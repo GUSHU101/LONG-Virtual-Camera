@@ -1,0 +1,46 @@
+package io.github.longcontroller.xposed;
+
+import android.content.Context;
+import android.database.Cursor;
+import android.net.Uri;
+
+import io.github.longcontroller.BuildConfig;
+
+final class ModuleConfig {
+    final boolean enabled;
+    final long generation;
+    final Uri mediaUri;
+
+    private ModuleConfig(boolean enabled, long generation, Uri mediaUri) {
+        this.enabled = enabled;
+        this.generation = generation;
+        this.mediaUri = mediaUri;
+    }
+
+    static ModuleConfig read(Context context) {
+        String authority = BuildConfig.APPLICATION_ID + ".media";
+        Uri configUri = Uri.parse("content://" + authority + "/config");
+        Uri mediaUri = Uri.parse("content://" + authority + "/media");
+        try (Cursor cursor = context.getContentResolver().query(
+                configUri,
+                new String[]{"enabled", "generation"},
+                null,
+                null,
+                null)) {
+            if (cursor == null || !cursor.moveToFirst()) return disabled(mediaUri);
+            int enabledColumn = cursor.getColumnIndex("enabled");
+            int generationColumn = cursor.getColumnIndex("generation");
+            if (enabledColumn < 0 || generationColumn < 0) return disabled(mediaUri);
+            return new ModuleConfig(
+                    cursor.getInt(enabledColumn) == 1,
+                    cursor.getLong(generationColumn),
+                    mediaUri);
+        } catch (RuntimeException deniedOrUnavailable) {
+            return disabled(mediaUri);
+        }
+    }
+
+    private static ModuleConfig disabled(Uri mediaUri) {
+        return new ModuleConfig(false, -1L, mediaUri);
+    }
+}

@@ -1,0 +1,62 @@
+package io.github.longcontroller.xposed;
+
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+
+import java.io.ByteArrayOutputStream;
+import java.util.Arrays;
+
+final class TestFrameGenerator {
+    private static final int[] LUMA_BARS = {235, 210, 170, 145, 106, 81, 41, 16};
+
+    private TestFrameGenerator() {}
+
+    static void fillNv21(byte[] destination, int width, int height, long frameNumber) {
+        int ySize = Math.max(0, width * height);
+        int required = ySize + ySize / 2;
+        int limit = Math.min(destination.length, required);
+        if (limit <= 0) return;
+
+        int yLimit = Math.min(ySize, limit);
+        for (int row = 0; row < height; row++) {
+            int rowOffset = row * width;
+            for (int col = 0; col < width && rowOffset + col < yLimit; col++) {
+                int bar = Math.min(LUMA_BARS.length - 1, (col * LUMA_BARS.length) / Math.max(1, width));
+                destination[rowOffset + col] = (byte) LUMA_BARS[bar];
+            }
+        }
+        if (limit > ySize) Arrays.fill(destination, ySize, limit, (byte) 128);
+
+        // Embed a changing, deterministic marker in luma so consumers can prove frames advance.
+        for (int bit = 0; bit < 32 && bit < yLimit; bit++) {
+            destination[yLimit - 1 - bit] = (byte) (((frameNumber >>> bit) & 1L) == 1L ? 235 : 16);
+        }
+    }
+
+    static byte[] jpeg(int width, int height, long frameNumber) {
+        int safeWidth = Math.max(320, Math.min(width, 1920));
+        int safeHeight = Math.max(240, Math.min(height, 1080));
+        Bitmap bitmap = Bitmap.createBitmap(safeWidth, safeHeight, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        int barWidth = Math.max(1, safeWidth / 8);
+        int[] colors = {
+                Color.WHITE, Color.YELLOW, Color.CYAN, Color.GREEN,
+                Color.MAGENTA, Color.RED, Color.BLUE, Color.BLACK
+        };
+        for (int i = 0; i < colors.length; i++) {
+            paint.setColor(colors[i]);
+            canvas.drawRect(i * barWidth, 0, i == 7 ? safeWidth : (i + 1) * barWidth,
+                    safeHeight, paint);
+        }
+        paint.setColor(Color.BLACK);
+        paint.setTextSize(Math.max(28f, safeWidth / 24f));
+        canvas.drawText("LONG TEST FRAME " + frameNumber, 24f, safeHeight / 2f, paint);
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output);
+        bitmap.recycle();
+        return output.toByteArray();
+    }
+}

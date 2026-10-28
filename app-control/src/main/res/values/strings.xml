@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LONG 虚拟摄像头</string>
+    <string name="xposed_description">Pixel 5 Android 14 基线控制器；跨应用替换已禁用，尚未通过真机验收</string>
+</resources>

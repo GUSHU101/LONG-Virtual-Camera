@@ -1,0 +1,37 @@
+schema: LONG-V9-COMPAT-CASE
+id: CASE-REPLACE
+status: NOT_RUN
+product:
+  gitCommit: FROM_GIT
+  workflowUrl: NOT_RUN
+  apkSha256: NOT_BUILT
+  signingCertSha256: NOT_BUILT
+  appVersion: 0.1.0-alpha01
+  deploymentMode: LSPOSED_EMBEDDED
+device:
+  model: FROM_DEVICE
+  androidApi: 33
+  fingerprint: FROM_DEVICE
+  securityPatch: FROM_DEVICE
+  rootManager: FROM_DEVICE
+  lsposedVersion: FROM_DEVICE
+  physicalCameraHealthBefore: NOT_RUN
+consumer:
+  packageName: FROM_DEVICE
+  versionCode: FROM_DEVICE
+  captureFamily: CAMERA1
+  scenarioType: GENERAL_MEDIA
+  explicitUserConsent: false
+observations:
+  enumerated: NOT_RUN
+  selected: NOT_RUN
+  sessionOpened: NOT_RUN
+  externalFramesObserved: NOT_RUN
+  stopAndReopen: NOT_RUN
+recovery:
+  physicalCameraRestored: NOT_RUN
+  uninstallRollback: NOT_RUN
+classification:
+  result: NOT_RUN
+  reason: EVIDENCE_INSUFFICIENT
+  artifactHashes: []

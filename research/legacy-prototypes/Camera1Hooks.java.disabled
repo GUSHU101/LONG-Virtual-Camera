@@ -1,0 +1,303 @@
+package io.github.longcontroller.xposed;
+
+import android.content.Context;
+import android.graphics.SurfaceTexture;
+import android.hardware.Camera;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+
+import java.util.ArrayDeque;
+import java.util.Map;
+import java.util.Queue;
+import java.util.WeakHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
+
+@SuppressWarnings("deprecation")
+final class Camera1Hooks {
+    private static final int MAX_CALLBACK_BUFFERS = 6;
+    private static final AtomicBoolean INSTALLED = new AtomicBoolean(false);
+    private static final Map<Camera, State> STATES = new WeakHashMap<>();
+    private static final ScheduledExecutorService FRAME_EXECUTOR =
+            Executors.newScheduledThreadPool(1, new DaemonThreadFactory());
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static Context appContext;
+    private static ConfigGate gate;
+
+    private Camera1Hooks() {}
+
+    static void install(Context context, ModuleConfig config) {
+        appContext = context.getApplicationContext();
+        gate = new ConfigGate(appContext, config);
+        if (!INSTALLED.compareAndSet(false, true)) return;
+
+        XposedHelpers.findAndHookMethod(
+                Camera.class,
+                "setPreviewTexture",
+                SurfaceTexture.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!gate.enabled()) return;
+                        SurfaceTexture texture = (SurfaceTexture) param.args[0];
+                        if (texture != null) state((Camera) param.thisObject)
+                                .setSurface(new Surface(texture), true);
+                        param.setResult(null);
+                    }
+                });
+
+        XposedHelpers.findAndHookMethod(
+                Camera.class,
+                "setPreviewDisplay",
+                SurfaceHolder.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!gate.enabled()) return;
+                        SurfaceHolder holder = (SurfaceHolder) param.args[0];
+                        if (holder != null) state((Camera) param.thisObject)
+                                .setSurface(holder.getSurface(), false);
+                        param.setResult(null);
+                    }
+                });
+
+        XposedHelpers.findAndHookMethod(
+                Camera.class,
+                "startPreview",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!gate.enabled()) return;
+                        State state = state((Camera) param.thisObject);
+                        state.start();
+                        param.setResult(null);
+                    }
+                });
+
+        XposedHelpers.findAndHookMethod(
+                Camera.class,
+                "stopPreview",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!gate.enabled()) return;
+                        State state = find((Camera) param.thisObject);
+                        if (state != null) state.stop(false);
+                        param.setResult(null);
+                    }
+                });
+
+        XposedHelpers.findAndHookMethod(
+                Camera.class,
+                "release",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        remove((Camera) param.thisObject);
+                    }
+                });
+
+        hookPreviewCallback("setPreviewCallback", false);
+        hookPreviewCallback("setOneShotPreviewCallback", false);
+        hookPreviewCallback("setPreviewCallbackWithBuffer", true);
+
+        XposedHelpers.findAndHookMethod(
+                Camera.class,
+                "addCallbackBuffer",
+                byte[].class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!gate.enabled()) return;
+                        byte[] buffer = (byte[]) param.args[0];
+                        if (buffer != null) state((Camera) param.thisObject).addBuffer(buffer);
+                        param.setResult(null);
+                    }
+                });
+
+        XposedBridge.hookAllMethods(Camera.class, "takePicture", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                if (!gate.enabled()) return;
+                Camera camera = (Camera) param.thisObject;
+                State state = state(camera);
+                Object[] callbacks = param.args.clone();
+                param.setResult(null);
+                MAIN.post(() -> state.deliverPicture(callbacks));
+            }
+        });
+    }
+
+    private static void hookPreviewCallback(String methodName, boolean withBuffer) {
+        XposedHelpers.findAndHookMethod(
+                Camera.class,
+                methodName,
+                Camera.PreviewCallback.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!gate.enabled()) return;
+                        State state = state((Camera) param.thisObject);
+                        Camera.PreviewCallback callback = (Camera.PreviewCallback) param.args[0];
+                        if ("setOneShotPreviewCallback".equals(methodName)) {
+                            state.oneShotCallback = callback;
+                        } else {
+                            state.previewCallback = callback;
+                            state.withBuffer = withBuffer;
+                        }
+                        param.setResult(null);
+                    }
+                });
+    }
+
+    private static synchronized State state(Camera camera) {
+        State existing = STATES.get(camera);
+        if (existing != null) return existing;
+        State created = new State(camera);
+        STATES.put(camera, created);
+        return created;
+    }
+
+    private static synchronized State find(Camera camera) {
+        return STATES.get(camera);
+    }
+
+    private static synchronized void remove(Camera camera) {
+        State state = STATES.remove(camera);
+        if (state != null) state.stop(true);
+    }
+
+    private static final class State {
+        private final Camera camera;
+        private final Queue<byte[]> callbackBuffers = new ArrayDeque<>();
+        private Surface surface;
+        private boolean ownsSurface;
+        private Camera.PreviewCallback previewCallback;
+        private Camera.PreviewCallback oneShotCallback;
+        private boolean withBuffer;
+        private long frameNumber;
+        private ScheduledFuture<?> frameTask;
+
+        State(Camera camera) {
+            this.camera = camera;
+        }
+
+        synchronized void setSurface(Surface replacement, boolean owns) {
+            if (surface != null && ownsSurface && surface != replacement) surface.release();
+            surface = replacement;
+            ownsSurface = owns;
+        }
+
+        synchronized void addBuffer(byte[] buffer) {
+            if (callbackBuffers.size() < MAX_CALLBACK_BUFFERS) callbackBuffers.offer(buffer);
+        }
+
+        synchronized void start() {
+            if (surface != null) {
+                VirtualMediaRenderer.start(appContext, gate.current().mediaUri, surface);
+            }
+            if (frameTask == null || frameTask.isCancelled()) {
+                frameTask = FRAME_EXECUTOR.scheduleAtFixedRate(this::deliverFrame,
+                        0L, 66L, TimeUnit.MILLISECONDS);
+            }
+        }
+
+        void deliverFrame() {
+            if (!gate.enabled()) {
+                stop(false);
+                return;
+            }
+            Camera.PreviewCallback continuous;
+            Camera.PreviewCallback once;
+            byte[] data;
+            int width = 640;
+            int height = 480;
+            try {
+                Camera.Size size = camera.getParameters().getPreviewSize();
+                if (size != null && size.width > 0 && size.height > 0) {
+                    width = size.width;
+                    height = size.height;
+                }
+            } catch (RuntimeException ignored) {
+                // A deterministic default is safer than crashing the target callback thread.
+            }
+            synchronized (this) {
+                continuous = previewCallback;
+                once = oneShotCallback;
+                oneShotCallback = null;
+                if (continuous == null && once == null) return;
+                if (withBuffer) {
+                    data = callbackBuffers.poll();
+                    if (data == null) return;
+                } else {
+                    long required = (long) width * height * 3L / 2L;
+                    if (required <= 0 || required > 64L * 1024L * 1024L) return;
+                    data = new byte[(int) required];
+                }
+                TestFrameGenerator.fillNv21(data, width, height, frameNumber++);
+            }
+            try {
+                if (continuous != null) continuous.onPreviewFrame(data, camera);
+                if (once != null && once != continuous) once.onPreviewFrame(data, camera);
+            } catch (Throwable callbackError) {
+                LongCameraModule.log(callbackError);
+            }
+        }
+
+        void deliverPicture(Object[] callbacks) {
+            int width = 1280;
+            int height = 720;
+            try {
+                Camera.Size size = camera.getParameters().getPictureSize();
+                if (size != null) {
+                    width = size.width;
+                    height = size.height;
+                }
+            } catch (RuntimeException ignored) {
+                // Use bounded defaults.
+            }
+            byte[] jpeg = TestFrameGenerator.jpeg(width, height, frameNumber++);
+            for (Object callback : callbacks) {
+                try {
+                    if (callback instanceof Camera.ShutterCallback shutter) {
+                        shutter.onShutter();
+                    } else if (callback instanceof Camera.PictureCallback picture) {
+                        picture.onPictureTaken(jpeg, camera);
+                    }
+                } catch (Throwable callbackError) {
+                    LongCameraModule.log(callbackError);
+                }
+            }
+        }
+
+        synchronized void stop(boolean releaseSurface) {
+            if (frameTask != null) {
+                frameTask.cancel(false);
+                frameTask = null;
+            }
+            if (surface != null) VirtualMediaRenderer.stop(surface);
+            callbackBuffers.clear();
+            if (releaseSurface && surface != null && ownsSurface) surface.release();
+            if (releaseSurface) surface = null;
+        }
+    }
+
+    private static final class DaemonThreadFactory implements ThreadFactory {
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable, "long-vcam-camera1");
+            thread.setDaemon(true);
+            return thread;
+        }
+    }
+}

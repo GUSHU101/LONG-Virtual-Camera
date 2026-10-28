@@ -1,0 +1,32 @@
+package io.github.longcontroller.xposed;
+
+import android.content.Context;
+
+final class ConfigGate {
+    private static final long REFRESH_MS = 750L;
+    private final Context context;
+    private volatile long lastCheckElapsed;
+    private volatile ModuleConfig config;
+
+    ConfigGate(Context context, ModuleConfig initial) {
+        this.context = context.getApplicationContext();
+        this.config = initial;
+    }
+
+    ModuleConfig current() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastCheckElapsed >= REFRESH_MS) {
+            synchronized (this) {
+                if (now - lastCheckElapsed >= REFRESH_MS) {
+                    config = ModuleConfig.read(context);
+                    lastCheckElapsed = now;
+                }
+            }
+        }
+        return config;
+    }
+
+    boolean enabled() {
+        return current().enabled;
+    }
+}
