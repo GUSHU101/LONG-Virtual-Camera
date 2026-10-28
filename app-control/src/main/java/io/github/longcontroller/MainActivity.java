@@ -157,9 +157,9 @@ public final class MainActivity extends Activity {
         });
         root.addView(clear);
 
-        addSection(root, "2. 选择目标应用");
+        addSection(root, "2. 规划后续测试应用");
         targetsView = bodyText(root);
-        Button chooseTargets = button("选择白名单应用");
+        Button chooseTargets = button("编辑测试清单（不开放外部访问）");
         chooseTargets.setOnClickListener(v -> chooseTargetApps());
         root.addView(chooseTargets);
 
@@ -280,8 +280,18 @@ public final class MainActivity extends Activity {
                     else selected.remove(packageName);
                 })
                 .setPositiveButton("保存（并关闭当前实验）", (dialog, which) -> {
-                    store.setAllowedPackages(selected);
-                    refreshUi();
+                    setBusy(true, "正在保存测试清单…");
+                    ioExecutor.execute(() -> {
+                        String errorText;
+                        try { store.setAllowedPackages(selected); errorText = null; }
+                        catch (Exception error) { errorText = safeMessage(error); }
+                        final String result = errorText;
+                        runOnUiThread(() -> {
+                            if (isDestroyed() || isFinishing()) return;
+                            setBusy(false, null); refreshUi();
+                            if (result != null) Toast.makeText(this, result, Toast.LENGTH_LONG).show();
+                        });
+                    });
                 })
                 .setNegativeButton("取消", null)
                 .show();
@@ -338,7 +348,7 @@ public final class MainActivity extends Activity {
         Set<String> targets = store.allowedPackages();
         targetsView.setText(targets.isEmpty()
                 ? "未选择目标应用；外部实验不能开启。"
-                : "已允许 " + targets.size() + " 个包：\n" + TextUtils.join("\n", targets));
+                : "计划测试 " + targets.size() + " 个包（尚未开放媒体访问）：\n" + TextUtils.join("\n", targets));
     }
 
     private void startPreview() {

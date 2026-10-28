@@ -8,6 +8,7 @@ import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.MediaMetadataRetriever;
 import android.graphics.Bitmap;
+import io.github.longcontroller.media.BoundedMediaCopy;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -90,7 +91,7 @@ public final class ConfigStore {
                 .putStringSet(KEY_ALLOWED_PACKAGES, clean)
                 .putLong(KEY_GENERATION, generation() + 1L);
         editor.putBoolean(KEY_ENABLED, false);
-        editor.commit();
+        if (!editor.commit()) throw new IllegalStateException("测试清单写入未确认，请重新打开后核验");
         notifyChanged();
     }
 
@@ -102,10 +103,11 @@ public final class ConfigStore {
         if (enabled && (!hasSource() || allowedPackages().isEmpty())) {
             throw new IllegalStateException("请先选择视频和至少一个目标应用");
         }
-        preferences.edit()
+        boolean committed = preferences.edit()
                 .putBoolean(KEY_ENABLED, enabled)
                 .putLong(KEY_GENERATION, generation() + 1L)
                 .commit();
+        if (!committed) throw new IllegalStateException("配置写入未确认，请重新打开后核验");
         notifyChanged();
     }
 
@@ -136,26 +138,13 @@ public final class ConfigStore {
             if (input == null) {
                 throw new IOException("无法读取所选媒体");
             }
-            byte[] buffer = new byte[64 * 1024];
-            int count;
-            while ((count = input.read(buffer)) >= 0) {
-                if (Thread.currentThread().isInterrupted()) throw new IOException("导入已取消");
-                if (count == 0) continue;
-                if (bytes + count > MAX_IMPORT_BYTES) throw new IOException("视频超过 256 MiB 导入上限");
-                output.write(buffer, 0, count);
-                digest.update(buffer, 0, count);
-                bytes += count;
-            }
+            bytes = BoundedMediaCopy.copy(input, output, digest, MAX_IMPORT_BYTES,
+                    () -> Thread.currentThread().isInterrupted());
             output.getFD().sync();
         } catch (IOException | RuntimeException error) {
             //noinspection ResultOfMethodCallIgnored
             temporary.delete();
             throw error;
-        }
-        if (bytes == 0L) {
-            //noinspection ResultOfMethodCallIgnored
-            temporary.delete();
-            throw new IOException("所选媒体为空");
         }
         String mime;
         try {

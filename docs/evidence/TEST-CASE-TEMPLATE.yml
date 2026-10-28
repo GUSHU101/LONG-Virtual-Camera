@@ -10,7 +10,9 @@ product:
   deploymentMode: LSPOSED_EMBEDDED
 device:
   model: FROM_DEVICE
-  androidApi: 33
+  androidApi: 34
+  expectedDevice: redfin
+  expectedBuildId: UP1A.231105.001.B2
   fingerprint: FROM_DEVICE
   securityPatch: FROM_DEVICE
   rootManager: FROM_DEVICE

@@ -6,6 +6,8 @@
 
 工作流 `.github/workflows/android.yml` 在 push、PR、手动触发运行 Debug 构建。权限仅 contents:read；Actions 固定完整提交 SHA；无 PR secrets、无 pull_request_target、无远程安装脚本。
 
+SDK 通过固定提交的 android-actions/setup-android 安装，不假设 runner 预装 sdkmanager；命令行工具版本固定为 15859902。SDK 安装步骤按常规 Android 构建流程接受其许可证。首次云端运行的 sdkmanager PATH 失败已通过显式安装修正。
+
 Debug 步骤：校验 wrapper → 安装固定 SDK/Build Tools → JUnit → Lint → assemble → 校验唯一 APK、包名、目标配置、DEX 中真实入口定义、Xposed API 未打包 → apksigner → SHA256 → Artifact。Artifact 保留 14 天，报告独立上传。云端通过不代表真机通过。
 
 ## Release 签名
