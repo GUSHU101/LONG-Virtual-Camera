@@ -1,0 +1,33 @@
+# ndk-build output
+android/libs/
+android/obj/
+
+# staged into a release by tools/package.py
+desktop/recam_ui/payload/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# release artifacts; they live on the GitHub release page
+release/
+
+# pulled from devices for offline symbol work
+.scratch/
+
+# local-only engineering notes
+.docs/
+
+__pycache__/
+*.pyc
+*.pyo
+
+*.log
+logs/
+*.idb
+*.i64
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

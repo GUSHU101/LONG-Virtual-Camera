@@ -1,0 +1,58 @@
+// Decoding video into CPU-readable YUV frames through MediaCodec.
+
+#pragma once
+
+#include <stdint.h>
+
+#include "scale.hpp"
+
+namespace recam {
+
+class VideoDecoder {
+public:
+    ~VideoDecoder();
+
+    bool open(const char* path);
+
+    // Annex-B H.264 off a socket. Takes ownership of `fd`; geometry comes from the SPS.
+    bool open_stream(int fd);
+
+    void close();
+
+    // Live: newest ready frame, or false if none. File: next frame, looping at EOS.
+    // Returned planes stay valid until release() or close().
+    bool next(SrcFrame* out);
+    void release();
+
+    // Sleep until socket input is ready, with a bounded codec-poll interval.
+    void wait_stream(int timeoutMs);
+
+    // The peer hung up, so the caller should fall back to its other source.
+    bool stream_ended() const;
+
+    int32_t width()  const { return mWidth; }
+    int32_t height() const { return mHeight; }
+    int64_t frame_interval_us() const { return mIntervalUs; }
+
+private:
+    bool pump();
+    bool pump_stream();
+    void pump_annexb();
+    void pump_flv();
+    bool drain_output(const char* source, int64_t timeoutUs = 2000,
+                      bool* progressed = nullptr);
+    void drain_available();
+    bool update_output_format(const char* source);
+    bool describe_frame(SrcFrame* out);
+    bool queue_au();
+    bool start_codec_from_csd();
+    void rewind();
+
+    struct Impl;
+    Impl*   mImpl       = nullptr;
+    int32_t mWidth      = 0;
+    int32_t mHeight     = 0;
+    int64_t mIntervalUs = 33333;
+};
+
+}  // namespace recam

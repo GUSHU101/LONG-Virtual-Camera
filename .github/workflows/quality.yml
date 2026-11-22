@@ -1,0 +1,69 @@
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: 27.3.13750724
+  CAMREPLACE_NDK_VERSION: 29.0.14033849
+
+jobs:
+  desktop-and-ring:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: Python checks
+        run: |
+          python -m compileall -q desktop tests long_virtual_camera.py
+          python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Shared ring ownership tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -pthread tests/ring_access_test.cpp -o /tmp/ring_access_test
+          /tmp/ring_access_test
+          gcc -std=c11 -Wall -Wextra -Werror tests/camreplace_ring_test.c -o /tmp/camreplace_ring_test
+          /tmp/camreplace_ring_test
+
+  android-native:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned NDK
+        run: |
+          if [ ! -x "$ANDROID_HOME/ndk/$NDK_VERSION/ndk-build" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION"
+          fi
+      - name: Build ARM64 and x86_64 payloads
+        run: |
+          "$ANDROID_HOME/ndk/$NDK_VERSION/ndk-build" \
+            NDK_PROJECT_PATH=android \
+            NDK_APPLICATION_MK=android/jni/Application.mk \
+            -j4
+
+  enhanced-android-native:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned NDK
+        run: |
+          if [ ! -x "$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION/ndk-build" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$CAMREPLACE_NDK_VERSION"
+          fi
+      - name: Configure enhanced Android engine
+        run: |
+          cmake -S engines/camreplace/android -B build/camreplace-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/android-ndk.cmake" \
+            -DANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION" \
+            -DCMAKE_BUILD_TYPE=Release
+      - name: Build enhanced Android engine
+        run: cmake --build build/camreplace-android --parallel 4
