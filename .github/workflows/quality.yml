@@ -119,3 +119,8 @@ jobs:
           cmake --build build/camreplace-host --target CameraReplace --parallel 4
           $exe = 'build/camreplace-host/bin/LONG-Virtual-Camera-Enhanced.exe'
           if (-not (Test-Path -LiteralPath $exe)) { throw "Missing output: $exe" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LONG-Virtual-Camera-Enhanced-windows-x64
+          path: build/camreplace-host/bin/LONG-Virtual-Camera-Enhanced.exe
+          if-no-files-found: error
