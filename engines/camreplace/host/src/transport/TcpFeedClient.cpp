@@ -4,16 +4,17 @@
  *   CRTP raw NV21, CRH2 H.264 chunks и CRAU PCM stream.
  *
  * ABI/совместимость:
- *   Wire headers не меняются. Video shared-memory ABI v1 на телефоне имеет
- *   fixed 1920x1080 NV21 slot cap; client валидирует dimensions до отправки
+ *   Wire headers не меняются. Video shared-memory ABI v2 на телефоне имеет
+ *   fixed 1920x1080/1080x1920 NV21 slot cap; client валидирует dimensions до отправки
  *   header, чтобы телефон не уходил в неочевидный receiver fail.
  *
  * Ограничения:
  *   Это транспортный слой, он не масштабирует и не ресемплит. Исправление
- *   oversized stream делается выше по pipeline или через будущий shm v2.
+ *   oversized stream делается выше по pipeline.
  */
 
 #include "transport/TcpFeedClient.h"
+#include "secure_channel/LocalTicketAuth.h"
 #include "util/Log.h"
 #include "util/WinApiDyn.h"
 
@@ -68,9 +69,9 @@ inline SOCKET as_sock(std::uintptr_t h) noexcept
   return (SOCKET) h;
 }
 
-constexpr std::uint32_t kFeedMaxWidth = 1920u;
-constexpr std::uint32_t kFeedMaxHeight = 1080u;
-constexpr std::uint32_t kFeedMaxNv21Bytes = kFeedMaxWidth * kFeedMaxHeight * 3u / 2u;
+constexpr std::uint32_t kFeedMaxDimension = 1920u;
+constexpr std::uint32_t kFeedMaxPixels = 1920u * 1080u;
+constexpr std::uint32_t kFeedMaxNv21Bytes = kFeedMaxPixels * 3u / 2u;
 constexpr std::uint32_t kPhoneHelloMagic = 0x324c4850u; // "PHL2"
 constexpr std::size_t kPhoneHelloBytes = 64;
 constexpr std::size_t kApplicationChunkBytes = 64 * 1024;
@@ -78,12 +79,15 @@ constexpr std::size_t kPcmRecordBytes = 32 * 1024;
 
 bool video_shape_supported(int width, int height, const char* proto)
 {
-  if (width < 16 || height < 16)
+  if (width < 16 || height < 16 ||
+      width > static_cast<int>(kFeedMaxDimension) ||
+      height > static_cast<int>(kFeedMaxDimension) ||
+      (width & 1) != 0 || (height & 1) != 0)
     return false;
   const auto bytes = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 3ull / 2ull;
   if (bytes <= kFeedMaxNv21Bytes)
     return true;
-  cr::log::warn("tcp", std::string(proto) + " frame " + std::to_string(width) + "x" + std::to_string(height) + " exceeds phone shm v1 cap 1920x1080");
+  cr::log::warn("tcp", std::string(proto) + " frame " + std::to_string(width) + "x" + std::to_string(height) + " exceeds phone shm v2 pixel cap");
   return false;
 }
 
@@ -118,6 +122,7 @@ bool fill_random(std::uint8_t* out, std::size_t bytes) noexcept
 
 bool make_dev_ticket(
     cr::secure_channel::v2::StreamKind stream_kind,
+    const std::array<std::uint8_t, 32>& host_private,
     const std::array<std::uint8_t, 32>& host_public,
     const std::array<std::uint8_t, 32>& phone_public,
     const std::array<std::uint8_t, 24>& phone_nonce,
@@ -132,8 +137,12 @@ bool make_dev_ticket(
   ticket.phone_nonce = phone_nonce;
   if (!fill_random(ticket.session_id.data(), ticket.session_id.size()))
     return false;
-  ticket.signature.fill(0);
-  return static_cast<bool>(cr::secure_channel::v2::encode_ticket(ticket, ticket_bytes));
+  std::array<std::uint8_t, 32> shared{};
+  crypto_x25519(shared.data(), host_private.data(), phone_public.data());
+  const bool signed_ok = static_cast<bool>(cr::secure_channel::v2::sign_local_ticket(
+      ticket, {shared.data(), shared.size()}));
+  crypto_wipe(shared.data(), shared.size());
+  return signed_ok && static_cast<bool>(cr::secure_channel::v2::encode_ticket(ticket, ticket_bytes));
 }
 
 } // namespace
@@ -208,7 +217,7 @@ bool TcpFeedClient::open(int port, cr::secure_channel::v2::StreamKind stream_kin
   crypto_x25519_public_key(host_public.data(), host_private.data());
 
   std::vector<std::uint8_t> dev_ticket;
-  if (!make_dev_ticket(stream_kind, host_public, phone_public, phone_nonce, dev_ticket))
+  if (!make_dev_ticket(stream_kind, host_private, host_public, phone_public, phone_nonce, dev_ticket))
   {
     cr::log::error("tcp", "local SCT2 session descriptor creation failed");
     crypto_wipe(host_private.data(), host_private.size());

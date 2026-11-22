@@ -3,7 +3,7 @@
  *   Общий H.264 -> NV21 -> /data/cr/feed decode pipeline для phone-side feed
  *   variants. Транспортный слой отдаёт Annex-B NAL units, а этот wrapper
  *   выбирает Android decoder, конвертирует output format и публикует NV21 в
- *   shared memory v1.
+ *   shared memory v2.
  *
  * Hook point и ABI assumptions:
  *   ABI /data/cr/feed не меняется: cr_feed_header + fixed NV21 slots. Этот
@@ -13,7 +13,7 @@
  *
  * Ограничения Pixel/Android:
  *   Tensor Pixel не гарантирует Qualcomm codec names. Размер кадра должен
- *   укладываться в текущий shm v1 cap 1920x1080 NV21; расширение требует
+ *   укладываться в текущий shm v2 pixel cap 1920x1080/1080x1920 NV21; расширение требует
  *   отдельной версии shared memory.
  *
  * Подтверждено:

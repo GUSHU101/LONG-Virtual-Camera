@@ -49,7 +49,10 @@ while incompatible hook mechanisms remain isolated behind an engine boundary.
 | Dimensions | Enhanced feed mishandled portrait limits | Independently bound width/height and require even NV21 geometry |
 | Desktop cleanup | Window close did less cleanup than Stop | Shared fail-safe shutdown tries streamer, feeder, payload and ADB forwarding |
 | Exposure/logging | RTMP could bind all interfaces and logs contained secrets | Loopback-only listeners and credential/header/token redaction |
-| Local ticket | Development tickets had no maximum accepted duration | Enforce a one-hour maximum lifetime plus clock/expiry checks |
+| Local ticket | Development tickets used an all-zero proof and had no maximum accepted duration | Authenticate the canonical ticket with the ephemeral X25519 shared secret; enforce a one-hour lifetime plus clock/expiry checks |
+| Async lifecycle | Detached Start/Stop workers could interleave device, forwarding and OBS state | Serialize complete lifecycle transactions and make every failed start roll back phone and host stages |
+| Multi-device | One global deploy flag and no host-session owner leaked state across serials | Track prepared artifacts per serial, bind the host pipeline to one owning serial and lock device switching while active |
+| UI callbacks | Old worker callbacks could overwrite the state of a newer user action | Atomic mode flags plus per-mode operation generations reject stale completions |
 
 ## Virtual microphone state machine
 
@@ -80,10 +83,10 @@ Camera and photo modes never transition the microphone state.
 - Both engines depend on private Android camera-service behavior; compatibility
   is firmware/SoC-specific and unsupported layouts pass through.
 - Enhanced mode is presently arm64 Android plus a Windows x64 host.
-- CamReplace's local secure-channel ticket is a USB/loopback development binding,
-  not remote identity authentication. Confidentiality and ephemeral key binding
-  remain useful, but the all-zero local ticket signature must not be represented
-  as server-backed authorization.
+- The enhanced local secure-channel ticket is authenticated with a keyed proof
+  derived from both ephemeral X25519 keys, replacing the historical all-zero
+  signature. It protects handshake integrity and key possession over USB/loopback,
+  but it is deliberately not persistent remote identity authentication.
 - Retaining an enhanced hook mapping until service exit is an intentional safety
   tradeoff. A service restart/reboot is the complete unload mechanism.
 - Physical-device regression is still required for each Android build family,
@@ -91,7 +94,9 @@ Camera and photo modes never transition the microphone state.
 
 ## Release gates
 
-A release is acceptable only when Python tests, both ring model tests, both NDK
-builds and source safety guards pass. Device validation should cover start/stop,
-service death, USB disconnect, video underrun, audio underrun, audio opt-in/out,
-portrait/landscape, preview/record/JPEG, and recovery after reboot.
+A release is acceptable only when Python tests, both ring model tests, the
+authenticated-channel handshake/replay/tamper tests, both NDK builds and source
+safety guards pass. Device validation should cover start/stop, service death,
+USB disconnect, device switching, repeated rapid Start/Stop, video underrun,
+audio underrun, audio opt-in/out, portrait/landscape, preview/record/JPEG, and
+recovery after reboot.

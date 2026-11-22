@@ -7,6 +7,7 @@
 #include <atomic>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <thread>
 #include <type_traits>
@@ -16,6 +17,24 @@ namespace cr::source
 
 namespace
 {
+
+// Every mode is one transaction spanning a process-wide OBS source, adb
+// forwards and state in one phone. Serialising those transactions prevents a
+// fast Start/Stop/device-switch sequence from interleaving half of two modes.
+std::mutex g_lifecycle_mu;
+
+std::string owning_serial(HostStack& host, const std::string& requested,
+                          const cr::device::DeployCallback& cb)
+{
+  const std::string owner = host.session_serial();
+  if (owner.empty() || owner == requested)
+    return requested;
+  if (cb)
+    cb(cr::device::DeployStatus::info(
+        "use active session device",
+        "active=" + owner + "; selected=" + requested));
+  return owner;
+}
 
 cr::device::FeedScheme video_scheme_for(Transport tr)
 {
@@ -163,6 +182,7 @@ void FeedController::install_software(std::string serial, cr::device::DeployCall
   launch_worker("install software", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   if (!cr::device::DeviceStack::instance().install(serial, cb))
                     return;
                   if (cb)
@@ -172,12 +192,14 @@ void FeedController::install_software(std::string serial, cr::device::DeployCall
 
 void FeedController::delete_software(std::string serial, cr::device::DeployCallback cb)
 {
-  HostStack::instance().shutdown();
-  cr::device::DeviceStack::instance().reset_session();
   launch_worker("delete software", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
-                  if (!cr::device::DeviceStack::instance().uninstall(serial, cb))
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
+                  auto& host = HostStack::instance();
+                  const std::string target = owning_serial(host, serial, cb);
+                  host.shutdown();
+                  if (!cr::device::DeviceStack::instance().uninstall(target, cb))
                     return;
                   if (cb)
                     cb(cr::device::DeployStatus::ok("delete: software removed"));
@@ -189,6 +211,7 @@ void FeedController::start_software(std::string serial, cr::device::DeployCallba
   launch_worker("start software", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   if (!cr::device::DeviceStack::instance().load_hooks(serial, video_scheme_for(transport()), cb))
                     return;
                   if (cb)
@@ -198,12 +221,14 @@ void FeedController::start_software(std::string serial, cr::device::DeployCallba
 
 void FeedController::stop_software(std::string serial, cr::device::DeployCallback cb)
 {
-  HostStack::instance().shutdown();
-  cr::device::DeviceStack::instance().reset_session();
   launch_worker("stop software", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
-                  cr::device::DeviceStack::instance().unload_hooks(serial,
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
+                  auto& host = HostStack::instance();
+                  const std::string target = owning_serial(host, serial, cb);
+                  host.shutdown();
+                  cr::device::DeviceStack::instance().unload_hooks(target,
                                                                    /*relaunch_clients=*/true, cb);
                   if (cb)
                     cb(cr::device::DeployStatus::ok("software stopped", "hooks unloaded; artifacts kept (use Delete to wipe)"));
@@ -217,6 +242,7 @@ void FeedController::start_replace_camera(std::string serial, cr::device::Deploy
   launch_worker("start replace camera", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   auto& dev = cr::device::DeviceStack::instance();
                   auto& host = HostStack::instance();
 
@@ -245,17 +271,19 @@ void FeedController::stop_replace_camera(std::string serial, cr::device::DeployC
   launch_worker("stop replace camera", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   auto& host = HostStack::instance();
+                  const std::string target = owning_serial(host, serial, cb);
                   const bool also_photo = host.photo_active();
-                  host.set_camera_active(false);
-                  host.teardown_if_idle();
 
                   // Photo mode also needs the camhook live + shm filled, so only
                   // disarm the phone-side video pipeline if photo isn't holding it.
                   if (!also_photo)
                   {
-                    cr::device::DeviceStack::instance().disarm_video(serial, cb);
+                    cr::device::DeviceStack::instance().disarm_video(target, cb);
                   }
+                  host.set_camera_active(false);
+                  host.teardown_if_idle();
                   if (cb)
                     cb(cr::device::DeployStatus::ok("camera: stopped"));
                 });
@@ -268,6 +296,7 @@ void FeedController::start_replace_photo(std::string serial, cr::device::DeployC
   launch_worker("start replace photo", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   auto& dev = cr::device::DeviceStack::instance();
                   auto& host = HostStack::instance();
 
@@ -287,7 +316,16 @@ void FeedController::start_replace_photo(std::string serial, cr::device::DeployC
                     return;
                   }
                   if (!dev.enable_photo_mode(serial, cb))
+                  {
+                    // Photo mode is a transaction spanning host forwarding,
+                    // video shm and the device sentinel. Undo every completed
+                    // stage so an error never leaves camera replacement armed.
+                    host.set_photo_active(false);
+                    dev.disable_photo_mode(serial, cb);
+                    dev.disarm_video(serial, cb);
+                    host.teardown_if_idle();
                     return;
+                  }
 
                   if (cb)
                     cb(cr::device::DeployStatus::ok("Photo replace ready", "Take a photo in any camera app - JPEG will be encoded from the live OBS stream."));
@@ -299,17 +337,19 @@ void FeedController::stop_replace_photo(std::string serial, cr::device::DeployCa
   launch_worker("stop replace photo", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   auto& host = HostStack::instance();
+                  const std::string target = owning_serial(host, serial, cb);
                   const bool also_camera = host.camera_active();
-                  host.set_photo_active(false);
-                  host.teardown_if_idle();
 
                   auto& dev = cr::device::DeviceStack::instance();
-                  dev.disable_photo_mode(serial, cb);
+                  dev.disable_photo_mode(target, cb);
                   if (!also_camera)
                   {
-                    dev.disarm_video(serial, cb);
+                    dev.disarm_video(target, cb);
                   }
+                  host.set_photo_active(false);
+                  host.teardown_if_idle();
                   if (cb)
                     cb(cr::device::DeployStatus::ok("photo: stopped"));
                 });
@@ -322,6 +362,7 @@ void FeedController::start_replace_sound(std::string serial, cr::device::DeployC
   launch_worker("start replace sound", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   auto& dev = cr::device::DeviceStack::instance();
                   auto& host = HostStack::instance();
 
@@ -366,10 +407,12 @@ void FeedController::stop_replace_sound(std::string serial, cr::device::DeployCa
   launch_worker("stop replace sound", cb,
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
+                  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   auto& host = HostStack::instance();
+                  const std::string target = owning_serial(host, serial, cb);
                   // Invalidate the shared channel first. The next audioserver
                   // callback immediately falls through to the phone microphone.
-                  cr::device::DeviceStack::instance().disarm_audio(serial, cb);
+                  cr::device::DeviceStack::instance().disarm_audio(target, cb);
                   host.stop_sound();
                   host.teardown_if_idle();
                   if (cb)
@@ -391,6 +434,7 @@ void FeedController::shutdown_all()
 
 void FeedController::cleanup_known_devices(const char* reason)
 {
+  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
   // Synchronous - joins ObsRtmpSource worker threads so adb subprocesses
   // don't outlive App::run(), then wipes phone-side state while adb is
   // still alive.

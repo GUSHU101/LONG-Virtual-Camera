@@ -30,7 +30,7 @@ class FusionSafetyGuards(unittest.TestCase):
         controller = self.read("host/src/source/FeedController.cpp")
         self.assertIn("Virtual microphone: OFF (phone microphone is used)", ui)
         self.assertIn("Enable virtual microphone", ui)
-        self.assertIn("bool sound_replacing = false", ui)
+        self.assertIn("std::atomic_bool sound_replacing{false}", ui)
         self.assertIn("dev.arm_audio(serial, cb)", controller)
         self.assertIn("dev.disarm_audio(serial, cb)", controller)
         self.assertIn("memset(buffer, 0, got)", audio)
@@ -39,6 +39,28 @@ class FusionSafetyGuards(unittest.TestCase):
         sanity = audio.index("audio_header_sane(g_shm.header, g_shm.size)", clear)
         self.assertLess(active_check, clear)
         self.assertLess(clear, sanity)
+
+    def test_async_ui_and_device_sessions_are_isolated(self):
+        ui = self.read("host/src/ui/MainWindow.cpp")
+        header = self.read("host/src/device/DeviceStack.h")
+        stack = self.read("host/src/device/DeviceStack.cpp")
+        controller = self.read("host/src/source/FeedController.cpp")
+        host_header = self.read("host/src/source/HostStack.h")
+        self.assertIn("std::atomic_uint64_t audio_operation", ui)
+        self.assertIn("state().audio_operation.load() == operation", ui)
+        self.assertIn("ImGui::BeginDisabled(device_locked)", ui)
+        self.assertIn("std::unordered_set<std::string> prepared_serials_", header)
+        self.assertIn("prepared_serials_.contains(serial)", stack)
+        self.assertIn("std::mutex g_lifecycle_mu", controller)
+        self.assertIn("std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu)", controller)
+        self.assertIn("std::string session_serial_", host_header)
+
+    def test_secure_channel_requires_ephemeral_ticket_proof(self):
+        session = self.read("common/secure_channel/SecureSession.cpp")
+        client = self.read("host/src/transport/TcpFeedClient.cpp")
+        self.assertIn("verify_local_ticket(view, bytes_of(shared))", session)
+        self.assertIn("sign_local_ticket", client)
+        self.assertNotIn("all_zero(view.signature", session)
 
     def test_camera_start_does_not_implicitly_arm_audio(self):
         controller = self.read("host/src/source/FeedController.cpp")

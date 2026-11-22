@@ -4,7 +4,7 @@
  *   загрузки hooks и запуска video/audio/photo режимов на rooted Pixel.
  *
  * Hook point и ABI assumptions:
- *   класс не раскрывает phone-side structs и не меняет shared memory v1.
+ *   класс не раскрывает phone-side structs и не меняет shared memory v2.
  *   Он только выбирает feed scheme, порты и exported init functions, которые
  *   PhoneOps передаёт cr_injector. Public C++ API оставлен совместимым.
  *
@@ -27,7 +27,7 @@
 
 // DeviceStack — the phone-side half of the camera-replace machinery.
 // Owns:
-//   * `artifacts_pushed_` per-session flag (idempotent push)
+//   * per-device prepared serial set (idempotent push without cross-device leaks)
 //   * the bring-up mutex that serialises concurrent start_replace_*
 //   * the port constants the cr_feed_proc tunnels listen on
 // Delegates ALL shell composition to `PhoneOps`. DeviceStack itself is
@@ -46,6 +46,7 @@
 
 #include <mutex>
 #include <string>
+#include <unordered_set>
 
 namespace cr::device
 {
@@ -69,7 +70,7 @@ class DeviceStack
 public:
   static DeviceStack& instance();
 
-  // Drop the per-session "artifacts_pushed" flag. Call from
+  // Drop every per-device prepared-session flag. Call from
   // shutdown_all / uninstall so the next push runs the clean step.
   void reset_session();
 
@@ -123,15 +124,18 @@ private:
   DeviceStack() = default;
 
   // Push artifacts if not pushed yet this session.
-  bool prepare_artifacts_(PhoneOps& ops, const DeployCallback& cb);
-  bool cleanup_device_(PhoneOps& ops, const DeployCallback& cb);
+  bool prepare_artifacts_(const std::string& serial, PhoneOps& ops, const DeployCallback& cb);
+  bool cleanup_device_(const std::string& serial, PhoneOps& ops, const DeployCallback& cb);
 
   // Serialises concurrent start_replace_* threads through arm_video /
   // arm_audio so push_artifacts and inject can't interleave.
   std::mutex bring_up_mu_;
 
   std::mutex state_mu_;
-  bool artifacts_pushed_ = false;
+  // Preparation is per device. A single process can switch between connected
+  // phones; treating this as one global boolean skipped deployment on the
+  // second serial and then operated on missing/stale artifacts.
+  std::unordered_set<std::string> prepared_serials_;
 };
 
 } // namespace cr::device

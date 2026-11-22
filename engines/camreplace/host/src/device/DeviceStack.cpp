@@ -7,7 +7,7 @@
  *   файл не содержит shell-команд напрямую и не меняет Android ABI. Все
  *   операции с cameraserver/audioserver и cr_feed_proc проходят через
  *   PhoneOps, а exported init symbols cr_camhook_init/cr_audhook_init,
- *   feed URL strings и shared memory v1 остаются совместимыми.
+ *   feed URL strings и shared memory v2 остаются совместимыми.
  *
  * Ограничения Pixel/Android:
  *   Pixel 6-10 / Android 12-16 respawn-ят cameraserver/audioserver
@@ -55,32 +55,35 @@ DeviceStack& DeviceStack::instance()
 void DeviceStack::reset_session()
 {
   std::lock_guard<std::mutex> lk(state_mu_);
-  artifacts_pushed_ = false;
+  prepared_serials_.clear();
 }
 
-bool DeviceStack::prepare_artifacts_(PhoneOps& ops, const DeployCallback& cb)
+bool DeviceStack::prepare_artifacts_(const std::string& serial, PhoneOps& ops, const DeployCallback& cb)
 {
-  std::lock_guard<std::mutex> lk(bring_up_mu_);
+  // Caller holds bring_up_mu_ for the complete prepare + inject/arm
+  // transaction. Releasing it between deployment and use allowed an uninstall
+  // on another worker to wipe the files in that gap.
   {
     std::lock_guard<std::mutex> sl(state_mu_);
-    if (artifacts_pushed_)
+    if (prepared_serials_.contains(serial))
     {
       if (cb)
-        cb(DeployStatus::ok("artifacts already pushed", "skipping wipe+push"));
+        cb(DeployStatus::ok("artifacts already pushed", "serial=" + serial + "; skipping wipe+push"));
       return true;
     }
   }
-  cleanup_device_(ops, cb);
+  if (!cleanup_device_(serial, ops, cb))
+    return false;
   if (!ops.push_artifacts(cb))
     return false;
   {
     std::lock_guard<std::mutex> sl(state_mu_);
-    artifacts_pushed_ = true;
+    prepared_serials_.insert(serial);
   }
   return true;
 }
 
-bool DeviceStack::cleanup_device_(PhoneOps& ops, const DeployCallback& cb)
+bool DeviceStack::cleanup_device_(const std::string& serial, PhoneOps& ops, const DeployCallback& cb)
 {
   // Drop hooks first; otherwise unlinked libraries can remain mapped
   // inside cameraserver/audioserver until the next service restart.
@@ -100,7 +103,7 @@ bool DeviceStack::cleanup_device_(PhoneOps& ops, const DeployCallback& cb)
 
   {
     std::lock_guard<std::mutex> sl(state_mu_);
-    artifacts_pushed_ = false;
+    prepared_serials_.erase(serial);
   }
   return wiped;
 }
@@ -110,14 +113,15 @@ bool DeviceStack::cleanup_device_(PhoneOps& ops, const DeployCallback& cb)
 bool DeviceStack::install(const std::string& serial, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
-  return prepare_artifacts_(ops, cb);
+  std::lock_guard<std::mutex> lk(bring_up_mu_);
+  return prepare_artifacts_(serial, ops, cb);
 }
 
 bool DeviceStack::uninstall(const std::string& serial, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
   std::lock_guard<std::mutex> lk(bring_up_mu_);
-  return cleanup_device_(ops, cb);
+  return cleanup_device_(serial, ops, cb);
 }
 
 bool DeviceStack::cleanup(const std::string& serial, const DeployCallback& cb)
@@ -128,7 +132,8 @@ bool DeviceStack::cleanup(const std::string& serial, const DeployCallback& cb)
 bool DeviceStack::load_hooks(const std::string& serial, FeedScheme video_scheme, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
-  if (!prepare_artifacts_(ops, cb))
+  std::lock_guard<std::mutex> lk(bring_up_mu_);
+  if (!prepare_artifacts_(serial, ops, cb))
     return false;
 
   // Preload only the camera hook. The phone microphone is an explicit opt-in:
@@ -140,6 +145,7 @@ bool DeviceStack::load_hooks(const std::string& serial, FeedScheme video_scheme,
 bool DeviceStack::unload_hooks(const std::string& serial, bool relaunch_clients, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
+  std::lock_guard<std::mutex> lk(bring_up_mu_);
   ops.kill_all_feed_procs(cb);
   ops.zero_shm_magic(ShmKind::Feed, cb);
   ops.zero_shm_magic(ShmKind::Audio, cb);
@@ -163,13 +169,20 @@ bool DeviceStack::arm_video(const std::string& serial, FeedScheme scheme, const 
     return false; // wrong domain
 
   PhoneOps ops(serial);
-  if (!prepare_artifacts_(ops, cb))
-    return false;
-
   std::lock_guard<std::mutex> lk(bring_up_mu_);
+  if (!prepare_artifacts_(serial, ops, cb))
+    return false;
 
   const FeedScheme other = (scheme == FeedScheme::H264) ? FeedScheme::Nv21 : FeedScheme::H264;
   const std::string url = feed_url_for(scheme);
+  const auto rollback_video = [&]()
+  {
+    ops.disable_video_replace_passthrough(cb);
+    ops.kill_feed_proc(FeedScheme::H264, cb);
+    ops.kill_feed_proc(FeedScheme::Nv21, cb);
+    ops.zero_shm_magic(ShmKind::Feed, cb);
+    ops.unforward(kVideoTcpPort, cb);
+  };
 
   if (!ops.forward(kVideoTcpPort, cb))
     return false;
@@ -178,13 +191,19 @@ bool DeviceStack::arm_video(const std::string& serial, FeedScheme scheme, const 
   {
     ops.kill_feed_proc(other, cb);
     if (!ops.wait_feed_stopped(other, 1500, cb))
+    {
+      rollback_video();
       return false;
+    }
   }
 
   if (!ops.feed_proc_running(scheme))
   {
     if (!ops.launch_feed(url, "cr_feed.log", cb))
+    {
+      rollback_video();
       return false;
+    }
   }
   else
   {
@@ -192,14 +211,14 @@ bool DeviceStack::arm_video(const std::string& serial, FeedScheme scheme, const 
       cb(DeployStatus::ok("cr_feed_proc(video) already running", "reuse"));
   }
   if (!ops.wait_feed_ready(scheme, "cr_feed.log", 4000, cb))
+  {
+    rollback_video();
     return false;
+  }
 
   if (!ops.inject_lib(HostProc::CameraServer, "libcr_hooks.so", "cr_camhook_init", url, cb))
   {
-    ops.disable_video_replace_passthrough(cb);
-    ops.kill_feed_proc(FeedScheme::H264, cb);
-    ops.kill_feed_proc(FeedScheme::Nv21, cb);
-    ops.zero_shm_magic(ShmKind::Feed, cb);
+    rollback_video();
     return false;
   }
   return true;
@@ -208,6 +227,7 @@ bool DeviceStack::arm_video(const std::string& serial, FeedScheme scheme, const 
 void DeviceStack::disarm_video(const std::string& serial, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
+  std::lock_guard<std::mutex> lk(bring_up_mu_);
   ops.disable_video_replace_passthrough(cb);
   if (cb)
     cb(DeployStatus::info("wait camera pass-through frame window"));
@@ -222,15 +242,15 @@ void DeviceStack::disarm_video(const std::string& serial, const DeployCallback& 
   ops.kill_feed_proc(FeedScheme::H264, cb);
   ops.kill_feed_proc(FeedScheme::Nv21, cb);
   ops.zero_shm_magic(ShmKind::Feed, cb);
+  ops.unforward(kVideoTcpPort, cb);
 }
 
 bool DeviceStack::arm_audio(const std::string& serial, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
-  if (!prepare_artifacts_(ops, cb))
-    return false;
-
   std::lock_guard<std::mutex> lk(bring_up_mu_);
+  if (!prepare_artifacts_(serial, ops, cb))
+    return false;
 
   if (!ops.forward(kAudioTcpPort, cb))
     return false;
@@ -269,6 +289,7 @@ bool DeviceStack::arm_audio(const std::string& serial, const DeployCallback& cb)
 void DeviceStack::disarm_audio(const std::string& serial, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
+  std::lock_guard<std::mutex> lk(bring_up_mu_);
   ops.kill_feed_proc(FeedScheme::Pcm, cb);
   ops.zero_shm_magic(ShmKind::Audio, cb);
   ops.unforward(kAudioTcpPort, cb);
@@ -277,12 +298,14 @@ void DeviceStack::disarm_audio(const std::string& serial, const DeployCallback& 
 bool DeviceStack::enable_photo_mode(const std::string& serial, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
+  std::lock_guard<std::mutex> lk(bring_up_mu_);
   return ops.enable_photo_mode(cb);
 }
 
 bool DeviceStack::disable_photo_mode(const std::string& serial, const DeployCallback& cb)
 {
   PhoneOps ops(serial);
+  std::lock_guard<std::mutex> lk(bring_up_mu_);
   return ops.disable_photo_mode(cb);
 }
 

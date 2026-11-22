@@ -49,6 +49,7 @@ target_compile_definitions(imgui PUBLIC
 
 add_library(cr_secure_channel STATIC
     ${CMAKE_SOURCE_DIR}/../common/secure_channel/SecureSession.cpp
+    ${CMAKE_SOURCE_DIR}/../common/secure_channel/LocalTicketAuth.cpp
     ${CMAKE_SOURCE_DIR}/../common/secure_channel/vendor/monocypher/monocypher.c
 )
 target_include_directories(cr_secure_channel PUBLIC

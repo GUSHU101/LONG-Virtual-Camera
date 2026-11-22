@@ -17,9 +17,26 @@ bool HostStack::ensure_running(const std::string& serial, const cr::device::Depl
   std::lock_guard<std::mutex> lk(mu_);
   if (obs_ && obs_->running())
   {
-    if (preview_decode)
-      obs_->set_preview_decode(true);
-    return true;
+    if (session_serial_ != serial)
+    {
+      if (camera_on_ || sound_on_ || photo_on_)
+      {
+        if (cb)
+          cb(cr::device::DeployStatus::err(
+              "host session belongs to another device",
+              "active=" + session_serial_ + "; requested=" + serial + "; stop the active modes before switching"));
+        return false;
+      }
+      obs_->stop();
+      obs_.reset();
+      session_serial_.clear();
+    }
+    else
+    {
+      if (preview_decode)
+        obs_->set_preview_decode(true);
+      return true;
+    }
   }
 
   auto src = std::make_shared<ObsRtmpSource>();
@@ -37,6 +54,7 @@ bool HostStack::ensure_running(const std::string& serial, const cr::device::Depl
     return false;
   }
   obs_ = std::move(src);
+  session_serial_ = serial;
   return true;
 }
 
@@ -157,6 +175,12 @@ bool HostStack::any_active() const
   return camera_on_ || sound_on_ || photo_on_;
 }
 
+std::string HostStack::session_serial() const
+{
+  std::lock_guard<std::mutex> lk(mu_);
+  return session_serial_;
+}
+
 void HostStack::teardown_if_idle()
 {
   std::lock_guard<std::mutex> lk(mu_);
@@ -172,6 +196,7 @@ void HostStack::teardown_if_idle_locked()
     obs_->stop();
     obs_.reset();
   }
+  session_serial_.clear();
 }
 
 void HostStack::shutdown()
@@ -182,6 +207,7 @@ void HostStack::shutdown()
     obs_->stop();
     obs_.reset();
   }
+  session_serial_.clear();
   camera_on_ = sound_on_ = photo_on_ = false;
 }
 

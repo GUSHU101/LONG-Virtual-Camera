@@ -404,7 +404,7 @@ void PhoneOps::zero_shm_magic(ShmKind kind, const DeployCallback& cb)
 void PhoneOps::disable_video_replace_passthrough(const DeployCallback& cb)
 {
   // cr_feed_header::channel_state is at offset 48 in the fixed 64-byte
-  // v1 header. Keep magic/header intact so the mapped camhook observes
+  // v2 header. Keep magic/header intact so the mapped camhook observes
   // a clean READY->NONE transition and simply stops touching buffers.
   std::string cmd = std::string("if [ -f /data/cr/feed ]; then "
                                 "dd if=/dev/zero of=/data/cr/feed bs=1 seek=48 count=4 conv=notrunc 2>/dev/null; "

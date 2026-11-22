@@ -52,7 +52,7 @@ for %%F in (cr_injector cr_feed_proc libcr_hooks.so) do (
 echo.
 echo ====================================================
 echo  Built public Android artifacts: %OUT_DIR%
-echo  No backend or launch tickets
+echo  No backend or remote authorization tickets
 echo ====================================================
 exit /b 0
 

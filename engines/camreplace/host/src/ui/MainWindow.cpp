@@ -48,10 +48,17 @@ namespace
 
 struct UiState
 {
-  bool software_running = false; // hooks loaded / software lifecycle active
-  bool streaming = false;       // OBS source running
-  bool sound_replacing = false; // audio pump active
-  bool photo_replacing = false; // BLOB still-capture sub
+  // Deploy callbacks run on worker threads while ImGui reads these on the UI
+  // thread. Atomics remove the previous data races. Per-mode generations make
+  // stale completion callbacks harmless after a Stop or device switch.
+  std::atomic_bool software_running{false}; // camera hook loaded / lifecycle active
+  std::atomic_bool streaming{false};        // OBS camera source running
+  std::atomic_bool sound_replacing{false};  // explicitly enabled audio pump
+  std::atomic_bool photo_replacing{false};  // BLOB still-capture substitution
+  std::atomic_uint64_t software_operation{0};
+  std::atomic_uint64_t camera_operation{0};
+  std::atomic_uint64_t audio_operation{0};
+  std::atomic_uint64_t photo_operation{0};
   bool preview_on = true;       // toggled by preview button
   bool log_expanded = false; // log collapsed by default
 
@@ -230,8 +237,14 @@ void start_log_tail_if_enabled(const std::string& serial)
 
 void reset_replace_ui_state(bool reset_software)
 {
+  ++state().camera_operation;
+  ++state().audio_operation;
+  ++state().photo_operation;
   if (reset_software)
+  {
+    ++state().software_operation;
     state().software_running = false;
+  }
   state().streaming = false;
   state().sound_replacing = false;
   state().photo_replacing = false;
@@ -1160,7 +1173,12 @@ void draw_device_panel(float width, float alpha)
   // Dropdown of serials when more than one.
   if (devices.size() > 1)
   {
+    const bool device_locked = ui.software_running.load() ||
+                               ui.streaming.load() ||
+                               ui.sound_replacing.load() ||
+                               ui.photo_replacing.load();
     const cr::device::DeviceInfo* cur = resolve_selected(devices);
+    ImGui::BeginDisabled(device_locked);
     if (ImGui::BeginCombo("##serial", cur ? cur->serial.c_str() : "(none)"))
     {
       for (auto& d : devices)
@@ -1177,6 +1195,9 @@ void draw_device_panel(float width, float alpha)
       }
       ImGui::EndCombo();
     }
+    ImGui::EndDisabled();
+    if (device_locked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip("Stop software and all replacement modes before switching devices.");
   }
 
   const cr::device::DeviceInfo* d = resolve_selected(devices);
@@ -1281,13 +1302,15 @@ void draw_device_panel(float width, float alpha)
       {
         // Start tailing logcat so we can see the injector's output in UI.
         start_log_tail_if_enabled(d->serial);
+        const std::uint64_t operation = ++state().software_operation;
         state().software_running = true;
         cr::source::FeedController::start_software(d->serial,
-                                                   [](cr::device::DeployStatus s)
+                                                   [operation](cr::device::DeployStatus s)
                                                    {
                                                      const auto kind = s.kind;
                                                      deploy_log_push(std::move(s));
-                                                     if (kind == cr::device::DeployStatus::Kind::Err)
+                                                     if (kind == cr::device::DeployStatus::Kind::Err &&
+                                                         state().software_operation.load() == operation)
                                                      {
                                                        state().software_running = false;
                                                      }
@@ -1329,11 +1352,13 @@ void draw_device_panel(float width, float alpha)
       // a multi-second arm_video does not look like a dead click.
       state().software_running = true;
       state().streaming = true;
+      const std::uint64_t operation = ++state().camera_operation;
       cr::source::FeedController::start_replace_camera(d->serial,
-                                                       [](cr::device::DeployStatus s)
+                                                       [operation](cr::device::DeployStatus s)
                                                        {
                                                          deploy_log_push(s);
-                                                         if (s.kind == cr::device::DeployStatus::Kind::Err)
+                                                         if (s.kind == cr::device::DeployStatus::Kind::Err &&
+                                                             state().camera_operation.load() == operation)
                                                          {
                                                            state().streaming = false;
                                                          }
@@ -1346,6 +1371,7 @@ void draw_device_panel(float width, float alpha)
     if (device_menu_button("Stop replace camera", ImVec2(-1, 0), ButtonVariant::Destructive))
     {
       cr::log::section("Stop replace camera", "serial=" + d->serial);
+      ++state().camera_operation;
       cr::source::FeedController::stop_replace_camera(d->serial, [](cr::device::DeployStatus s) { deploy_log_push(std::move(s)); });
       state().streaming = false;
       cr::render::LivePreview::instance().reset();
@@ -1368,11 +1394,13 @@ void draw_device_panel(float width, float alpha)
       start_log_tail_if_enabled(d->serial);
       state().software_running = true;
       state().sound_replacing = true;
+      const std::uint64_t operation = ++state().audio_operation;
       cr::source::FeedController::start_replace_sound(d->serial,
-                                                      [](cr::device::DeployStatus s)
+                                                      [operation](cr::device::DeployStatus s)
                                                       {
                                                         deploy_log_push(s);
-                                                        if (s.kind == cr::device::DeployStatus::Kind::Err)
+                                                        if (s.kind == cr::device::DeployStatus::Kind::Err &&
+                                                            state().audio_operation.load() == operation)
                                                         {
                                                           state().sound_replacing = false;
                                                         }
@@ -1386,6 +1414,7 @@ void draw_device_panel(float width, float alpha)
     if (device_menu_button("Disable virtual microphone", ImVec2(-1, 0), ButtonVariant::Destructive))
     {
       cr::log::section("Stop replace sound", "serial=" + d->serial);
+      ++state().audio_operation;
       cr::source::FeedController::stop_replace_sound(d->serial, [](cr::device::DeployStatus s) { deploy_log_push(std::move(s)); });
       state().sound_replacing = false;
     }
@@ -1409,11 +1438,13 @@ void draw_device_panel(float width, float alpha)
       apply_video_start_settings();
       state().software_running = true;
       state().photo_replacing = true;
+      const std::uint64_t operation = ++state().photo_operation;
       cr::source::FeedController::start_replace_photo(d->serial,
-                                                      [](cr::device::DeployStatus s)
+                                                      [operation](cr::device::DeployStatus s)
                                                       {
                                                         deploy_log_push(s);
-                                                        if (s.kind == cr::device::DeployStatus::Kind::Err)
+                                                        if (s.kind == cr::device::DeployStatus::Kind::Err &&
+                                                            state().photo_operation.load() == operation)
                                                         {
                                                           state().photo_replacing = false;
                                                         }
@@ -1426,6 +1457,7 @@ void draw_device_panel(float width, float alpha)
     if (device_menu_button("Stop replace photo", ImVec2(-1, 0), ButtonVariant::Destructive))
     {
       cr::log::section("Stop replace photo", "serial=" + d->serial);
+      ++state().photo_operation;
       cr::source::FeedController::stop_replace_photo(d->serial, [](cr::device::DeployStatus s) { deploy_log_push(std::move(s)); });
       state().photo_replacing = false;
     }

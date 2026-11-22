@@ -1,4 +1,5 @@
 #include "SecureSession.h"
+#include "LocalTicketAuth.h"
 
 extern "C"
 {
@@ -40,13 +41,6 @@ bool equal(const std::uint8_t* a, const std::uint8_t* b, std::size_t size) noexc
     diff |= a[i] ^ b[i];
   return diff == 0;
 }
-bool all_zero(const std::uint8_t* p, std::size_t size) noexcept
-{
-  std::uint8_t acc = 0;
-  for (std::size_t i = 0; i < size; ++i)
-    acc |= p[i];
-  return acc == 0;
-}
 void append(std::vector<std::uint8_t>& out, Bytes in)
 {
   if (in.size)
@@ -81,9 +75,7 @@ CR_NOINLINE Status validate_local_ticket(const TicketView& view, StreamKind expe
   {
     return Status::failure(Error::ExpiredTicket);
   }
-  return all_zero(view.signature.data, view.signature.size)
-      ? Status{}
-      : Status::failure(Error::InvalidField);
+  return {};
 }
 
 CR_NOINLINE Status verify_peer_key_binding_marker(const std::array<std::uint8_t, kKeyBytes>& local_public, const std::array<std::uint8_t, kKeyBytes>& expected_local) noexcept
@@ -148,6 +140,12 @@ Status SecureSession::initialize(Role role, Bytes local_private, Bytes ticket_by
   std::array<std::uint8_t, kKeyBytes> shared{};
   crypto_x25519(shared.data(), local_private.data, peer_public.data());
   if (Status status = verify_shared_secret_marker(shared); !status)
+  {
+    crypto_wipe(local_public.data(), local_public.size());
+    crypto_wipe(shared.data(), shared.size());
+    return status;
+  }
+  if (Status status = verify_local_ticket(view, bytes_of(shared)); !status)
   {
     crypto_wipe(local_public.data(), local_public.size());
     crypto_wipe(shared.data(), shared.size());

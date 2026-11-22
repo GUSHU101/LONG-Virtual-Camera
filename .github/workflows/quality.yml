@@ -35,6 +35,17 @@ jobs:
           /tmp/ring_access_test
           gcc -std=c11 -Wall -Wextra -Werror tests/camreplace_ring_test.c -o /tmp/camreplace_ring_test
           /tmp/camreplace_ring_test
+      - name: Authenticated media channel tests
+        run: |
+          gcc -std=c99 -Wall -Wextra -Werror -c \
+            engines/camreplace/common/secure_channel/vendor/monocypher/monocypher.c \
+            -o /tmp/monocypher.o
+          g++ -std=c++20 -Wall -Wextra -Werror \
+            tests/secure_channel_test.cpp \
+            engines/camreplace/common/secure_channel/SecureSession.cpp \
+            engines/camreplace/common/secure_channel/LocalTicketAuth.cpp \
+            /tmp/monocypher.o -o /tmp/secure_channel_test
+          /tmp/secure_channel_test
 
   android-native:
     runs-on: ubuntu-22.04

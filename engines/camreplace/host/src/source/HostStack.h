@@ -54,6 +54,11 @@ public:
   bool sound_active() const;
   bool any_active() const;
 
+  // Serial that owns the current OBS/ADB-forward session. Empty when no host
+  // pipeline exists. Stop operations use this instead of whichever phone the
+  // UI happens to have selected after a disconnect or device-list reorder.
+  std::string session_serial() const;
+
   // If no mode is active, drop the ObsRtmpSource so the next Start
   // gets a fresh state. No-op when at least one mode is still up.
   void teardown_if_idle();
@@ -74,6 +79,7 @@ private:
 
   mutable std::mutex mu_;
   std::shared_ptr<ObsRtmpSource> obs_;
+  std::string session_serial_;
   bool camera_on_ = false;
   bool sound_on_ = false;
   bool photo_on_ = false;
