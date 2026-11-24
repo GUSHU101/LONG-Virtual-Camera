@@ -185,6 +185,22 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertIn('strcmp(process, "cameraserver") != 0', native)
         self.assertIn("Camera3OutputStream21queueBufferToConsumer", native)
 
+    def test_picker_result_is_not_blocked_by_startup_refresh(self) -> None:
+        activity = (MODULE / "java/com/gushu/longvc/MainActivity.java").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("if (!documentPickerOpen && !busy && !emergencyBusy)", activity)
+        self.assertLess(activity.index("documentPickerOpen = true;"),
+                        activity.index("startActivityForResult(intent, requestCode)"))
+        self.assertIn("outState.putBoolean(PICKER_OPEN, documentPickerOpen)", activity)
+
+    def test_injector_discovers_services_by_executable(self) -> None:
+        source = (ROOT / "engines/camreplace/android/injector/src/ptrace_arm64.cpp"
+                  ).read_text(encoding="utf-8")
+        lookup = source.split("pid_t find_pid(", 1)[1]
+        self.assertIn('"/proc/%s/exe"', lookup)
+        self.assertNotIn('"/proc/%s/comm"', lookup)
+
 
 if __name__ == "__main__":
     unittest.main()

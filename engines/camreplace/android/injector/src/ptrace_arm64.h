@@ -52,6 +52,6 @@ bool find_writable_mapping(pid_t pid, uintptr_t addr, uintptr_t& start, uintptr_
 uintptr_t lookup_symbol(pid_t pid, const char* so_basename, const char* symbol);
 
 // Handy: find a PID by short process name via /proc/*/comm.
-pid_t find_pid(const char* comm_name);
+pid_t find_pid(const char* executable_name);
 
 } // namespace cr::inj

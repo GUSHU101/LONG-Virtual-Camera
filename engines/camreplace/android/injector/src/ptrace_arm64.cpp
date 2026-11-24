@@ -472,9 +472,10 @@ uintptr_t lookup_symbol(pid_t pid, const char* so_basename, const char* sym)
   return base + off;
 }
 
-// PID lookup by /proc/<pid>/comm
+// Service identity is the executable. Binder can rename the leader thread's
+// comm while the CameraService is active.
 
-pid_t find_pid(const char* comm_name)
+pid_t find_pid(const char* executable_name)
 {
   DIR* d = opendir("/proc");
   if (!d)
@@ -483,21 +484,18 @@ pid_t find_pid(const char* comm_name)
   pid_t found = 0;
   for (dirent* e; (e = readdir(d));)
   {
-    if (e->d_name[0] < '0' || e->d_name[0] > '9')
+    const size_t name_length = strspn(e->d_name, "0123456789");
+    if (name_length == 0 || e->d_name[name_length] != '\0' || name_length > 10)
       continue;
     char path[64];
-    snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
-    FILE* f = fopen(path, "re");
-    if (!f)
+    snprintf(path, sizeof(path), "/proc/%s/exe", e->d_name);
+    char executable[512];
+    const ssize_t length = readlink(path, executable, sizeof(executable) - 1);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(executable) - 1)
       continue;
-    char buf[64] = {};
-    fgets(buf, sizeof(buf), f);
-    fclose(f);
-    // /proc/N/comm has a trailing \n.
-    size_t n = strlen(buf);
-    if (n && buf[n - 1] == '\n')
-      buf[n - 1] = 0;
-    if (strcmp(buf, comm_name) == 0)
+    executable[length] = '\0';
+    const char* slash = strrchr(executable, '/');
+    if (slash && strcmp(slash + 1, executable_name) == 0)
     {
       found = (pid_t) atoi(e->d_name);
       break;

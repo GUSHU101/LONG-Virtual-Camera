@@ -130,7 +130,7 @@ CR_NOINLINE bool parse(int argc, char** argv, Args& out)
 
 CR_NOINLINE pid_t resolve_target(const char* spec)
 {
-  // Numeric → use as-is, else treat as /proc/*/comm name.
+  // Numeric PID or executable basename. Binder worker names can change comm.
   char* end = nullptr;
   long p = strtol(spec, &end, 10);
   if (end && *end == '\0' && p > 0)

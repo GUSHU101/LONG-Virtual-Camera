@@ -114,7 +114,8 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
+            applicationIdSuffix = providers.gradleProperty("longvc.debugApplicationIdSuffix")
+                    .getOrElse(".debug")
             versionNameSuffix = "-debug"
         }
         release {

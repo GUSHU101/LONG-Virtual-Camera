@@ -296,11 +296,10 @@ wait_service() {
 }
 
 camera_packages() {
-  camera_ds=$(dumpsys media.camera 2>/dev/null)
-  {
-    say "$camera_ds" | sed -nE 's/.*Client Package Name: *([A-Za-z0-9._]+).*/\1/p'
-    say "$camera_ds" | sed -nE 's/.*client for package ([A-Za-z0-9._]+).*/\1/p'
-  } | head -n 3 | sort -u
+  dumpsys media.camera 2>/dev/null |
+    sed -nE -e 's/.*Client Package Name: *([A-Za-z0-9._]+).*/\1/p' \
+      -e 's/.*client for package ([A-Za-z0-9._]+).*/\1/p' |
+    head -n 3 | sort -u
 }
 
 remember_and_close_camera() {
@@ -346,11 +345,11 @@ ensure_camera_hook() {
   hook_pid cameraserver "$CAM_READY" >/dev/null 2>&1 && return 0
 
   remember_and_close_camera
-  if pidof cameraserver >/dev/null 2>&1; then
-    killall -q cameraserver >/dev/null 2>&1 ||
-      killall cameraserver >/dev/null 2>&1 || { restore_camera; return 1; }
+  camera_previous=$(pidof -s cameraserver 2>/dev/null)
+  if [ -n "$camera_previous" ]; then
+    kill -TERM "$camera_previous" 2>/dev/null || { restore_camera; return 1; }
   fi
-  if ! wait_service cameraserver || ! prepare_camera_ready; then
+  if ! wait_service cameraserver "$camera_previous" || ! prepare_camera_ready; then
     restore_camera
     return 1
   fi

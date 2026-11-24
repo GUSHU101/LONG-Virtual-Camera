@@ -31,6 +31,7 @@ public final class MainActivity extends Activity
     private static final int PICK_VIDEO = 1001;
     private static final int PICK_IMAGE = 1002;
     private static final int PICK_AUDIO = 1003;
+    private static final String PICKER_OPEN = "document_picker_open";
 
     private RootController rootController;
     private XposedService xposedService;
@@ -56,6 +57,7 @@ public final class MainActivity extends Activity
     private boolean rendering;
     private boolean busy;
     private boolean emergencyBusy;
+    private boolean documentPickerOpen;
     private boolean destroyed;
     private long operationGeneration;
     private RuntimeState lastState;
@@ -63,6 +65,8 @@ public final class MainActivity extends Activity
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        documentPickerOpen = savedInstanceState != null
+                && savedInstanceState.getBoolean(PICKER_OPEN);
         setContentView(R.layout.activity_main);
         rootController = new RootController(this);
 
@@ -133,7 +137,19 @@ public final class MainActivity extends Activity
     protected void onStart() {
         super.onStart();
         LongVcApplication.addServiceStateListener(this, true);
+        // The picker result may arrive after onStart. A background refresh
+        // cannot take the operation slot from the pending user import.
+        if (!documentPickerOpen && !busy && !emergencyBusy) refreshOnEntry();
+    }
+
+    private void refreshOnEntry() {
         runOperation("正在检查 LSPosed 与 root 状态…", rootController::requestRootAndReadStatus);
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        outState.putBoolean(PICKER_OPEN, documentPickerOpen);
+        super.onSaveInstanceState(outState);
     }
 
     @Override
@@ -154,14 +170,26 @@ public final class MainActivity extends Activity
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType(mime);
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        startActivityForResult(intent, requestCode);
+        documentPickerOpen = true;
+        try {
+            startActivityForResult(intent, requestCode);
+        } catch (android.content.ActivityNotFoundException error) {
+            documentPickerOpen = false;
+            operationLog.setText(getString(R.string.operation_failed, safeMessage(error)));
+        }
     }
 
     @Override
     @SuppressWarnings("deprecation")
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        if (requestCode != PICK_VIDEO && requestCode != PICK_IMAGE &&
+                requestCode != PICK_AUDIO) return;
+        documentPickerOpen = false;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            if (lastState == null && !busy && !emergencyBusy) refreshOnEntry();
+            return;
+        }
         Uri uri = data.getData();
         switch (requestCode) {
             case PICK_VIDEO -> runOperation("正在校验并导入本地视频…",
