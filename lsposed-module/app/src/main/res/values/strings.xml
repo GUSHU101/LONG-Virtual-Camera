@@ -51,6 +51,11 @@
     <string name="scope_reloading">system_server 正在更新模块</string>
     <string name="scope_reload_failed">system_server 模块更新失败；请查看管理器日志</string>
     <string name="operation_failed">操作失败：%1$s</string>
+    <string name="operation_failed_with_status">操作失败：%1$s\n\n%2$s</string>
+    <string name="root_operation_in_progress">另一项 Root 操作仍在执行。结束后可刷新状态。</string>
+    <string name="recovery_in_progress">正在中断普通任务并验证系统服务恢复…</string>
+    <string name="recovery_unverified">恢复未通过验证：%1$s\n\n%2$s</string>
+    <string name="runtime_state_unknown">暂时无法确认运行状态。%1$s</string>
     <string name="recovery_verified">紧急恢复已验证完成。\n%1$s</string>
     <string name="scope_approved">%1$s 的 system 作用域已批准。系统层进程的加载状态见上方。</string>
     <string name="scope_failed">system 作用域申请失败：%1$s</string>

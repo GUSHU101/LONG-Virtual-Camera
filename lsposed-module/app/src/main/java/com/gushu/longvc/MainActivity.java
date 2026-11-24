@@ -226,11 +226,8 @@ public final class MainActivity extends Activity
             renderState(lastState);
             return;
         }
-        final long generation = ++operationGeneration;
-        busy = true;
-        operationLog.setText(pending);
-        renderControls();
-        LongVcApplication.executeRootOperation(() -> {
+        final long generation = operationGeneration + 1;
+        boolean accepted = LongVcApplication.executeRootOperation(() -> {
             try {
                 RuntimeState state = operation.run();
                 runOnUiThreadIfAlive(() -> {
@@ -241,26 +238,25 @@ public final class MainActivity extends Activity
                     renderState(display);
                     operationLog.setText(buildSummary(display));
                 });
-            } catch (Throwable error) {
-                runOnUiThreadIfAlive(() -> {
-                    if (generation != operationGeneration) return;
-                    busy = false;
-                    operationLog.setText(getString(R.string.operation_failed, safeMessage(error)));
-                    Toast.makeText(this, "操作失败，请查看日志", Toast.LENGTH_LONG).show();
-                    renderState(lastState);
-                });
+            } catch (Exception error) {
+                showOperationFailure(generation, false, error);
             }
         });
+        if (!accepted) {
+            operationLog.setText(R.string.root_operation_in_progress);
+            renderState(lastState);
+            return;
+        }
+        operationGeneration = generation;
+        busy = true;
+        operationLog.setText(pending);
+        renderControls();
     }
 
     private void runEmergencyStop() {
         if (emergencyBusy) return;
-        final long generation = ++operationGeneration;
-        busy = false;
-        emergencyBusy = true;
-        operationLog.setText("正在中断普通任务、停止全部替换并验证系统服务恢复…");
-        renderControls();
-        LongVcApplication.executeEmergencyOperation(() -> {
+        final long generation = operationGeneration + 1;
+        boolean accepted = LongVcApplication.executeEmergencyOperation(() -> {
             try {
                 RuntimeState state = rootController.run(RootController.Action.STOP_ALL);
                 runOnUiThreadIfAlive(() -> {
@@ -272,17 +268,48 @@ public final class MainActivity extends Activity
                     operationLog.setText(getString(R.string.recovery_verified,
                             buildSummary(display)));
                 });
-            } catch (Throwable error) {
-                runOnUiThreadIfAlive(() -> {
-                    if (generation != operationGeneration) return;
-                    emergencyBusy = false;
-                    operationLog.setText(getString(R.string.operation_failed,
-                            safeMessage(error)));
-                    Toast.makeText(this, "恢复未通过验证，请立即重启手机",
-                            Toast.LENGTH_LONG).show();
-                    renderState(lastState);
-                });
+            } catch (Exception error) {
+                showOperationFailure(generation, true, error);
             }
+        });
+        if (!accepted) {
+            operationLog.setText(R.string.recovery_in_progress);
+            return;
+        }
+        operationGeneration = generation;
+        busy = false;
+        emergencyBusy = true;
+        operationLog.setText(R.string.recovery_in_progress);
+        renderControls();
+    }
+
+    private void showOperationFailure(long generation, boolean recovery, Exception error) {
+        RuntimeState observed = null;
+        String statusError = "";
+        if (error instanceof InterruptedException) {
+            Thread.currentThread().interrupt();
+        } else if (!Thread.currentThread().isInterrupted()) {
+            try {
+                observed = rootController.requestRootAndReadStatus();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            } catch (Exception readFailure) {
+                statusError = safeMessage(readFailure);
+            }
+        }
+        final RuntimeState current = observed;
+        final String readError = statusError;
+        runOnUiThreadIfAlive(() -> {
+            if (generation != operationGeneration) return;
+            busy = false;
+            emergencyBusy = false;
+            lastState = current == null ? null : preserveEphemeralObsKey(current);
+            renderState(lastState);
+            String status = current == null
+                    ? getString(R.string.runtime_state_unknown, readError)
+                    : buildSummary(lastState);
+            operationLog.setText(getString(recovery ? R.string.recovery_unverified
+                    : R.string.operation_failed_with_status, safeMessage(error), status));
         });
     }
 
@@ -357,7 +384,7 @@ public final class MainActivity extends Activity
         rootButton.setEnabled(!blocked);
         installButton.setEnabled(!blocked && rootReady);
         // Emergency recovery remains actionable during a long media import.
-        stopButton.setEnabled(!emergencyBusy && rootReady);
+        stopButton.setEnabled(!emergencyBusy);
         refreshButton.setEnabled(!blocked);
         scopeButton.setEnabled(!blocked && canRequestSystemScope);
         selectVideoButton.setEnabled(!blocked && rootReady);
@@ -455,6 +482,8 @@ public final class MainActivity extends Activity
     }
 
     private static String buildSummary(RuntimeState state) {
+        if (!state.root) return "Root 无法确认，运行状态未知。\n" + state.raw;
+        if (!state.controllerVerified) return "当前 APK 的控制器未校验，运行状态未知。";
         return "输入源：" + sourceLabel(state)
                 + "\n全局相机：" + cameraState(state, state.cameraEnabled)
                 + "\n照片替换：" + cameraState(state, state.photoEnabled)

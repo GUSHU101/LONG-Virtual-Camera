@@ -32,6 +32,13 @@ final class RootShell {
                     && streamError == null;
         }
 
+        boolean hasLine(String expected) {
+            for (String line : output.split("\\R")) {
+                if (expected.equals(line.trim())) return true;
+            }
+            return false;
+        }
+
         String describe() {
             if (timedOut) return "root command timed out";
             if (streamError != null) return "root stream failed: " + streamError.getMessage();
@@ -60,6 +67,7 @@ final class RootShell {
         if (timeoutSeconds < 1L || timeoutSeconds > 1_800L) {
             throw new IllegalArgumentException("invalid root timeout");
         }
+        checkCancellation();
         Process process = new ProcessBuilder("su", "-c", command)
                 .redirectErrorStream(true)
                 .start();
@@ -93,23 +101,18 @@ final class RootShell {
         boolean finished;
         try {
             finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+            if (!finished) terminate(process, input, reader, writer);
+            writer.join(3_000L);
+            reader.join(3_000L);
+            if (finished && (writer.isAlive() || reader.isAlive())) {
+                terminate(process, input, reader, writer);
+                writer.join(1_000L);
+                reader.join(1_000L);
+            }
         } catch (InterruptedException e) {
             terminate(process, input, reader, writer);
             Thread.currentThread().interrupt();
             throw e;
-        }
-        if (!finished) terminate(process, input, reader, writer);
-
-        writer.join(3_000L);
-        reader.join(3_000L);
-        if (writer.isAlive()) writer.interrupt();
-        if (reader.isAlive()) reader.interrupt();
-        if (writer.isAlive() || reader.isAlive()) {
-            closeQuietly(input);
-            closeQuietly(process.getOutputStream());
-            closeQuietly(process.getInputStream());
-            writer.join(1_000L);
-            reader.join(1_000L);
         }
 
         int exit = finished && !process.isAlive() ? process.exitValue() : -1;
@@ -121,10 +124,16 @@ final class RootShell {
         return new Result(exit, capture.text(), !finished, capture.truncated, error);
     }
 
+    static void checkCancellation() throws InterruptedException {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException("root operation cancelled");
+        }
+    }
+
     private static void terminate(Process process, InputStream source,
                                   Thread reader, Thread writer) {
-        closeQuietly(source);
-        closeQuietly(process.getOutputStream());
+        writer.interrupt();
+        reader.interrupt();
         process.destroy();
         try {
             if (!process.waitFor(500L, TimeUnit.MILLISECONDS)) {
@@ -135,9 +144,13 @@ final class RootShell {
             process.destroyForcibly();
             Thread.currentThread().interrupt();
         }
-        closeQuietly(process.getInputStream());
-        writer.interrupt();
-        reader.interrupt();
+        // A document provider can block in close(). Terminate the process
+        // first, then release the provider stream on a background thread.
+        if (source != null) {
+            Thread closer = new Thread(() -> closeQuietly(source), "longvc-root-input-close");
+            closer.setDaemon(true);
+            closer.start();
+        }
     }
 
     private static void closeQuietly(java.io.Closeable closeable) {

@@ -56,10 +56,15 @@ final class RootController {
         }
         RootShell.Result result = shell.execute(
                 PayloadInstaller.REMOTE_SCRIPT + " " + action.command, 45L);
-        if (!result.ok() || !result.output.contains("result=ok")) {
+        if (!result.ok() || !result.hasLine("result=ok")
+                || !result.hasLine("action=" + action.command)) {
             throw new IOException(action.command + " failed: " + result.describe());
         }
-        return status();
+        RuntimeState state = status();
+        if (action == Action.STOP_ALL && !state.isStopped()) {
+            throw new IOException("stop-all returned but the runtime is still active or unverified");
+        }
+        return state;
     }
 
     RuntimeState stageVideo(Uri uri) throws IOException, InterruptedException {
@@ -106,11 +111,11 @@ final class RootController {
                     + "echo selinux=$(getenforce 2>/dev/null); echo result=degraded";
         }
         RootShell.Result result = shell.execute(command, 15L);
-        if (!result.ok()) return RuntimeState.noRoot(result.describe());
+        if (!result.ok()) {
+            throw new IOException("controller status unavailable: " + result.describe());
+        }
         boolean hashesCurrent = installer.isCurrent();
-        return RuntimeState.parse(result.output
-                + "\ninstalled=" + (hashesCurrent ? "1" : "0")
-                + "\ncontroller_verified=" + (scriptCurrent ? "1" : "0"));
+        return RuntimeState.parseController(result.output, scriptCurrent, hashesCurrent);
     }
 
     private RuntimeState replaceSource(SourceMutation mutation)
@@ -129,20 +134,24 @@ final class RootController {
             Thread.currentThread().interrupt();
             throw cancelled;
         } catch (IOException failure) {
-            if (active) restoreBestEffort(before, failure);
+            if (active && !Thread.currentThread().isInterrupted()) restoreBestEffort(before, failure);
             throw failure;
         } catch (RuntimeException failure) {
-            if (active) restoreBestEffort(before, failure);
+            if (active && !Thread.currentThread().isInterrupted()) restoreBestEffort(before, failure);
             throw failure;
         }
 
         try {
             restore(before);
             return status();
-        } catch (IOException | InterruptedException failure) {
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            throw cancelled;
+        } catch (IOException failure) {
             try {
                 run(Action.STOP_ALL);
-            } catch (Throwable cleanup) {
+            } catch (IOException | InterruptedException | RuntimeException cleanup) {
+                if (cleanup instanceof InterruptedException) Thread.currentThread().interrupt();
                 failure.addSuppressed(cleanup);
             }
             throw failure;
@@ -150,6 +159,7 @@ final class RootController {
     }
 
     private void restore(RuntimeState state) throws IOException, InterruptedException {
+        RootShell.checkCancellation();
         if (state.cameraEnabled) run(Action.ARM_CAMERA);
         if (state.photoEnabled) run(Action.ARM_PHOTO);
         if (state.micEnabled) run(Action.ARM_MIC);
@@ -158,7 +168,8 @@ final class RootController {
     private void restoreBestEffort(RuntimeState state, Throwable failure) {
         try {
             restore(state);
-        } catch (Throwable restoreFailure) {
+        } catch (IOException | InterruptedException | RuntimeException restoreFailure) {
+            if (restoreFailure instanceof InterruptedException) Thread.currentThread().interrupt();
             failure.addSuppressed(restoreFailure);
         }
     }

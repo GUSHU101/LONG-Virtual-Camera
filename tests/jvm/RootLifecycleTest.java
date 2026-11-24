@@ -1,0 +1,111 @@
+package com.gushu.longvc;
+
+import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public final class RootLifecycleTest {
+    private static void check(boolean condition, String message) {
+        if (!condition) throw new AssertionError(message);
+    }
+
+    private static void cancelsQueuedWork() {
+        ArrayDeque<Runnable> ordinary = new ArrayDeque<>();
+        ArrayDeque<Runnable> recovery = new ArrayDeque<>();
+        RootOperations tasks = new RootOperations(ordinary::add, recovery::add);
+        AtomicInteger ran = new AtomicInteger();
+        check(tasks.submit(() -> ran.addAndGet(10)), "first activity accepted");
+        check(!tasks.submit(() -> ran.addAndGet(100)), "second activity must not replace pending work");
+        check(tasks.recover(ran::incrementAndGet), "recovery accepted");
+        check(!tasks.recover(ran::incrementAndGet), "duplicate recovery rejected");
+        recovery.remove().run();
+        check(!tasks.submit(ran::incrementAndGet), "cancelled task still owns its slot");
+        ordinary.remove().run();
+        check(ran.get() == 1, "obsolete queued work ran after recovery");
+        check(tasks.submit(ran::incrementAndGet), "new action accepted after recovery");
+        ordinary.remove().run();
+        check(ran.get() == 2, "new action ran");
+    }
+
+    private static void interruptsRunningWork() throws Exception {
+        ExecutorService ordinary = Executors.newSingleThreadExecutor();
+        ArrayDeque<Runnable> recovery = new ArrayDeque<>();
+        RootOperations tasks = new RootOperations(ordinary, recovery::add);
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            check(tasks.submit(() -> {
+                started.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException expected) {
+                    interrupted.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException repeated) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }), "ordinary action accepted");
+            check(started.await(2, TimeUnit.SECONDS), "ordinary action started");
+            check(tasks.recover(() -> {}), "recovery can be scheduled during a task");
+            check(interrupted.await(2, TimeUnit.SECONDS), "correct worker interrupted");
+            recovery.remove().run();
+            check(!tasks.submit(() -> {}), "must wait for cancelled task cleanup");
+            release.countDown();
+            ordinary.submit(() -> {}).get(2, TimeUnit.SECONDS);
+            check(tasks.submit(() -> {}), "command accepted after cleanup");
+        } finally {
+            release.countDown();
+            ordinary.shutdownNow();
+        }
+    }
+
+    private static String snapshot(String result) {
+        return "schema=1\nroot=1\nresult=" + result + "\n"
+                + "camera_enabled=0\nphoto_enabled=0\nmic_enabled=0\n"
+                + "camera_hook_ready=0\naudio_hook_ready=0\nvideo_feeder_ready=0\n"
+                + "audio_feeder_ready=0\nvideo_channel_ready=0\naudio_channel_ready=0\n"
+                + "visual_source_ready=1\naudio_source_ready=0\nobs_listener_ready=0\n";
+    }
+
+    private static void verifiesRecoveryResult() throws Exception {
+        String stopped = snapshot("ok");
+        check(RuntimeState.parseController(stopped, true, true).isStopped(), "verified stop");
+        check(!RuntimeState.parseController(snapshot("degraded"), false, false).isStopped(),
+                "unknown controller cannot prove stop");
+        check(!RuntimeState.parseController(stopped.replace("camera_hook_ready=0",
+                "camera_hook_ready=1"), true, true).isStopped(), "live hook cannot be ignored");
+        for (String damaged : new String[]{stopped.replace("camera_enabled=0\n", ""),
+                stopped + "camera_enabled=1\n", stopped.replace("result=ok", "result=error")}) {
+            try {
+                RuntimeState.parseController(damaged, true, true);
+                throw new AssertionError("accepted an incomplete or ambiguous status");
+            } catch (IOException expected) {
+                // Failures must surface instead of becoming default OFF values.
+            }
+        }
+        RootShell.Result action = new RootShell.Result(0,
+                "warning: result=ok\naction=stop-all\n", false, false, null);
+        check(!action.hasLine("result=ok"), "diagnostic text cannot acknowledge success");
+        Thread.currentThread().interrupt();
+        try {
+            RootShell.checkCancellation();
+            throw new AssertionError("cancelled task can still launch a command");
+        } catch (InterruptedException expected) {
+            Thread.interrupted();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        cancelsQueuedWork();
+        interruptsRunningWork();
+        verifiesRecoveryResult();
+        System.out.println("Root lifecycle checks passed");
+    }
+}

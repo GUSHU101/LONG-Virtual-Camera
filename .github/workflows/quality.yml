@@ -26,6 +26,14 @@ jobs:
         run: |
           bash -n lsposed-module/app/src/main/payload/longvc-control.sh
           bash tests/controller_recovery_test.sh
+      - name: Root lifecycle and protocol tests
+        run: |
+          set -euo pipefail
+          src=lsposed-module/app/src/main/java/com/gushu/longvc
+          out=$(mktemp -d)
+          javac -d "$out" "$src/RootOperations.java" "$src/RuntimeState.java" \
+            "$src/RootShell.java" tests/jvm/RootLifecycleTest.java
+          java -cp "$out" com.gushu.longvc.RootLifecycleTest
       - name: Shared-memory and media geometry tests
         run: |
           set -euo pipefail

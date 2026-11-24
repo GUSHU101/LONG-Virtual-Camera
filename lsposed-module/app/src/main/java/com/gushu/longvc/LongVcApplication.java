@@ -6,9 +6,6 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.FutureTask;
-import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.libxposed.service.XposedService;
 import io.github.libxposed.service.XposedServiceHelper;
@@ -37,8 +34,8 @@ public final class LongVcApplication extends Application
                 thread.setDaemon(true);
                 return thread;
             });
-    private static final AtomicReference<Future<?>> ACTIVE_OPERATION =
-            new AtomicReference<>();
+    private static final RootOperations OPERATIONS =
+            new RootOperations(ROOT_OPERATIONS, EMERGENCY_OPERATIONS);
     private static volatile XposedService service;
 
     static void addServiceStateListener(ServiceStateListener listener, boolean notifyImmediately) {
@@ -50,21 +47,12 @@ public final class LongVcApplication extends Application
         LISTENERS.remove(listener);
     }
 
-    static void executeRootOperation(Runnable operation) {
-        FutureTask<Void> task = new FutureTask<>(operation, null) {
-            @Override
-            protected void done() {
-                ACTIVE_OPERATION.compareAndSet(this, null);
-            }
-        };
-        ACTIVE_OPERATION.set(task);
-        ROOT_OPERATIONS.execute(task);
+    static boolean executeRootOperation(Runnable operation) {
+        return OPERATIONS.submit(operation);
     }
 
-    static void executeEmergencyOperation(Runnable operation) {
-        Future<?> active = ACTIVE_OPERATION.getAndSet(null);
-        if (active != null) active.cancel(true);
-        EMERGENCY_OPERATIONS.execute(operation);
+    static boolean executeEmergencyOperation(Runnable operation) {
+        return OPERATIONS.recover(operation);
     }
 
     @Override

@@ -1,5 +1,6 @@
 package com.gushu.longvc;
 
+import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -60,15 +61,34 @@ final class RuntimeState {
         this.raw = raw;
     }
 
-    static RuntimeState parse(String raw) {
+    static RuntimeState parseController(String raw, boolean controllerVerified,
+                                        boolean hashesCurrent) throws IOException {
         Map<String, String> values = new LinkedHashMap<>();
         for (String line : raw.split("\\R")) {
             int delimiter = line.indexOf('=');
             if (delimiter <= 0) continue;
             String key = line.substring(0, delimiter).trim();
             String value = line.substring(delimiter + 1).trim();
-            if (key.matches("[a-z_]+")) values.put(key, value);
+            if (key.matches("[a-z_]+") && values.putIfAbsent(key, value) != null) {
+                throw new IOException("duplicate controller status key: " + key);
+            }
         }
+        String expectedResult = controllerVerified ? "ok" : "degraded";
+        if (!"1".equals(values.get("schema")) || !"1".equals(values.get("root"))
+                || !expectedResult.equals(values.get("result"))) {
+            throw new IOException("missing or unexpected controller status acknowledgement");
+        }
+        for (String key : new String[]{"camera_enabled", "photo_enabled", "mic_enabled",
+                "camera_hook_ready", "audio_hook_ready", "video_feeder_ready",
+                "audio_feeder_ready", "video_channel_ready", "audio_channel_ready",
+                "visual_source_ready", "audio_source_ready", "obs_listener_ready"}) {
+            String value = values.get(key);
+            if (!"0".equals(value) && !"1".equals(value)) {
+                throw new IOException("missing or invalid controller status: " + key);
+            }
+        }
+        values.put("installed", hashesCurrent ? "1" : "0");
+        values.put("controller_verified", controllerVerified ? "1" : "0");
         return new RuntimeState(values, raw, "");
     }
 
@@ -88,6 +108,13 @@ final class RuntimeState {
 
     boolean micHealthy() {
         return micEnabled && audioFeederReady && audioHookReady && audioChannelReady;
+    }
+
+    boolean isStopped() {
+        return root && controllerVerified && !cameraEnabled && !photoEnabled
+                && !micEnabled && !cameraHookReady && !audioHookReady
+                && !videoFeederReady && !audioFeederReady && !obsListenerReady
+                && !videoChannelReady && !audioChannelReady;
     }
 
     boolean usesObs() {
