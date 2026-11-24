@@ -9,9 +9,8 @@
  *   PhoneOps передаёт cr_injector. Public C++ API оставлен совместимым.
  *
  * Ограничения Pixel/Android:
- *   video schemes tcp_h264/tcp_nv21 используют один порт, поэтому перед
- *   переключением нужно останавливать старый cr_feed_proc и ждать факта
- *   остановки. Audio tcp_pcm независим, но readiness также проверяется через
+ *   Video uses one tcp_h264 lane. Audio tcp_pcm is independent, and readiness
+ *   is verified through process/log evidence rather than fixed sleeps.
  *   процесс и log listener, а не через fixed sleep.
  *
  * Подтверждено:
@@ -31,8 +30,8 @@
 //   * the bring-up mutex that serialises concurrent start_replace_*
 //   * the port constants the cr_feed_proc tunnels listen on
 // Delegates ALL shell composition to `PhoneOps`. DeviceStack itself is
-// just sequencing: "for arm_video — forward port, kill the other-scheme
-// cr_feed_proc if running, launch this one, inject camhook". Each step
+// just sequencing: "for arm_video — forward the port, launch the H.264
+// feeder, inject camhook". Each step
 // is a single PhoneOps call.
 // Why split this out of FeedController: the old monolith mixed
 // phone-side orchestration with host-side state (ObsRtmpSource lifecycle,
@@ -46,17 +45,13 @@
 
 #include <mutex>
 #include <string>
+#include <vector>
 #include <unordered_set>
 
 namespace cr::device
 {
 
 // adb-forward ports for the host↔phone tunnels.
-// kVideoTcpPort is reused for both transports (Compressed and Raw) —
-// cr_feed_proc on the phone runs ONE scheme at a time, so the two
-// can't race on the port. The host-side TcpFeedClient sends a
-// different magic + payload format depending on which scheme is
-// listening.
 constexpr int kVideoTcpPort = 8901;   // → /data/cr/feed
 constexpr int kAudioTcpPort = 8902;   // → /data/cr/audio
 constexpr int kRtmpListenPort = 1935; // PC-side RtmpServer (OBS dest)
@@ -74,6 +69,11 @@ public:
   // shutdown_all / uninstall so the next push runs the clean step.
   void reset_session();
 
+  // Devices actually touched by this process. Shutdown cleanup is deliberately
+  // scoped to this set; merely connecting/authorizing a phone must never make
+  // it a cleanup target.
+  std::vector<std::string> session_serials();
+
   // === Software lifecycle ===
   // Pure file copy. No service restarts, no hooks loaded.
   bool install(const std::string& serial, const DeployCallback& cb);
@@ -89,20 +89,17 @@ public:
 
   // Preload the camera hook only. Audio is intentionally untouched until the
   // user explicitly enables the virtual microphone through arm_audio().
-  // No cr_feed_proc is launched. video_scheme is just for diagnostic labelling
-  // on the camhook init — the runtime shm path is hardcoded.
-  bool load_hooks(const std::string& serial, FeedScheme video_scheme, const DeployCallback& cb);
+  // No cr_feed_proc is launched; the hook remains pass-through until armed.
+  bool load_hooks(const std::string& serial, const DeployCallback& cb);
 
-  // Restart cameraserver + audioserver to drop any hooks loaded during this or
-  // an earlier interrupted session. `relaunch_clients=true` re-monkey-launches
-  // camera apps we closed during the kill.
+  // Restart only services whose hooks this process prepared. `relaunch_clients`
+  // re-monkey-launches camera apps closed while dropping the camera hook.
   bool unload_hooks(const std::string& serial, bool relaunch_clients, const DeployCallback& cb);
 
   // === Per-mode arming (for replace_*) ===
   // Forward port + launch cr_feed_proc + ensure camhook is loaded.
-  // Idempotent on hook load. Kills any other-scheme cr_feed_proc
-  // first (Compressed↔Raw share the port).
-  bool arm_video(const std::string& serial, FeedScheme scheme, const DeployCallback& cb);
+  // Idempotent on hook load. H.264 is the product's only video transport.
+  bool arm_video(const std::string& serial, const DeployCallback& cb);
 
   // Kill cr_feed_proc(video) + zero feed shm magic. Hook stays loaded
   // and falls through to real sensor. Audio side untouched.
@@ -126,6 +123,7 @@ private:
   // Push artifacts if not pushed yet this session.
   bool prepare_artifacts_(const std::string& serial, PhoneOps& ops, const DeployCallback& cb);
   bool cleanup_device_(const std::string& serial, PhoneOps& ops, const DeployCallback& cb);
+  void remember_serial_(const std::string& serial);
 
   // Serialises concurrent start_replace_* threads through arm_video /
   // arm_audio so push_artifacts and inject can't interleave.
@@ -136,6 +134,11 @@ private:
   // phones; treating this as one global boolean skipped deployment on the
   // second serial and then operated on missing/stale artifacts.
   std::unordered_set<std::string> prepared_serials_;
+  // A service enters these sets only after this process explicitly prepares
+  // it for injection. Camera-only use therefore never restarts audioserver.
+  std::unordered_set<std::string> camera_hook_serials_;
+  std::unordered_set<std::string> audio_hook_serials_;
+  std::unordered_set<std::string> touched_serials_;
 };
 
 } // namespace cr::device

@@ -1,4 +1,4 @@
-# LONG Virtual Camera enhanced engine — Windows host application.
+# LONG Virtual Camera — unified Windows host application.
 #
 # Single statically-linked .exe. Everything that needs to land on the phone
 # (adb.exe + .so binaries + the cr_* native helpers) is embedded as a
@@ -14,6 +14,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include(Embed)
+
+# A distributable executable must never silently contain zero-byte adb or
+# Android payloads. Developers doing UI-only bootstrap work may opt in to
+# placeholders explicitly; Release/CI builds keep the safe default.
+option(CR_ALLOW_MISSING_RESOURCES "Allow zero-byte embedded resource placeholders" OFF)
 
 # --- warnings / build hygiene ------------------------------------------------
 add_compile_options(
@@ -70,6 +75,7 @@ add_executable(CameraReplace WIN32
     src/render/LivePreview.cpp
     src/resources/EmbeddedFs.cpp
     src/source/AudioPump.cpp
+    src/source/DesktopSource.cpp
     src/source/FeedController.cpp
     src/source/HostStack.cpp
     src/source/ObsRtmpSource.cpp
@@ -82,9 +88,8 @@ add_executable(CameraReplace WIN32
     src/util/Log.cpp
     src/util/SessionLog.cpp
     src/util/WinApiDyn.cpp
-    # Embeds CameraReplace.manifest (requireAdministrator + DPI-aware) so
-    # Windows shows the UAC prompt at process create. Refusing the prompt
-    # aborts the launch — there is no unprivileged code path.
+    # Embeds CameraReplace.manifest (asInvoker + DPI-aware). Host media and
+    # ADB access do not require Windows elevation; phone root is device-side.
     resources/CameraReplace.rc
 )
 
@@ -99,14 +104,18 @@ target_link_libraries(CameraReplace PRIVATE
     d3d11 dxgi d3dcompiler   # DX11 runtime
     mf mfplat mfreadwrite mfuuid   # Media Foundation: H.264 preview decoder
     ws2_32                          # Winsock: TcpFeedClient + RtmpServer
-    user32 gdi32 ole32 uuid winmm
+    user32 gdi32 ole32 oleaut32 uuid winmm comdlg32 strmiids advapi32
     imm32 dwmapi
 )
+
+if(CR_ALLOW_MISSING_RESOURCES)
+    target_compile_definitions(CameraReplace PRIVATE CR_ALLOW_MISSING_RESOURCES=1)
+endif()
 
 # Where the built exe lands.
 set_target_properties(CameraReplace PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-    OUTPUT_NAME "LONG-Virtual-Camera-Enhanced"
+    OUTPUT_NAME "LONG-Virtual-Camera"
 )
 
 # Strip symbols + subsystem:Windows (no console).
@@ -116,12 +125,13 @@ target_link_options(CameraReplace PRIVATE
 )
 
 target_compile_definitions(CameraReplace PRIVATE
-    CR_STARTUP_ASCII_INTRO=1)
+    CR_STARTUP_ASCII_INTRO=1
+    _WIN32_WINNT=0x0A00
+    WINVER=0x0A00)
 
 # --- embedded resources ------------------------------------------------------
-# Paths are resolved lazily — missing sources still configure (with
-# warnings) and generate empty placeholders. Rebuild the android tree
-# first to fill them in.
+# Every declared resource is mandatory unless CR_ALLOW_MISSING_RESOURCES was
+# explicitly enabled for a UI-only development build.
 
 if(NOT DEFINED ADB_SRC_DIR OR "${ADB_SRC_DIR}" STREQUAL "")
     if(NOT "$ENV{ADB_SRC_DIR}" STREQUAL "")
@@ -135,6 +145,23 @@ endif()
 if(NOT DEFINED ANDROID_OUT_DIR)
     set(ANDROID_OUT_DIR "${CMAKE_SOURCE_DIR}/../build/android/out")
 endif()
+if(NOT DEFINED MINGW_RUNTIME_DIR OR "${MINGW_RUNTIME_DIR}" STREQUAL "")
+    if(NOT "${LLVM_MINGW_ROOT}" STREQUAL "" AND
+       EXISTS "${LLVM_MINGW_ROOT}/x86_64-w64-mingw32/bin/libwinpthread-1.dll")
+        set(MINGW_RUNTIME_DIR "${LLVM_MINGW_ROOT}/x86_64-w64-mingw32/bin")
+    elseif(NOT "${LLVM_MINGW_ROOT}" STREQUAL "" AND
+           EXISTS "${LLVM_MINGW_ROOT}/bin/libwinpthread-1.dll")
+        set(MINGW_RUNTIME_DIR "${LLVM_MINGW_ROOT}/bin")
+    elseif(NOT "$ENV{LLVM_MINGW_ROOT}" STREQUAL "" AND
+           EXISTS "$ENV{LLVM_MINGW_ROOT}/x86_64-w64-mingw32/bin/libwinpthread-1.dll")
+        set(MINGW_RUNTIME_DIR "$ENV{LLVM_MINGW_ROOT}/x86_64-w64-mingw32/bin")
+    elseif(NOT "$ENV{LLVM_MINGW_ROOT}" STREQUAL "" AND
+           EXISTS "$ENV{LLVM_MINGW_ROOT}/bin/libwinpthread-1.dll")
+        set(MINGW_RUNTIME_DIR "$ENV{LLVM_MINGW_ROOT}/bin")
+    else()
+        get_filename_component(MINGW_RUNTIME_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    endif()
+endif()
 
 cr_embed_resource(TARGET CameraReplace NAME adb_exe
     FILE "${ADB_SRC_DIR}/adb.exe"               OUT_NAME "adb.exe")
@@ -143,7 +170,7 @@ cr_embed_resource(TARGET CameraReplace NAME adb_winapi_dll
 cr_embed_resource(TARGET CameraReplace NAME adb_winusbapi_dll
     FILE "${ADB_SRC_DIR}/AdbWinUsbApi.dll"      OUT_NAME "AdbWinUsbApi.dll")
 cr_embed_resource(TARGET CameraReplace NAME libwinpthread_dll
-    FILE "${ADB_SRC_DIR}/libwinpthread-1.dll"   OUT_NAME "libwinpthread-1.dll")
+    FILE "${MINGW_RUNTIME_DIR}/libwinpthread-1.dll" OUT_NAME "libwinpthread-1.dll")
 cr_embed_resource(TARGET CameraReplace NAME cr_injector
     FILE "${ANDROID_OUT_DIR}/cr_injector"       OUT_NAME "cr_injector")
 cr_embed_resource(TARGET CameraReplace NAME cr_feed_proc

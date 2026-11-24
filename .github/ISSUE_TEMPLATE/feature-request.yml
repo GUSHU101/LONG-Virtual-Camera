@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest a new capability or an improvement to ReCam.
+description: Suggest a new capability or an improvement to LONG Virtual Camera.
 title: "[Feature]: "
 body:
   - type: markdown
@@ -20,7 +20,7 @@ body:
     id: proposal
     attributes:
       label: Proposed behavior
-      description: Describe how you would like ReCam to work. Include relevant platforms, devices, or camera apps.
+      description: Describe how you would like LONG Virtual Camera to work. Include relevant Windows, Android device, firmware, or camera-app details.
     validations:
       required: true
 

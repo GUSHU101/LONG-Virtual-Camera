@@ -7,6 +7,7 @@ extern "C"
 
 #include <array>
 #include <cstring>
+#include <new>
 #include <vector>
 
 namespace cr::secure_channel::v2
@@ -38,15 +39,23 @@ Status compute_mac(std::array<std::uint8_t, 64>& output,
 
 } // namespace
 
-Status sign_local_ticket(Ticket& ticket, Bytes shared_secret)
+Status sign_local_ticket(Ticket& ticket, Bytes shared_secret) noexcept
 {
-  ticket.signature.fill(0);
-  std::vector<std::uint8_t> encoded;
-  if (Status status = encode_ticket(ticket, encoded); !status)
-    return status;
-  return compute_mac(ticket.signature,
-                     {encoded.data(), kTicketUnsignedBytes},
-                     shared_secret);
+  try
+  {
+    ticket.signature.fill(0);
+    std::vector<std::uint8_t> encoded;
+    if (Status status = encode_ticket(ticket, encoded); !status)
+      return status;
+    return compute_mac(ticket.signature,
+                       {encoded.data(), kTicketUnsignedBytes},
+                       shared_secret);
+  }
+  catch (const std::bad_alloc&)
+  {
+    ticket.signature.fill(0);
+    return Status::failure(Error::ResourceExhausted);
+  }
 }
 
 Status verify_local_ticket(const TicketView& ticket, Bytes shared_secret) noexcept

@@ -20,7 +20,7 @@ public:
   void wipe() noexcept;
 
 private:
-  bool receive_record_(std::vector<std::uint8_t>& record) noexcept;
+  bool receive_record_(std::vector<std::uint8_t>& record);
 
   int socket_fd_{-1};
   cr::secure_channel::v2::SecureSession session_{};

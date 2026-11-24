@@ -1,14 +1,14 @@
 #include "source/FeedController.h"
 #include "source/HostStack.h"
-#include "device/DeviceScanner.h"
 #include "device/DeviceStack.h"
 #include "util/Log.h"
 
-#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
-#include <vector>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -23,6 +23,82 @@ namespace
 // fast Start/Stop/device-switch sequence from interleaving half of two modes.
 std::mutex g_lifecycle_mu;
 
+// Deployment operations are owned by the process and executed in order. This
+// replaces detached threads, which could still call UI callbacks or adb after
+// App::run() had already torn down their dependencies.
+class OperationExecutor
+{
+public:
+  bool submit(std::function<void()> job)
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!accepting_)
+      return false;
+    if (!worker_.joinable())
+    {
+      try
+      {
+        worker_ = std::thread([this] { run(); });
+      }
+      catch (...)
+      {
+        return false;
+      }
+    }
+    jobs_.push_back(std::move(job));
+    cv_.notify_one();
+    return true;
+  }
+
+  void stop_and_join()
+  {
+    std::thread worker;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      accepting_ = false;
+      stopping_ = true;
+      jobs_.clear();
+      worker.swap(worker_);
+    }
+    cv_.notify_all();
+    if (worker.joinable())
+      worker.join();
+  }
+
+  ~OperationExecutor() { stop_and_join(); }
+
+private:
+  void run()
+  {
+    for (;;)
+    {
+      std::function<void()> job;
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
+        if (stopping_ && jobs_.empty())
+          return;
+        job = std::move(jobs_.front());
+        jobs_.pop_front();
+      }
+      job();
+    }
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> jobs_;
+  std::thread worker_;
+  bool accepting_ = true;
+  bool stopping_ = false;
+};
+
+OperationExecutor& operation_executor()
+{
+  static OperationExecutor executor;
+  return executor;
+}
+
 std::string owning_serial(HostStack& host, const std::string& requested,
                           const cr::device::DeployCallback& cb)
 {
@@ -34,11 +110,6 @@ std::string owning_serial(HostStack& host, const std::string& requested,
         "use active session device",
         "active=" + owner + "; selected=" + requested));
   return owner;
-}
-
-cr::device::FeedScheme video_scheme_for(Transport tr)
-{
-  return tr == Transport::Raw ? cr::device::FeedScheme::Nv21 : cr::device::FeedScheme::H264;
 }
 
 void report_worker_failure(const std::string& action, const char* phase, const std::string& detail, const cr::device::DeployCallback& cb)
@@ -95,17 +166,16 @@ template <class Fn> void launch_worker(std::string action, cr::device::DeployCal
 
   try
   {
-    std::thread(run).detach();
+    if (!operation_executor().submit(run))
+      report_worker_failure(job->action, ": operation rejected", "controller is shutting down or no worker thread is available", job->fail_cb);
   }
   catch (const std::exception& e)
   {
-    cr::log::warn("deploy", job->action + ": worker thread unavailable; running synchronously - " + e.what());
-    run();
+    report_worker_failure(job->action, ": operation rejected", e.what(), job->fail_cb);
   }
   catch (...)
   {
-    cr::log::warn("deploy", job->action + ": worker thread unavailable; running synchronously - unknown exception");
-    run();
+    report_worker_failure(job->action, ": operation rejected", "unknown executor error", job->fail_cb);
   }
 }
 
@@ -130,49 +200,21 @@ void cleanup_log_status(cr::device::DeployStatus s)
     cr::log::info("cleanup", line);
 }
 
-std::vector<std::string> known_authorized_serials()
-{
-  std::vector<std::string> out;
-  for (const auto& d : cr::device::DeviceScanner::instance().snapshot())
-  {
-    if (d.auth != cr::device::AuthState::Authorized || d.serial.empty())
-      continue;
-    bool seen = false;
-    for (const auto& serial : out)
-    {
-      if (serial == d.serial)
-      {
-        seen = true;
-        break;
-      }
-    }
-    if (!seen)
-      out.push_back(d.serial);
-  }
-  return out;
-}
-
 } // namespace
 
-// Transport selection (process-wide; UI prevents flip while a mode is up)
-
-namespace
+bool FeedController::set_desktop_source(DesktopSourceConfig config)
 {
-std::atomic<Transport> g_transport{Transport::Compressed};
+  return HostStack::instance().configure_source(std::move(config));
 }
 
-void FeedController::set_transport(Transport t)
+DesktopSourceConfig FeedController::desktop_source()
 {
-  Transport prev = g_transport.exchange(t);
-  if (prev != t)
-  {
-    cr::log::info("transport", std::string("switched to ") + (t == Transport::Raw ? "Raw (NV21 over PC decode)" : "Compressed (RTMP H.264)"));
-  }
+  return HostStack::instance().source_config();
 }
 
-Transport FeedController::transport()
+DesktopSourceStatus FeedController::desktop_source_status()
 {
-  return g_transport.load();
+  return HostStack::instance().source_status();
 }
 
 // Software lifecycle (Install / Delete / Start / Stop)
@@ -212,7 +254,7 @@ void FeedController::start_software(std::string serial, cr::device::DeployCallba
                 [serial = std::move(serial), cb = std::move(cb)]()
                 {
                   std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
-                  if (!cr::device::DeviceStack::instance().load_hooks(serial, video_scheme_for(transport()), cb))
+                  if (!cr::device::DeviceStack::instance().load_hooks(serial, cb))
                     return;
                   if (cb)
                     cb(cr::device::DeployStatus::ok("software running", "camera hook loaded; microphone remains untouched until explicitly enabled"));
@@ -245,10 +287,11 @@ void FeedController::start_replace_camera(std::string serial, cr::device::Deploy
                   std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   auto& dev = cr::device::DeviceStack::instance();
                   auto& host = HostStack::instance();
+                  const bool video_already_leased = host.photo_active();
 
                   if (!host.ensure_running(serial, cb, true))
                     return;
-                  if (!dev.arm_video(serial, video_scheme_for(transport()), cb))
+                  if (!video_already_leased && !dev.arm_video(serial, cb))
                   {
                     host.teardown_if_idle();
                     return;
@@ -257,7 +300,8 @@ void FeedController::start_replace_camera(std::string serial, cr::device::Deploy
                   {
                     if (cb)
                       cb(cr::device::DeployStatus::err("camera: enable forward failed"));
-                    cr::device::DeviceStack::instance().disarm_video(serial, cb);
+                    if (!video_already_leased)
+                      cr::device::DeviceStack::instance().disarm_video(serial, cb);
                     host.teardown_if_idle();
                     return;
                   }
@@ -299,10 +343,11 @@ void FeedController::start_replace_photo(std::string serial, cr::device::DeployC
                   std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
                   auto& dev = cr::device::DeviceStack::instance();
                   auto& host = HostStack::instance();
+                  const bool video_already_leased = host.camera_active();
 
                   if (!host.ensure_running(serial, cb, true))
                     return;
-                  if (!dev.arm_video(serial, video_scheme_for(transport()), cb))
+                  if (!video_already_leased && !dev.arm_video(serial, cb))
                   {
                     host.teardown_if_idle();
                     return;
@@ -311,7 +356,8 @@ void FeedController::start_replace_photo(std::string serial, cr::device::DeployC
                   {
                     if (cb)
                       cb(cr::device::DeployStatus::err("photo: enable forward failed"));
-                    cr::device::DeviceStack::instance().disarm_video(serial, cb);
+                    if (!video_already_leased)
+                      cr::device::DeviceStack::instance().disarm_video(serial, cb);
                     host.teardown_if_idle();
                     return;
                   }
@@ -322,7 +368,8 @@ void FeedController::start_replace_photo(std::string serial, cr::device::DeployC
                     // stage so an error never leaves camera replacement armed.
                     host.set_photo_active(false);
                     dev.disable_photo_mode(serial, cb);
-                    dev.disarm_video(serial, cb);
+                    if (!video_already_leased)
+                      dev.disarm_video(serial, cb);
                     host.teardown_if_idle();
                     return;
                   }
@@ -429,6 +476,9 @@ ObsRtmpSource::Status FeedController::obs_status()
 
 void FeedController::shutdown_all()
 {
+  // Stop accepting new commands, discard commands that never started, and
+  // wait for the one in-flight transaction before touching shared resources.
+  operation_executor().stop_and_join();
   cleanup_known_devices("app shutdown");
 }
 
@@ -440,22 +490,24 @@ void FeedController::cleanup_known_devices(const char* reason)
   // still alive.
   HostStack::instance().shutdown();
 
-  const auto serials = known_authorized_serials();
+  auto& devices = cr::device::DeviceStack::instance();
+  const auto serials = devices.session_serials();
   if (serials.empty())
   {
-    cr::log::info("cleanup", std::string(reason ? reason : "cleanup") + ": no authorized devices");
-    cr::device::DeviceStack::instance().reset_session();
+    cr::log::info("cleanup", std::string(reason ? reason : "cleanup") + ": no devices touched by this session");
+    devices.reset_session();
     return;
   }
 
   for (const auto& serial : serials)
   {
     cr::log::info("cleanup", std::string(reason ? reason : "cleanup") + ": wiping " + serial);
-    if (!cr::device::DeviceStack::instance().cleanup(serial, cleanup_log_status))
+    if (!devices.cleanup(serial, cleanup_log_status))
     {
       cr::log::warn("cleanup", "device cleanup reported failure for " + serial);
     }
   }
+  devices.reset_session();
 }
 
 } // namespace cr::source

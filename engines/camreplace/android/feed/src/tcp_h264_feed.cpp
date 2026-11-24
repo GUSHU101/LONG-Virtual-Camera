@@ -38,6 +38,8 @@
 #include "../include/cr_feed.h"
 #include "shm.h"
 #include "secure_channel_reader.h"
+#include "interruptible_socket.h"
+#include "media/FrameLayout.h"
 
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
@@ -52,6 +54,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -97,7 +100,6 @@ bool nv21_shape_supported(int w, int h, const char* tag)
 constexpr int32_t kFmtYUV420Planar = 19;     // I420
 constexpr int32_t kFmtYUV420SemiPlanar = 21; // NV12
 constexpr int32_t kFmtYUV420PackedSemiPlanar = 0x7fa30c04;
-constexpr int32_t kFmtYUV420Flexible = 0x7f420888;
 
 // /data/cr/feed writer. Identical contract to the raw NV21 path: a stable-
 // size reserved file, grown-only, that the hook's mmap can safely hold.
@@ -112,6 +114,11 @@ struct ShmOut
   size_t slot_bytes = 0;
   uint32_t cur_wi = 0; // last index we published into
   bool ready_logged = false;
+
+  ~ShmOut() { shutdown(OBF("scope exit").c_str()); }
+  ShmOut() = default;
+  ShmOut(const ShmOut&) = delete;
+  ShmOut& operator=(const ShmOut&) = delete;
 
   bool init(int ww, int hh)
   {
@@ -130,6 +137,13 @@ struct ShmOut
     fd = open(OBF("/data/cr/feed").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0)
       return false;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      LOGE(OBF("h264 shm writer lease is already owned: %s").c_str(), strerror(errno));
+      close(fd);
+      fd = -1;
+      return false;
+    }
     struct stat st;
     if (fstat(fd, &st) != 0)
     {
@@ -156,6 +170,7 @@ struct ShmOut
     map = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED)
     {
+      map = nullptr;
       close(fd);
       fd = -1;
       return false;
@@ -166,27 +181,32 @@ struct ShmOut
     h = hh;
 
     auto* hd = (cr_feed_header*) map;
-    const uint32_t prev_gen = atomic_load(&hd->generation);
-    hd->magic = 0u;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    const bool ownership_compatible = cr_feed_ownership_layout_valid(hd);
+    const uint32_t prev_gen =
+        ownership_compatible ? atomic_load(&hd->generation) : 0u;
+    const uint32_t prev_wi =
+        ownership_compatible ? atomic_load(&hd->write_index) : 0u;
+    __atomic_store_n(&hd->magic, 0u, __ATOMIC_RELEASE);
 
-    hd->version = CR_FEED_SHM_VERSION;
-    hd->width = (uint32_t) ww;
-    hd->height = (uint32_t) hh;
-    hd->stride = (uint32_t) ww;
-    hd->slot_size = (uint32_t) slot_bytes;
-    hd->num_slots = CR_FEED_NUM_SLOTS;
-    hd->format = 0; // NV21
-    atomic_store(&hd->write_index, 0u);
-    atomic_store(&hd->generation, prev_gen + 1u);
+    if (ownership_compatible)
+      cr_feed_recover_dead_writer(hd);
+    else
+      cr_feed_reset_slot_states(hd);
+
+    __atomic_store_n(&hd->version, CR_FEED_SHM_VERSION, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->width, (uint32_t) ww, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->height, (uint32_t) hh, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->stride, (uint32_t) ww, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->slot_size, (uint32_t) slot_bytes, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->num_slots, CR_FEED_NUM_SLOTS, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->format, 0u, __ATOMIC_RELAXED); // NV21
+    atomic_store(&hd->write_index, prev_wi % CR_FEED_NUM_SLOTS);
+    atomic_store(&hd->generation, cr_feed_next_generation(prev_gen));
     atomic_store(&hd->frame_counter, 0ull);
     atomic_store(&hd->channel_state, CR_CHANNEL_STATE_NONE);
-    for (uint32_t i = 0; i < CR_FEED_NUM_SLOTS; ++i)
-      atomic_store(&hd->slot_state[i], 0u);
-    cur_wi = 0;
+    cur_wi = prev_wi % CR_FEED_NUM_SLOTS;
 
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    hd->magic = CR_FEED_MAGIC;
+    __atomic_store_n(&hd->magic, CR_FEED_MAGIC, __ATOMIC_RELEASE);
     return true;
   }
 
@@ -201,8 +221,9 @@ struct ShmOut
     if (!cr_feed_claim_write(hd, cur_wi, &next))
       return;
     memcpy(slot0 + (size_t) next * CR_FEED_MAX_NV21_BYTES, src, slot_bytes);
-    atomic_store(&hd->channel_state, CR_CHANNEL_STATE_READY);
     cr_feed_publish(hd, next);
+    atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_READY,
+                          memory_order_release);
     if (!ready_logged)
     {
       LOGI(OBF("h264 shm READY transition on first publish (%dx%d slot=%zu)").c_str(), w, h, slot_bytes);
@@ -225,6 +246,8 @@ struct ShmOut
       }
       munmap(map, mapped);
       map = nullptr;
+      mapped = 0;
+      slot0 = nullptr;
     }
     if (fd >= 0)
     {
@@ -274,15 +297,6 @@ void i420_to_nv21_planes(const uint8_t* y_plane, const uint8_t* u_plane, const u
       out[x * 2 + 1] = u[x];
     }
   }
-}
-
-void y_to_nv21_mono(const uint8_t* y_plane, int ww, int hh, int src_y_stride, uint8_t* dst)
-{
-  for (int y = 0; y < hh; ++y)
-  {
-    memcpy(dst + (size_t) y * ww, y_plane + (size_t) y * src_y_stride, (size_t) ww);
-  }
-  memset(dst + (size_t) ww * hh, 128, (size_t) ww * hh / 2);
 }
 
 // Decoder session — handles one connected client end-to-end.
@@ -482,6 +496,11 @@ int serve_client(int client)
                need_keyframe ? 1 : 0,
                (unsigned long long) in_count,
                (unsigned long long) out_count);
+          // The keyframe is our recovery boundary. Without re-anchoring here,
+          // every following inter frame is still measured against the stale
+          // pre-stall clock and is dropped forever, despite a valid IDR.
+          pts_anchor_us = ph.pts_us;
+          wall_anchor_ms = arrived;
         }
         else
         {
@@ -531,21 +550,33 @@ int serve_client(int client)
         // We never set BUFFER_FLAG_CODEC_CONFIG explicitly because
         // the encoder inlines SPS/PPS at the head of every keyframe
         // packet on our wire. MediaCodec autodetects that fine.
-        AMediaCodec_queueInputBuffer(dec, (size_t) in_idx, 0, packet.size(), (uint64_t) ph.pts_us, cflags);
-        ++in_count;
-        if (is_keyframe)
+        const media_status_t queued = AMediaCodec_queueInputBuffer(
+            dec, (size_t) in_idx, 0, packet.size(), (uint64_t) ph.pts_us,
+            cflags);
+        if (queued == AMEDIA_OK)
         {
-          if (need_keyframe)
+          ++in_count;
+          if (is_keyframe)
           {
-            LOGI(OBF("h264 recovered on IDR pts=%lld in=%llu out=%llu late=%llu busy=%llu wait=%llu").c_str(),
-                 (long long) ph.pts_us,
-                 (unsigned long long) in_count,
-                 (unsigned long long) out_count,
-                 (unsigned long long) dropped_late,
-                 (unsigned long long) dropped_busy,
-                 (unsigned long long) dropped_until_key);
+            if (need_keyframe)
+            {
+              LOGI(OBF("h264 recovered on IDR pts=%lld in=%llu out=%llu late=%llu busy=%llu wait=%llu").c_str(),
+                   (long long) ph.pts_us,
+                   (unsigned long long) in_count,
+                   (unsigned long long) out_count,
+                   (unsigned long long) dropped_late,
+                   (unsigned long long) dropped_busy,
+                   (unsigned long long) dropped_until_key);
+            }
+            need_keyframe = false;
           }
-          need_keyframe = false;
+        }
+        else
+        {
+          ++dropped_busy;
+          LOGW(OBF("h264: queueInput failed status=%d key=%d bytes=%zu").c_str(),
+               (int) queued, is_keyframe ? 1 : 0, packet.size());
+          enter_need_keyframe(OBF("queue-input-failed").c_str(), true);
         }
       }
       else
@@ -557,6 +588,14 @@ int serve_client(int client)
              packet.size(),
              (long long) ph.pts_us,
              need_keyframe ? 1 : 0);
+        // dequeueInputBuffer transferred one codec slot to us. Queue an empty
+        // buffer to return ownership before flushing/resetting for the next
+        // IDR; otherwise repeated oversize packets can exhaust every slot.
+        const media_status_t returned = AMediaCodec_queueInputBuffer(
+            dec, (size_t) in_idx, 0, 0, (uint64_t) ph.pts_us, 0);
+        if (returned != AMEDIA_OK)
+          LOGW(OBF("h264: could not return undersized input slot status=%d").c_str(),
+               (int) returned);
         enter_need_keyframe(OBF("input-buffer-too-small").c_str(), true);
       }
     }
@@ -607,12 +646,14 @@ int serve_client(int client)
         const int sy = y_stride ? y_stride : w;
         const int suv = uv_stride ? uv_stride : sy;
         const int slice = slice_height > 0 ? slice_height : h;
-        const size_t offset = info.offset >= 0 ? (size_t) info.offset : 0;
-        const bool offset_ok = out_buf && offset < cap;
-        const uint8_t* base = offset_ok ? out_buf + offset : nullptr;
-        const size_t available = offset_ok ? cap - offset : 0;
+        cr::media::PlaneSpan window;
+        const bool window_ok = out_buf && cr::media::valid_codec_window(
+                                                cap, info.offset, info.size, window);
+        const uint8_t* base = window_ok ? out_buf + window.offset : nullptr;
+        const size_t available = window_ok ? window.bytes : 0;
+        bool converted = false;
 
-        if (!base || sy < w || suv < w || slice < h)
+        if (!base || sy < w || suv < w || slice < h || sy <= 0 || suv <= 0)
         {
           const uint64_t lw = ++output_layout_warns;
           if (lw <= 3 || (lw % 120) == 0)
@@ -628,143 +669,91 @@ int serve_client(int client)
                  w,
                  h);
           }
-          AMediaCodec_releaseOutputBuffer(dec, (size_t) out_idx, false);
-          continue;
         }
-        const size_t y_visible_bytes = (size_t) sy * (size_t) h;
-        if (y_visible_bytes > available)
+        else if (color_format == kFmtYUV420SemiPlanar ||
+                 color_format == kFmtYUV420PackedSemiPlanar)
         {
-          const uint64_t lw = ++output_layout_warns;
-          if (lw <= 3 || (lw % 120) == 0)
+          cr::media::Yuv420Layout layout;
+          if (cr::media::semiplanar_420(
+                  available, (uint32_t) w, (uint32_t) h, (uint32_t) sy,
+                  (uint32_t) slice, (uint32_t) suv, layout))
           {
-            LOGW(OBF("h264 output Y bounds rejected: need=%zu avail=%zu off=%d size=%d cap=%zu stride=%d slice=%d").c_str(),
-                 y_visible_bytes,
-                 available,
-                 (int) info.offset,
-                 (int) info.size,
-                 cap,
-                 sy,
-                 slice);
-          }
-          AMediaCodec_releaseOutputBuffer(dec, (size_t) out_idx, false);
-          continue;
-        }
-
-        if (color_format == kFmtYUV420SemiPlanar || color_format == kFmtYUV420PackedSemiPlanar)
-        {
-          const size_t need = (size_t) sy * (size_t) slice + (size_t) suv * (size_t) (h / 2);
-          if (need <= available)
-          {
-            nv12_to_nv21_planes(base, base + (size_t) sy * (size_t) slice, w, h, sy, suv, nv21.data());
+            nv12_to_nv21_planes(base, base + layout.u_or_uv.offset, w, h,
+                                sy, suv, nv21.data());
+            converted = true;
           }
           else
           {
             const uint64_t lw = ++output_layout_warns;
             if (lw <= 3 || (lw % 120) == 0)
-            {
-              LOGW(OBF("h264 semiplanar bounds fallback: need=%zu avail=%zu off=%d size=%d cap=%zu stride=%d uv=%d slice=%d").c_str(),
-                   need,
-                   available,
-                   (int) info.offset,
-                   (int) info.size,
-                   cap,
-                   sy,
-                   suv,
+              LOGW(OBF("h264 semiplanar layout rejected: valid=%zu off=%d size=%d cap=%zu stride=%d uv=%d slice=%d").c_str(),
+                   available, (int) info.offset, (int) info.size, cap, sy, suv,
                    slice);
-            }
-            y_to_nv21_mono(base, w, h, sy, nv21.data());
           }
         }
         else if (color_format == kFmtYUV420Planar)
         {
           const int chroma_stride = sy > 1 ? sy / 2 : w / 2;
-          const int chroma_slice = slice / 2;
-          const size_t y_bytes = (size_t) sy * (size_t) slice;
-          const size_t uv_bytes = (size_t) chroma_stride * (size_t) chroma_slice;
-          if (y_bytes + uv_bytes * 2 <= available)
+          cr::media::Yuv420Layout layout;
+          if (chroma_stride > 0 && cr::media::planar_420(
+                                       available, (uint32_t) w, (uint32_t) h,
+                                       (uint32_t) sy, (uint32_t) slice,
+                                       (uint32_t) chroma_stride, layout))
           {
-            const uint8_t* u = base + y_bytes;
-            const uint8_t* v = u + uv_bytes;
-            i420_to_nv21_planes(base, u, v, w, h, sy, chroma_stride, chroma_stride, nv21.data());
+            i420_to_nv21_planes(base, base + layout.u_or_uv.offset,
+                                base + layout.v.offset, w, h, sy,
+                                chroma_stride, chroma_stride, nv21.data());
+            converted = true;
           }
           else
           {
             const uint64_t lw = ++output_layout_warns;
             if (lw <= 3 || (lw % 120) == 0)
-            {
-              LOGW(OBF("h264 planar bounds fallback: need=%zu avail=%zu off=%d size=%d cap=%zu stride=%d slice=%d").c_str(),
-                   y_bytes + uv_bytes * 2,
-                   available,
-                   (int) info.offset,
-                   (int) info.size,
-                   cap,
-                   sy,
-                   slice);
-            }
-            y_to_nv21_mono(base, w, h, sy, nv21.data());
+              LOGW(OBF("h264 planar layout rejected: valid=%zu off=%d size=%d cap=%zu stride=%d chroma=%d slice=%d").c_str(),
+                   available, (int) info.offset, (int) info.size, cap, sy,
+                   chroma_stride, slice);
           }
-        }
-        else if (color_format == kFmtYUV420Flexible)
-        {
-          const uint64_t lw = ++output_layout_warns;
-          if (lw <= 3 || (lw % 120) == 0)
-          {
-            LOGW(OBF("h264 flexible output fallback: color=0x%x off=%d size=%d cap=%zu stride=%d uv=%d slice=%d").c_str(),
-                 color_format,
-                 (int) info.offset,
-                 (int) info.size,
-                 cap,
-                 sy,
-                 suv,
-                 slice);
-          }
-          y_to_nv21_mono(base, w, h, sy, nv21.data());
         }
         else
         {
-          // Unknown — monochrome fallback so the preview isn't
-          // stuck on a stale frame.
+          // Flexible YUV needs explicit plane metadata; proprietary/tiled
+          // formats need a verified adapter. Guessing UV offsets or publishing
+          // a grey frame would turn an unsupported layout into corrupted
+          // replacement, so keep the real camera frame instead.
           const uint64_t lw = ++output_layout_warns;
           if (lw <= 3 || (lw % 120) == 0)
           {
-            LOGW(OBF("h264 unknown output color fallback: color=0x%x off=%d size=%d cap=%zu stride=%d slice=%d").c_str(),
-                 color_format,
-                 (int) info.offset,
-                 (int) info.size,
-                 cap,
-                 sy,
+            LOGW(OBF("h264 unsupported output format: color=0x%x off=%d size=%d cap=%zu stride=%d uv=%d slice=%d").c_str(),
+                 color_format, (int) info.offset, (int) info.size, cap, sy, suv,
                  slice);
           }
-          y_to_nv21_mono(base, w, h, sy, nv21.data());
         }
-        const int64_t pub = now_ms();
-        if (out_count > 0 && (pub - last_pub_ms) > 500)
-        {
-          LOGW(OBF("h264 STALL in decoder: %lldms since last decoded frame (need_keyframe=%d late=%llu busy=%llu in=%llu out=%llu pts=%lld key=%d)").c_str(),
-               (long long) (pub - last_pub_ms),
-               need_keyframe ? 1 : 0,
-               (unsigned long long) dropped_late,
-               (unsigned long long) dropped_busy,
-               (unsigned long long) in_count,
-               (unsigned long long) out_count,
-               (long long) info.presentationTimeUs,
-               (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME) ? 1 : 0);
-        }
-        last_pub_ms = pub;
 
-        shm.publish_nv21(nv21.data());
-        ++out_count;
-        if (out_count <= 3 || (out_count % 120) == 0)
+        if (converted)
         {
-          LOGI(OBF("h264: decoded frame #%llu (in=%llu fmt=0x%x off=%d size=%d stride=%d uv=%d slice=%d)").c_str(),
-               (unsigned long long) out_count,
-               (unsigned long long) in_count,
-               color_format,
-               (int) info.offset,
-               (int) info.size,
-               sy,
-               suv,
-               slice);
+          const int64_t pub = now_ms();
+          if (out_count > 0 && (pub - last_pub_ms) > 500)
+          {
+            LOGW(OBF("h264 STALL in decoder: %lldms since last decoded frame (need_keyframe=%d late=%llu busy=%llu in=%llu out=%llu pts=%lld key=%d)").c_str(),
+                 (long long) (pub - last_pub_ms), need_keyframe ? 1 : 0,
+                 (unsigned long long) dropped_late,
+                 (unsigned long long) dropped_busy,
+                 (unsigned long long) in_count,
+                 (unsigned long long) out_count,
+                 (long long) info.presentationTimeUs,
+                 (info.flags & AMEDIACODEC_BUFFER_FLAG_KEY_FRAME) ? 1 : 0);
+          }
+          last_pub_ms = pub;
+
+          shm.publish_nv21(nv21.data());
+          ++out_count;
+          if (out_count <= 3 || (out_count % 120) == 0)
+          {
+            LOGI(OBF("h264: decoded frame #%llu (in=%llu fmt=0x%x off=%d size=%d stride=%d uv=%d slice=%d)").c_str(),
+                 (unsigned long long) out_count,
+                 (unsigned long long) in_count, color_format,
+                 (int) info.offset, (int) info.size, sy, suv, slice);
+          }
         }
       }
       AMediaCodec_releaseOutputBuffer(dec, (size_t) out_idx, false);
@@ -823,9 +812,11 @@ int cr_feed_run_tcp_h264(int port)
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
-    int client = accept(srv, nullptr, nullptr);
+    int client = cr::feed::accept_interruptible(srv, g_stop);
     if (client < 0)
     {
+      if (g_stop.load(std::memory_order_relaxed))
+        break;
       if (errno == EINTR)
         continue;
       LOGW(OBF("h264: accept: %s").c_str(), strerror(errno));

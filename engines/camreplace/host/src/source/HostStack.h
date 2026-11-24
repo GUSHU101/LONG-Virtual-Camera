@@ -4,7 +4,6 @@
 // Owns:
 //   * the (at most one) live ObsRtmpSource
 //   * the three mode flags (camera_on / sound_on / photo_on)
-//   * the wire_mode (H264 NAL forward vs. PC-decode + NV21 forward)
 // Coexistence rules enforced internally:
 //   * camera + sound  : both can run together. video_forward=true,
 //                       audio pump on.
@@ -19,6 +18,7 @@
 
 #include "device/DeployStatus.h"
 #include "source/AudioPump.h"
+#include "source/DesktopSource.h"
 #include "source/FeedController.h"
 #include "source/ObsRtmpSource.h"
 
@@ -39,6 +39,13 @@ public:
   // at start time — UI prevents transport switching while a mode
   // is active, so this stays valid for the session.
   bool ensure_running(const std::string& serial, const cr::device::DeployCallback& cb, bool preview_decode);
+
+  // ReCam-derived source selection. Configuration is immutable while a host
+  // session is active; the selected adapter publishes into the same RTMP
+  // server as OBS, so every downstream camera/photo/audio path is shared.
+  bool configure_source(DesktopSourceConfig config);
+  DesktopSourceConfig source_config() const;
+  DesktopSourceStatus source_status() const;
 
   // Mode flips. Each call updates the internal flag and drives
   // ObsRtmpSource::set_video_forward / start_audio / stop_audio
@@ -71,7 +78,6 @@ public:
 
 private:
   HostStack() = default;
-  void teardown_if_idle_locked();
   bool video_should_be_on_locked() const
   {
     return camera_on_ || photo_on_;
@@ -79,6 +85,8 @@ private:
 
   mutable std::mutex mu_;
   std::shared_ptr<ObsRtmpSource> obs_;
+  std::shared_ptr<DesktopSource> desktop_source_;
+  DesktopSourceConfig source_config_{};
   std::string session_serial_;
   bool camera_on_ = false;
   bool sound_on_ = false;

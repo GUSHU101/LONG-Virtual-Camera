@@ -135,7 +135,13 @@ SessionLog::SessionLog()
   std::error_code ec;
   fs::rename(session_path_, dir / "session.log.1", ec);
   const std::wstring write_mode = L"wb";
+#if defined(_MSC_VER)
+  if (_wfopen_s(&session_fp_, session_path_.wstring().c_str(),
+                write_mode.c_str()) != 0)
+    session_fp_ = nullptr;
+#else
   session_fp_ = _wfopen(session_path_.wstring().c_str(), write_mode.c_str());
+#endif
 
   write_session_header_();
 }
@@ -157,7 +163,7 @@ void SessionLog::write_session_header_()
   // log. Format kept stable so future tooling can grep `^HOST ` /
   // `^DEVICE ` to extract the diagnostic preamble.
   std::fprintf(session_fp_,
-               "============================================================\nLONG Virtual Camera enhanced session  %s\n"
+               "============================================================\nLONG Virtual Camera session  %s\n"
                "HOST  windows=%lu.%lu.%lu arch=%s built=%s %s\n============================================================\n",
                timestamp_now().c_str(), (unsigned long) os.major, (unsigned long) os.minor, (unsigned long) os.build, os.arch, __DATE__, __TIME__);
   std::fflush(session_fp_);

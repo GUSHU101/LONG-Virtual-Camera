@@ -27,6 +27,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <vector>
 
 namespace cr_feed
@@ -70,6 +71,8 @@ public:
   bool push(T&& item)
   {
     std::unique_lock<std::mutex> lk(mu_);
+    if (closed_)
+      return false;
     bool dropped = false;
     if (q_.size() >= cap_)
     {

@@ -148,6 +148,7 @@ class Streamer:
                 on_line(line)
         self._on_line = report
         self._proc = None
+        self._drain_thread = None
 
     def running(self):
         return self._proc is not None and self._proc.poll() is None
@@ -164,7 +165,9 @@ class Streamer:
                                       stderr=subprocess.PIPE, text=True,
                                       encoding="utf-8", errors="replace",
                                       bufsize=1, creationflags=_NO_WINDOW)
-        threading.Thread(target=self._drain, args=(self._proc,), daemon=True).start()
+        self._drain_thread = threading.Thread(target=self._drain,
+                                              args=(self._proc,), daemon=True)
+        self._drain_thread.start()
 
     def _drain(self, proc):
         for line in proc.stderr:
@@ -176,12 +179,29 @@ class Streamer:
             self._on_line(f"ffmpeg exited {rc}")
 
     def stop(self):
-        if not self.running():
-            self._proc = None
-            return
-        self._proc.terminate()
+        proc = self._proc
+        drain = self._drain_thread
+        stop_error = None
         try:
-            self._proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-        self._proc = None
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired as exc:
+                        stop_error = StreamerError("ffmpeg did not stop after terminate and kill")
+                        stop_error.__cause__ = exc
+            if drain:
+                drain.join(timeout=2)
+                if drain.is_alive() and stop_error is None:
+                    stop_error = StreamerError("ffmpeg log reader did not stop")
+        finally:
+            # Never retain stale process/thread ownership after every shutdown
+            # action has been attempted. A later Start must get a clean state.
+            self._drain_thread = None
+            self._proc = None
+        if stop_error:
+            raise stop_error

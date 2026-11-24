@@ -2,15 +2,21 @@
 #include "resources/Resources.h"
 #include "util/Log.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <Aclapi.h>
 #include <shlobj.h> // SHGetKnownFolderPath
 #include "util/WinApiDyn.h"
 
@@ -23,6 +29,8 @@ namespace
 {
 
 constexpr uint64_t kSplitMixIncrement = 0x9E3779B97F4A7C15ull;
+std::recursive_mutex g_extraction_mutex;
+std::atomic<uint64_t> g_stage_counter{0};
 
 uint64_t splitmix64_next(uint64_t& state) noexcept
 {
@@ -75,6 +83,10 @@ void xor_splitmix64_stream(unsigned char* data, size_t size, uint64_t seed) noex
 
 SecureBytes decode_blob(const Blob& b)
 {
+  if (b.size != 0 && !b.data)
+  {
+    throw std::runtime_error("embedded blob data missing");
+  }
   if (b.encoded_size < b.size)
   {
     throw std::runtime_error("embedded blob truncated");
@@ -112,16 +124,182 @@ fs::path local_appdata()
   return p;
 }
 
-fs::path bin_dir_cached;
-
 const fs::path& bin_dir()
 {
-  if (bin_dir_cached.empty())
-  {
-    bin_dir_cached = local_appdata() / "LONG-Virtual-Camera" / "bin";
-  }
-  return bin_dir_cached;
+  static const fs::path cached = local_appdata() / "LONG-Virtual-Camera" / "bin";
+  return cached;
 }
+
+void configure_trustee(EXPLICIT_ACCESSW& entry, PSID sid,
+                       TRUSTEE_TYPE type) noexcept
+{
+  entry = {};
+  entry.grfAccessPermissions = GENERIC_ALL;
+  entry.grfAccessMode = SET_ACCESS;
+  entry.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+  entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  entry.Trustee.TrusteeType = type;
+  entry.Trustee.ptstrName = reinterpret_cast<LPWSTR>(sid);
+}
+
+void secure_extraction_directory(const fs::path& directory)
+{
+  fs::create_directories(directory);
+  const DWORD attrs = GetFileAttributesW(directory.c_str());
+  if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) ||
+      (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
+  {
+    throw std::runtime_error("unsafe extraction directory");
+  }
+
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    throw std::runtime_error("OpenProcessToken failed: " + std::to_string(GetLastError()));
+
+  DWORD token_bytes = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &token_bytes);
+  std::vector<unsigned char> token_storage(token_bytes);
+  if (token_bytes == 0 ||
+      !GetTokenInformation(token, TokenUser, token_storage.data(), token_bytes,
+                           &token_bytes))
+  {
+    const DWORD error = GetLastError();
+    CloseHandle(token);
+    throw std::runtime_error("GetTokenInformation failed: " + std::to_string(error));
+  }
+  PSID user_sid = reinterpret_cast<TOKEN_USER*>(token_storage.data())->User.Sid;
+
+  std::array<unsigned char, SECURITY_MAX_SID_SIZE> system_storage{};
+  std::array<unsigned char, SECURITY_MAX_SID_SIZE> admins_storage{};
+  DWORD system_bytes = static_cast<DWORD>(system_storage.size());
+  DWORD admins_bytes = static_cast<DWORD>(admins_storage.size());
+  if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, system_storage.data(),
+                          &system_bytes) ||
+      !CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr,
+                          admins_storage.data(), &admins_bytes))
+  {
+    const DWORD error = GetLastError();
+    CloseHandle(token);
+    throw std::runtime_error("CreateWellKnownSid failed: " + std::to_string(error));
+  }
+
+  EXPLICIT_ACCESSW entries[3]{};
+  configure_trustee(entries[0], user_sid, TRUSTEE_IS_USER);
+  configure_trustee(entries[1], system_storage.data(), TRUSTEE_IS_USER);
+  configure_trustee(entries[2], admins_storage.data(), TRUSTEE_IS_GROUP);
+  PACL acl = nullptr;
+  const DWORD acl_error = SetEntriesInAclW(3, entries, nullptr, &acl);
+  if (acl_error != ERROR_SUCCESS)
+  {
+    CloseHandle(token);
+    throw std::runtime_error("SetEntriesInAcl failed: " + std::to_string(acl_error));
+  }
+
+  std::wstring mutable_path = directory.wstring();
+  const auto security_info = static_cast<SECURITY_INFORMATION>(
+      DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION);
+  const DWORD set_error = SetNamedSecurityInfoW(
+      mutable_path.data(), SE_FILE_OBJECT, security_info,
+      nullptr, nullptr, acl, nullptr);
+  LocalFree(acl);
+  CloseHandle(token);
+  if (set_error != ERROR_SUCCESS)
+    throw std::runtime_error("SetNamedSecurityInfo failed: " + std::to_string(set_error));
+}
+
+bool file_matches(const fs::path& path, const SecureBytes& expected)
+{
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec) || ec ||
+      fs::file_size(path, ec) != expected.v.size() || ec)
+    return false;
+
+  std::ifstream in(path, std::ios::binary);
+  std::array<unsigned char, 64u * 1024u> chunk{};
+  size_t offset = 0;
+  while (offset < expected.v.size())
+  {
+    const size_t want = std::min(chunk.size(), expected.v.size() - offset);
+    in.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(want));
+    if (!in || static_cast<size_t>(in.gcount()) != want ||
+        std::memcmp(chunk.data(), expected.v.data() + offset, want) != 0)
+      return false;
+    offset += want;
+  }
+  return true;
+}
+
+class StagedFile
+{
+public:
+  explicit StagedFile(const fs::path& destination)
+  {
+    for (unsigned attempt = 0; attempt < 128; ++attempt)
+    {
+      path_ = destination;
+      path_ += ".tmp." + std::to_string(GetCurrentProcessId()) + "." +
+               std::to_string(GetCurrentThreadId()) + "." +
+               std::to_string(g_stage_counter.fetch_add(1, std::memory_order_relaxed));
+      handle_ = CreateFileW(path_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH,
+                            nullptr);
+      if (handle_ != INVALID_HANDLE_VALUE)
+        return;
+      const DWORD error = GetLastError();
+      if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS)
+        break;
+    }
+    throw std::runtime_error("cannot create unique extraction staging file");
+  }
+
+  ~StagedFile() noexcept
+  {
+    if (handle_ != INVALID_HANDLE_VALUE)
+      CloseHandle(handle_);
+    if (!committed_ && !path_.empty())
+      DeleteFileW(path_.c_str());
+  }
+  StagedFile(const StagedFile&) = delete;
+  StagedFile& operator=(const StagedFile&) = delete;
+
+  void write(const SecureBytes& bytes)
+  {
+    size_t offset = 0;
+    while (offset < bytes.v.size())
+    {
+      const DWORD chunk = static_cast<DWORD>(std::min<size_t>(
+          bytes.v.size() - offset, 1024u * 1024u));
+      DWORD written = 0;
+      if (!WriteFile(handle_, bytes.v.data() + offset, chunk, &written, nullptr) ||
+          written != chunk)
+        throw std::runtime_error("embedded staging write failed");
+      offset += written;
+    }
+    if (!FlushFileBuffers(handle_))
+      throw std::runtime_error("embedded staging flush failed");
+  }
+
+  void commit(const fs::path& destination)
+  {
+    if (handle_ != INVALID_HANDLE_VALUE)
+    {
+      CloseHandle(handle_);
+      handle_ = INVALID_HANDLE_VALUE;
+    }
+    if (!MoveFileExW(path_.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+      throw std::runtime_error("atomic resource replace failed: " +
+                               std::to_string(GetLastError()));
+    }
+    committed_ = true;
+  }
+
+private:
+  fs::path path_;
+  HANDLE handle_ = INVALID_HANDLE_VALUE;
+  bool committed_ = false;
+};
 
 // Write blob to path. Skip the write only when the on-disk file matches the
 // embedded blob byte-for-byte — anything cheaper (size + N-byte sniff) has
@@ -133,51 +311,27 @@ void write_blob_if_changed(const Blob& b, const fs::path& dest)
 {
   if (b.size == 0)
   {
+#if defined(CR_ALLOW_MISSING_RESOURCES)
     cr::log::warn("embed", std::string("embedded blob empty: ") + dest.string());
     return;
+#else
+    throw std::runtime_error("required embedded blob empty: " + dest.string());
+#endif
   }
 
   SecureBytes expected = decode_blob(b);
 
-  if (fs::exists(dest))
-  {
-    std::error_code ec;
-    auto have = fs::file_size(dest, ec);
-    if (!ec && have == b.size)
-    {
-      std::ifstream in(dest, std::ios::binary);
-      SecureBytes existing(b.size);
-      in.read(reinterpret_cast<char*>(existing.v.data()), static_cast<std::streamsize>(b.size));
-      if (in && (size_t) in.gcount() == b.size && std::memcmp(existing.v.data(), expected.v.data(), b.size) == 0)
-      {
-        return; // already up-to-date
-      }
-    }
-  }
+  if (file_matches(dest, expected))
+    return; // already up-to-date
 
-  // Write to a temp sibling and rename, so a crashed extract doesn't leave
-  // a half-written exe in place.
-  fs::path tmp = dest;
-  tmp += ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out)
-      throw std::runtime_error("cannot open " + tmp.string());
-    out.write(reinterpret_cast<const char*>(expected.v.data()), static_cast<std::streamsize>(b.size));
-    if (!out)
-      throw std::runtime_error("write failed: " + tmp.string());
-  }
-  std::error_code ec;
-  fs::rename(tmp, dest, ec);
-  if (ec)
-  {
-    // Rename can fail if the destination is locked (adb running). Retry
-    // as copy + delete.
-    fs::remove(dest, ec);
-    fs::rename(tmp, dest, ec);
-    if (ec)
-      throw std::runtime_error("rename failed: " + dest.string());
-  }
+  // Each caller gets an exclusive sibling staging file. Only a completely
+  // written and flushed file is atomically made visible; the known-good old
+  // resource is never deleted first when adb or antivirus has it open.
+  StagedFile staging(dest);
+  staging.write(expected);
+  staging.commit(dest);
+  if (!file_matches(dest, expected))
+    throw std::runtime_error("resource verification failed after replace: " + dest.string());
   cr::log::info("embed", std::string("extracted ") + dest.filename().string() + " (" + std::to_string(b.size) + " bytes)");
 }
 
@@ -197,7 +351,8 @@ void remove_file_best_effort(const fs::path& path) noexcept
 // independent from generated embed metadata.
 fs::path extract_adb_suite()
 {
-  fs::create_directories(bin_dir());
+  std::lock_guard<std::recursive_mutex> lock(g_extraction_mutex);
+  secure_extraction_directory(bin_dir());
 
   // ADB suite must be extracted together — adb.exe will fail to start if
   // AdbWinApi.dll is missing alongside it.
@@ -211,7 +366,8 @@ fs::path extract_adb_suite()
 
 fs::path extract_android_artifacts()
 {
-  fs::create_directories(bin_dir());
+  std::lock_guard<std::recursive_mutex> lock(g_extraction_mutex);
+  secure_extraction_directory(bin_dir());
 
   // Android artifacts (pushed to /data/local/tmp on phone).
   write_blob_if_changed(cr_injector(), bin_dir() / "cr_injector");
@@ -223,6 +379,7 @@ fs::path extract_android_artifacts()
 
 fs::path extract_all()
 {
+  std::lock_guard<std::recursive_mutex> lock(g_extraction_mutex);
   extract_adb_suite();
   extract_android_artifacts();
   return bin_dir();
@@ -232,6 +389,7 @@ void cleanup_android_artifacts() noexcept
 {
   try
   {
+    std::lock_guard<std::recursive_mutex> lock(g_extraction_mutex);
     remove_file_best_effort(bin_dir() / "cr_injector");
     remove_file_best_effort(bin_dir() / "cr_feed_proc");
     remove_file_best_effort(bin_dir() / "libcr_hooks.so");
@@ -250,6 +408,7 @@ void cleanup_bin_dir() noexcept
 {
   try
   {
+    std::lock_guard<std::recursive_mutex> lock(g_extraction_mutex);
     cleanup_android_artifacts();
     remove_file_best_effort(bin_dir() / "adb.exe");
     remove_file_best_effort(bin_dir() / "AdbWinApi.dll");

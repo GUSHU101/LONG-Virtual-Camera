@@ -364,7 +364,7 @@ void App::cleanup_host_runtime(const char* reason, bool cleanup_android) noexcep
   try
   {
     if (cleanup_android && g_host_runtime_ready)
-      cr::source::FeedController::cleanup_known_devices(reason);
+      cr::source::FeedController::shutdown_all();
 
     cr::device::DeviceScanner::instance().stop();
     cr::device::LogTail::instance().stop();
@@ -632,8 +632,8 @@ LRESULT CALLBACK App::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 bool App::init_window(HINSTANCE hInstance, int nShowCmd)
 {
-  const std::wstring class_name = L"LONGVirtualCameraEnhancedWnd";
-  const std::wstring window_title = L"LONG Virtual Camera - Enhanced";
+  const std::wstring class_name = L"LONGVirtualCameraWnd";
+  const std::wstring window_title = L"LONG Virtual Camera";
 
   WNDCLASSEXW wc{sizeof(wc)};
   wc.style = CS_CLASSDC;
@@ -715,43 +715,9 @@ void App::shutdown()
   }
 }
 
-// Defense-in-depth admin check. The embedded manifest requests
-// `requireAdministrator` so Windows normally shows UAC and refuses to
-// launch the process at all if the user clicks No — but if the manifest
-// somehow didn't take effect (corrupted build, side-loaded into a
-// loader that ignores it), refuse to run from main() too. Avoids a
-// half-broken state where the app starts but every adb command fails
-// silently for permission reasons.
-static bool is_process_elevated()
-{
-  HANDLE token = nullptr;
-  if (!cr::winapi::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
-  {
-    return false;
-  }
-  TOKEN_ELEVATION elev{};
-  DWORD got = 0;
-  bool elevated = false;
-  if (cr::winapi::GetTokenInformation(token, TokenElevation, &elev, sizeof(elev), &got))
-  {
-    elevated = (elev.TokenIsElevated != 0);
-  }
-  ::CloseHandle(token);
-  return elevated;
-}
-
 int App::run(HINSTANCE hInstance, int nShowCmd)
 {
   g_app = this;
-
-  if (!is_process_elevated())
-  {
-    const std::wstring msg = L"Camera Replace requires administrator privileges.\n\nRight-click the .exe and choose \"Run as administrator\", "
-                             "or accept the UAC prompt the next time you launch.";
-    const std::wstring title = L"Camera Replace - admin required";
-    ::MessageBoxW(nullptr, msg.c_str(), title.c_str(), MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
-    return 3;
-  }
 
   TimerResolutionScope timer_resolution;
   cr::log::info("init", "Camera Replace starting");

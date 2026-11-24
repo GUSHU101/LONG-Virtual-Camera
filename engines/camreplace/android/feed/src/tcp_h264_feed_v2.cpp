@@ -26,6 +26,7 @@
 #include "../include/cr_feed.h"
 #include "h264_decode_pipe.h" // ShmOut, NV12/I420 → NV21 helpers
 #include "feed_queues.h"
+#include "interruptible_socket.h"
 #include "shm.h"
 
 #include <media/NdkMediaCodec.h>
@@ -47,6 +48,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66,7 +69,9 @@ constexpr uint32_t kMagic = 0x32484243u; // 'CRH2' LE
 
 bool nv21_shape_supported(int w, int h)
 {
-  if (w < 16 || w > 8192 || h < 16 || h > 8192)
+  if (w < 16 || w > (int) CR_FEED_MAX_WIDTH ||
+      h < 16 || h > (int) CR_FEED_MAX_HEIGHT ||
+      (w & 1) != 0 || (h & 1) != 0)
   {
     LOGE(OBF("v2: bogus dims %dx%d").c_str(), w, h);
     return false;
@@ -154,6 +159,7 @@ struct DecoderState
   std::string codec_name;
   int32_t color_format = 21, y_stride = 0, slice_height = 0, uv_stride = 0;
   uint64_t in_count = 0, out_count = 0;
+  uint64_t output_layout_warns = 0;
   std::vector<uint8_t> nv21_scratch;
 };
 
@@ -224,7 +230,6 @@ void drain_decoder_into_q(DecoderState& d, cr_feed::BoundedQueue<cr_feed::Nv21Fr
   constexpr int32_t kFmtYUV420Planar = 19;
   constexpr int32_t kFmtYUV420SemiPlanar = 21;
   constexpr int32_t kFmtYUV420PackedSemiPlanar = 0x7fa30c04;
-  constexpr int32_t kFmtYUV420Flexible = 0x7f420888;
 
   for (;;)
   {
@@ -254,37 +259,73 @@ void drain_decoder_into_q(DecoderState& d, cr_feed::BoundedQueue<cr_feed::Nv21Fr
       uint8_t* out_buf = AMediaCodec_getOutputBuffer(d.dec, (size_t) out_idx, &cap);
       const int sy = d.y_stride ? d.y_stride : d.w;
       const int suv = d.uv_stride ? d.uv_stride : sy;
+      const int slice = d.slice_height > 0 ? d.slice_height : d.h;
+      cr::media::PlaneSpan window;
+      const bool window_ok = out_buf && cr::media::valid_codec_window(
+                                              cap, info.offset, info.size, window);
+      const uint8_t* base = window_ok ? out_buf + window.offset : nullptr;
+      const size_t available = window_ok ? window.bytes : 0;
+      bool converted = false;
 
-      if (d.color_format == kFmtYUV420SemiPlanar || d.color_format == kFmtYUV420PackedSemiPlanar || d.color_format == kFmtYUV420Flexible)
+      if (!base || sy < d.w || suv < d.w || slice < d.h || sy <= 0 ||
+          suv <= 0)
       {
-        cr_feed::nv12_to_nv21(out_buf, d.w, d.h, sy, suv, d.nv21_scratch.data());
+        const uint64_t n = ++d.output_layout_warns;
+        if (n <= 3 || (n % 120) == 0)
+          LOGW(OBF("v2/dec: output layout rejected color=0x%x off=%d size=%d cap=%zu stride=%d uv=%d slice=%d dims=%dx%d").c_str(),
+               d.color_format, (int) info.offset, (int) info.size, cap, sy,
+               suv, slice, d.w, d.h);
+      }
+      else if (d.color_format == kFmtYUV420SemiPlanar ||
+               d.color_format == kFmtYUV420PackedSemiPlanar)
+      {
+        cr::media::Yuv420Layout layout;
+        if (cr::media::semiplanar_420(
+                available, (uint32_t) d.w, (uint32_t) d.h, (uint32_t) sy,
+                (uint32_t) slice, (uint32_t) suv, layout))
+        {
+          cr_feed::nv12_to_nv21(base, base + layout.u_or_uv.offset, d.w, d.h,
+                                sy, suv, d.nv21_scratch.data());
+          converted = true;
+        }
       }
       else if (d.color_format == kFmtYUV420Planar)
       {
-        cr_feed::i420_to_nv21(out_buf, d.w, d.h, sy, sy / 2, sy / 2, d.nv21_scratch.data());
+        const int chroma_stride = sy > 1 ? sy / 2 : d.w / 2;
+        cr::media::Yuv420Layout layout;
+        if (chroma_stride > 0 && cr::media::planar_420(
+                                     available, (uint32_t) d.w,
+                                     (uint32_t) d.h, (uint32_t) sy,
+                                     (uint32_t) slice,
+                                     (uint32_t) chroma_stride, layout))
+        {
+          cr_feed::i420_to_nv21(base, base + layout.u_or_uv.offset,
+                                base + layout.v.offset, d.w, d.h, sy,
+                                chroma_stride, chroma_stride,
+                                d.nv21_scratch.data());
+          converted = true;
+        }
       }
       else
       {
-        for (int y = 0; y < d.h; ++y)
-        {
-          memcpy(d.nv21_scratch.data() + (size_t) y * d.w, out_buf + (size_t) y * sy, (size_t) d.w);
-        }
-        memset(d.nv21_scratch.data() + (size_t) d.w * d.h, 128, (size_t) d.w * d.h / 2);
+        const uint64_t n = ++d.output_layout_warns;
+        if (n <= 3 || (n % 120) == 0)
+          LOGW(OBF("v2/dec: unsupported output format color=0x%x off=%d size=%d cap=%zu").c_str(),
+               d.color_format, (int) info.offset, (int) info.size, cap);
       }
 
-      cr_feed::Nv21Frame frame;
-      frame.data = d.nv21_scratch; // copy, decoder reuses scratch
-      frame.width = d.w;
-      frame.height = d.h;
-      frame.pts_us = (int64_t) info.presentationTimeUs;
-      if (!frame_q.push(std::move(frame)))
+      if (converted)
       {
-        frame_dropped.fetch_add(1, std::memory_order_relaxed);
-      }
-      ++d.out_count;
-      if (d.out_count <= 3 || (d.out_count % 120) == 0)
-      {
-        LOGI(OBF("v2/dec: frame #%llu (in=%llu)").c_str(), (unsigned long long) d.out_count, (unsigned long long) d.in_count);
+        cr_feed::Nv21Frame frame;
+        frame.data = d.nv21_scratch; // copy, decoder reuses scratch
+        frame.width = d.w;
+        frame.height = d.h;
+        frame.pts_us = (int64_t) info.presentationTimeUs;
+        if (!frame_q.push(std::move(frame)))
+          frame_dropped.fetch_add(1, std::memory_order_relaxed);
+        ++d.out_count;
+        if (d.out_count <= 3 || (d.out_count % 120) == 0)
+          LOGI(OBF("v2/dec: frame #%llu (in=%llu)").c_str(), (unsigned long long) d.out_count, (unsigned long long) d.in_count);
       }
     }
     AMediaCodec_releaseOutputBuffer(d.dec, (size_t) out_idx, false);
@@ -300,12 +341,15 @@ void decoder_loop(int w, int h, cr_feed::BoundedQueue<cr_feed::NalPacket>& pkt_q
     frame_q.close();
     return;
   }
+  bool need_keyframe = false;
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
     cr_feed::NalPacket pkt;
     if (!pkt_q.pop(pkt))
       break;
+    if (need_keyframe && !pkt.is_key)
+      continue;
 
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(d.dec, 20 * 1000);
     if (in_idx >= 0)
@@ -315,13 +359,38 @@ void decoder_loop(int w, int h, cr_feed::BoundedQueue<cr_feed::NalPacket>& pkt_q
       if (in_buf && cap >= pkt.data.size())
       {
         memcpy(in_buf, pkt.data.data(), pkt.data.size());
-        AMediaCodec_queueInputBuffer(d.dec, (size_t) in_idx, 0, pkt.data.size(), (uint64_t) pkt.pts_us, 0);
-        ++d.in_count;
+        const media_status_t queued = AMediaCodec_queueInputBuffer(
+            d.dec, (size_t) in_idx, 0, pkt.data.size(),
+            pkt.pts_us < 0 ? 0u : (uint64_t) pkt.pts_us, 0);
+        if (queued == AMEDIA_OK)
+        {
+          ++d.in_count;
+          if (pkt.is_key)
+            need_keyframe = false;
+        }
+        else
+        {
+          LOGW(OBF("v2/dec: queueInput failed status=%d").c_str(),
+               (int) queued);
+          AMediaCodec_flush(d.dec);
+          need_keyframe = true;
+        }
       }
       else
       {
         LOGW(OBF("v2/dec: input buf too small: cap=%zu need=%zu").c_str(), cap, pkt.data.size());
+        AMediaCodec_queueInputBuffer(d.dec, (size_t) in_idx, 0, 0,
+                                     pkt.pts_us < 0 ? 0u : (uint64_t) pkt.pts_us,
+                                     0);
+        AMediaCodec_flush(d.dec);
+        need_keyframe = true;
       }
+    }
+    else
+    {
+      // Losing an encoded access unit invalidates inter-frame references.
+      AMediaCodec_flush(d.dec);
+      need_keyframe = true;
     }
     drain_decoder_into_q(d, frame_q, frame_dropped);
   }
@@ -359,7 +428,28 @@ void publish_loop(cr_feed::BoundedQueue<cr_feed::Nv21Frame>& frame_q, cr_feed::S
     }
     else
     {
-      int64_t target_ns = wall_anchor_ns + (frame.pts_us - pts_anchor_us) * 1000ll;
+      const uint64_t pts_delta_us =
+          static_cast<uint64_t>(frame.pts_us) -
+          static_cast<uint64_t>(pts_anchor_us);
+      if (frame.pts_us < pts_anchor_us ||
+          pts_delta_us >
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max() /
+                                    1000ll))
+      {
+        pts_anchor_us = frame.pts_us;
+        wall_anchor_ns = now_ns();
+        shm.publish_nv21(frame.data.data());
+        continue;
+      }
+      const int64_t pts_delta_ns = static_cast<int64_t>(pts_delta_us) * 1000ll;
+      if (wall_anchor_ns > std::numeric_limits<int64_t>::max() - pts_delta_ns)
+      {
+        pts_anchor_us = frame.pts_us;
+        wall_anchor_ns = now_ns();
+        shm.publish_nv21(frame.data.data());
+        continue;
+      }
+      int64_t target_ns = wall_anchor_ns + pts_delta_ns;
       int64_t delta_ns = target_ns - now_ns();
       if (delta_ns > 100'000'000ll)
       {
@@ -418,9 +508,47 @@ int serve_client(int client)
   cr_feed::BoundedQueue<cr_feed::Nv21Frame> frame_q(kFrameQueueCap, cr_feed::BoundedQueue<cr_feed::Nv21Frame>::kDropOldest);
 
   std::atomic<uint64_t> pkt_dropped{0}, frame_dropped{0};
+  std::atomic<bool> worker_failed{false};
 
-  std::thread t_dec([&] { decoder_loop(w, h, pkt_q, frame_q, frame_dropped); });
-  std::thread t_pub([&] { publish_loop(frame_q, shm); });
+  auto fail_worker = [&](const char* worker, const char* detail)
+  {
+    worker_failed.store(true, std::memory_order_release);
+    LOGE(OBF("v2/%s: worker failed: %s").c_str(), worker,
+         detail ? detail : OBF("unknown").c_str());
+    pkt_q.close();
+    frame_q.close();
+    shutdown(client, SHUT_RDWR);
+  };
+  std::thread t_dec([&]
+                    {
+                      try
+                      {
+                        decoder_loop(w, h, pkt_q, frame_q, frame_dropped);
+                      }
+                      catch (const std::exception& e)
+                      {
+                        fail_worker(OBF("decoder").c_str(), e.what());
+                      }
+                      catch (...)
+                      {
+                        fail_worker(OBF("decoder").c_str(), OBF("non-standard exception").c_str());
+                      }
+                    });
+  std::thread t_pub([&]
+                    {
+                      try
+                      {
+                        publish_loop(frame_q, shm);
+                      }
+                      catch (const std::exception& e)
+                      {
+                        fail_worker(OBF("publisher").c_str(), e.what());
+                      }
+                      catch (...)
+                      {
+                        fail_worker(OBF("publisher").c_str(), OBF("non-standard exception").c_str());
+                      }
+                    });
 
   // Network reads on this thread (we already own its lifetime here).
   network_loop(client, pkt_q, pkt_dropped);
@@ -434,7 +562,7 @@ int serve_client(int client)
 
   LOGI(OBF("v2: client gone (drops pkt=%llu frame=%llu)").c_str(), (unsigned long long) pkt_dropped.load(), (unsigned long long) frame_dropped.load());
   shm.shutdown();
-  return 0;
+  return worker_failed.load(std::memory_order_acquire) ? -1 : 0;
 }
 
 } // namespace
@@ -473,9 +601,11 @@ int cr_feed_run_tcp_h264(int port)
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
-    int client = accept(srv, nullptr, nullptr);
+    int client = cr::feed::accept_interruptible(srv, g_stop);
     if (client < 0)
     {
+      if (g_stop.load(std::memory_order_relaxed))
+        break;
       if (errno == EINTR)
         continue;
       LOGW(OBF("v2: accept: %s").c_str(), strerror(errno));

@@ -10,6 +10,16 @@ if not defined BUILD_DIR set "BUILD_DIR=%PROJECT_DIR%\build\host-dev-dev"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 if not defined LLVM_MINGW_ROOT set "LLVM_MINGW_ROOT=C:\llvm-mingw-20240606-msvcrt-x86_64"
 set "PATH=%LLVM_MINGW_ROOT%\bin;%PATH%"
+if not defined MINGW_RUNTIME_DIR (
+    if exist "%LLVM_MINGW_ROOT%\x86_64-w64-mingw32\bin\libwinpthread-1.dll" (
+        set "MINGW_RUNTIME_DIR=%LLVM_MINGW_ROOT%\x86_64-w64-mingw32\bin"
+    ) else if exist "%LLVM_MINGW_ROOT%\bin\libwinpthread-1.dll" (
+        set "MINGW_RUNTIME_DIR=%LLVM_MINGW_ROOT%\bin"
+    ) else (
+        echo *** Missing x86_64 libwinpthread-1.dll under %LLVM_MINGW_ROOT%
+        exit /b 1
+    )
+)
 
 if not defined ANDROID_OUT_DIR (
     if defined ANDROID_BUILD_DIR (
@@ -36,6 +46,7 @@ echo Android outs: !ANDROID_OUT_DIR!
 cmake -S "%PROJECT_DIR%\host" -B "%BUILD_DIR%" -G Ninja ^
     -DCMAKE_TOOLCHAIN_FILE="%PROJECT_DIR%\toolchains\llvm-mingw.cmake" ^
     -DLLVM_MINGW_ROOT="%LLVM_MINGW_ROOT%" ^
+    -DMINGW_RUNTIME_DIR="!MINGW_RUNTIME_DIR!" ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DANDROID_OUT_DIR="!ANDROID_OUT_DIR!"
 set RC=%ERRORLEVEL%
@@ -56,7 +67,7 @@ if not "%RC%"=="0" goto :err
 
 echo.
 echo ====================================================
-echo  Built LONG Virtual Camera enhanced engine: %BUILD_DIR%\bin\LONG-Virtual-Camera-Enhanced.exe
+echo  Built LONG Virtual Camera: %BUILD_DIR%\bin\LONG-Virtual-Camera.exe
 echo  Public no-server build
 echo  Embedded public Android outs: !ANDROID_OUT_DIR!
 echo ====================================================

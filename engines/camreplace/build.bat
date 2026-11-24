@@ -16,16 +16,16 @@ if not exist "%NDK_ROOT%\build\cmake\android.toolchain.cmake" goto :missing_ndk
 if not defined LLVM_MINGW_ROOT set "LLVM_MINGW_ROOT=C:\llvm-mingw-20240606-msvcrt-x86_64"
 if not exist "%LLVM_MINGW_ROOT%\bin\x86_64-w64-mingw32-clang++.exe" goto :missing_llvm
 
-echo Building LONG Virtual Camera enhanced engine...
+echo Building LONG Virtual Camera...
 call "%~dp0scripts\build_host_dev_dev.cmd"
 if errorlevel 1 goto :build_failed
 
 echo.
 echo Build complete:
 if defined BUILD_DIR (
-    echo   %BUILD_DIR%\bin\LONG-Virtual-Camera-Enhanced.exe
+    echo   %BUILD_DIR%\bin\LONG-Virtual-Camera.exe
 ) else (
-    echo   %~dp0build\host-dev-dev\bin\LONG-Virtual-Camera-Enhanced.exe
+    echo   %~dp0build\host-dev-dev\bin\LONG-Virtual-Camera.exe
 )
 exit /b 0
 
@@ -59,5 +59,5 @@ exit /b 1
 
 :build_failed
 echo.
-echo ERROR: LONG Virtual Camera enhanced build failed.
+echo ERROR: LONG Virtual Camera build failed.
 exit /b 1

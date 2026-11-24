@@ -6,17 +6,17 @@ body:
     attributes:
       value: |
         Please describe what fails and include the diagnostics below so we can investigate.
-        Check the [latest release](https://github.com/aimardcr/ReCam/releases/latest) and
-        [existing issues](https://github.com/aimardcr/ReCam/issues) first.
+        Check the [latest release](https://github.com/GUSHU101/LONG-Virtual-Camera/releases/latest) and
+        [existing issues](https://github.com/GUSHU101/LONG-Virtual-Camera/issues) first.
         For a desktop startup problem, enter **N/A — fails before connecting** in device-only fields.
         If a command cannot run, include its error instead of leaving the diagnostics blank.
 
   - type: input
     id: version
     attributes:
-      label: ReCam version and download
+      label: LONG Virtual Camera version and download
       description: Give the release version and archive name, or the commit SHA if built from source. Say whether you also tried the latest release.
-      placeholder: "v0.1.3, ReCam-v0.1.3-windows-x64.zip; also reproduced on the latest release"
+      placeholder: "v0.3.0, LONG-Virtual-Camera-v0.3.0-windows-x64.zip; also reproduced on the latest release"
     validations:
       required: true
 
@@ -24,8 +24,8 @@ body:
     id: host
     attributes:
       label: Desktop OS and architecture
-      description: Include your OS version and CPU architecture, and whether you use the desktop UI or CLI only.
-      placeholder: "Windows 11 x64, desktop UI; or macOS 15 ARM64, CLI only"
+      description: Include the Windows version/build and CPU architecture.
+      placeholder: "Windows 11 24H2 build 26100, x64"
     validations:
       required: true
 
@@ -62,12 +62,11 @@ body:
       label: Input source
       options:
         - Test pattern
-        - Video file on the device
-        - FFmpeg input
-        - RTMP / OBS
-        - Camera / virtual camera
+        - Video file or URL
+        - OBS / RTMP
+        - Windows DirectShow camera
         - Multiple sources (describe below)
-        - Not applicable (startup, installation, or CLI problem)
+        - Not applicable (startup or installation problem)
     validations:
       required: true
 
@@ -76,11 +75,11 @@ body:
     attributes:
       label: Source and camera-app setup
       description: |
-        Name the source device/file type or FFmpeg command, and the target app/browser and version.
+        Name the desktop source/device/file type and the target Android app/browser and version.
         Include front/rear camera, resolution/FPS, and whether preview, photo capture, or the saved
         recording is affected. If it works in one app or mode but not another, list both.
       placeholder: |
-        Source: OBS Virtual Camera, 1280x720 at 30 FPS
+        Source: OBS, 1280x720 at 30 FPS
         Target: stock Camera app, rear camera, video at 1080p30
         Works: browser preview
         Fails: stock Camera preview and saved recording
@@ -94,7 +93,7 @@ body:
       description: Include the buttons or CLI commands used, in order, and how often the issue occurs.
       placeholder: |
         1. Connect the phone and select ...
-        2. Start ReCam using ...
+        2. Start LONG Virtual Camera and select ...
         3. Open ... and begin recording ...
         4. The problem occurs ...
     validations:
@@ -128,28 +127,27 @@ body:
     attributes:
       value: |
         ### Attach session logs
-        With the desktop app, reproduce the problem and open the `logs/` directory
-        shown in the UI. Attach `desktop-<pid>.log`, `device-<pid>.log`, and
-        `payload-<pid>.log` from the same session, including numbered backups.
+        Reproduce the problem, then attach
+        `%LOCALAPPDATA%\LONG-Virtual-Camera\session.log`. If the application was
+        restarted after the failure, also attach `session.log.1`. This unified log
+        contains host events, deployment results and scoped phone logcat lines.
 
-        For CLI-only use, capture logs before reproducing the issue:
+        For a device-side failure, an additional full logcat and camera-service
+        snapshot are useful. Replace `DEVICE_SERIAL` with the selected serial:
 
         ```sh
-        adb logcat -b all -v threadtime > recam-logcat.txt
+        adb -s DEVICE_SERIAL logcat -b all -v threadtime > longvc-logcat.txt
         ```
 
         While the failure is visible, collect state in another terminal:
 
         ```sh
-        adb shell "su -c '/data/local/tmp/recam status'" > recam-status.txt
-        adb shell dumpsys media.camera > camera-service.txt
+        adb -s DEVICE_SERIAL shell dumpsys media.camera > camera-service.txt
+        adb -s DEVICE_SERIAL shell "su -c 'ps -A | grep -E \"camera|audio|cr_feed\"'" > process-state.txt
         ```
 
-        If the root command fails, run `adb shell`, then `su`, then
-        `/data/local/tmp/recam status`, and paste the JSON or error.
         For preview versus recording problems, collect camera-service output
-        in each affected mode. With multiple devices, add `-s DEVICE_SERIAL`
-        immediately after `adb`.
+        in each affected mode. Include root-command errors rather than omitting them.
 
         For a desktop startup failure, include the launch error or terminal output.
         Review logs and redact private information before attaching them.
@@ -158,7 +156,7 @@ body:
     id: diagnostics
     attributes:
       label: Session logs and errors
-      description: Attach the three desktop session logs, or CLI logcat/status files. Include camera-service output for mode-specific failures. If a log is unavailable, explain why and include any error.
+      description: Attach session.log (and session.log.1 when relevant), plus optional logcat/camera-service/process snapshots. If a log is unavailable, explain why and include any error.
       placeholder: "Attach files or paste output here. Explain any unavailable diagnostics."
     validations:
       required: true

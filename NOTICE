@@ -15,7 +15,7 @@ Because this combined work incorporates GPL-3.0-only source, LONG Virtual
 Camera as a whole is distributed under GNU GPL v3.0. The MIT notices for the
 ReCam-derived portions remain in force and are preserved above.
 
-Stable-engine bundled sources:
+ReCam-derived compatibility sources:
 
 AndKittyInjector - https://github.com/MJx0/AndKittyInjector
   Copyright (c) 2023 MJ. MIT License.
@@ -27,6 +27,6 @@ XZ Embedded - https://github.com/tukaani-project/xz-embedded
   Copyright (C) The XZ Embedded authors and contributors. Public domain.
   Full text: android/third_party/xz-embedded/COPYING
 
-Enhanced-engine third-party attributions are listed in
+Native-core third-party attributions are listed in
 engines/camreplace/THIRD_PARTY_NOTICES.txt and in license files stored beside
 the corresponding source trees.

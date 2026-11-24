@@ -3,6 +3,7 @@
 #include "util/Log.h"
 
 #include <chrono>
+#include <exception>
 #include <string>
 #include <thread>
 namespace cr::source
@@ -14,7 +15,20 @@ namespace
 void emit(const cr::device::DeployCallback& cb, cr::device::DeployStatus::Kind k, std::string step, std::string detail = {})
 {
   if (cb)
-    cb({k, std::move(step), std::move(detail)});
+  {
+    try
+    {
+      cb({k, std::move(step), std::move(detail)});
+    }
+    catch (const std::exception& e)
+    {
+      cr::log::warn("obs", std::string("status callback failed: ") + e.what());
+    }
+    catch (...)
+    {
+      cr::log::warn("obs", "status callback failed: unknown exception");
+    }
+  }
 }
 
 } // namespace
@@ -28,7 +42,6 @@ bool ObsRtmpSource::start(std::string serial, const Config& cfg, cr::device::Dep
   cb_ = std::move(cb);
   video_forward_.store(cfg.video_forward, std::memory_order_release);
   preview_decode_.store(cfg.preview_decode || cfg.video_forward, std::memory_order_release);
-  wire_mode_ = cfg.wire_mode;
 
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -50,14 +63,16 @@ bool ObsRtmpSource::start(std::string serial, const Config& cfg, cr::device::Dep
   {
     std::lock_guard<std::mutex> tx_lk(tx_mu_);
     bool connected = false;
-    for (int i = 0; i < 20; ++i)
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    for (int i = 0; i < 20 && std::chrono::steady_clock::now() < deadline; ++i)
     {
       if (tx_.open(cfg_.adb_port, cr::secure_channel::v2::StreamKind::Video))
       {
         connected = true;
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      if (std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
     if (!connected)
     {
@@ -67,25 +82,37 @@ bool ObsRtmpSource::start(std::string serial, const Config& cfg, cr::device::Dep
     tx_header_sent_ = false;
   }
 
-  // Side-channel: arm the local H.264 decoder. Two callbacks:
-  //   BGRA → LivePreview, always — drives the host preview pane.
-  //   NV12 → NV21 → tx_.send_frame, only in WireMode::Nv21. Skips the
-  //                 second decode that would otherwise happen on the
-  //                 phone (cr_feed_proc tcp_h264 path) — we already
-  //                 paid for one decode here on the PC, no point
-  //                 paying for it again on a slower phone OMX.
-  preview_dec_.arm([](const uint8_t* bgra, int w, int h, int pitch) { cr::render::LivePreview::instance().publish_bgra(bgra, w, h, pitch); }, wire_mode_ == WireMode::Nv21 ? cr::render::H264PreviewDecoder::Nv12PublishFn([this](const uint8_t* nv12, int w, int h, int stride) { on_nv12_(nv12, w, h, stride); }) : cr::render::H264PreviewDecoder::Nv12PublishFn{});
+  // Side-channel: decode H.264 locally only for the preview pane. The
+  // product has one phone transport: Annex-B H.264 over the authenticated
+  // loopback tunnel, decoded into the shared frame ring on Android.
+  bool ok = false;
+  try
+  {
+    preview_dec_.arm([](const uint8_t* bgra, int w, int h, int pitch) {
+      cr::render::LivePreview::instance().publish_bgra(bgra, w, h, pitch);
+    });
 
-  bool ok = rtmp_.start(
-      cfg_.rtmp_port, [this](const cr::transport::RtmpStreamMeta& m) { on_meta_(m); }, [this](const uint8_t* data, size_t len, int64_t pts_us, bool key) { on_nalu_(data, len, pts_us, key); }, [this](bool c, const std::string& detail) { on_conn_(c, detail); }, [this](const cr::transport::RtmpVideoEvent& event) { on_video_(event); },
-      // Audio side-channel — RtmpServer routes both AAC csd and raw
-      // frames into our AudioPump. The pump itself drops them when the
-      // user hasn't enabled "Start replace sound", so wiring this here
-      // costs nothing in the camera-only case.
-      [this](const uint8_t* csd, size_t len) { audio_.on_aac_csd(csd, len); }, [this](const uint8_t* aac, size_t len, int64_t pts_us) { audio_.on_aac_frame(aac, len, pts_us); });
+    ok = rtmp_.start(
+        cfg_.rtmp_port, [this](const cr::transport::RtmpStreamMeta& m) { on_meta_(m); }, [this](const uint8_t* data, size_t len, int64_t pts_us, bool key) { on_nalu_(data, len, pts_us, key); }, [this](bool c, const std::string& detail) { on_conn_(c, detail); }, [this](const cr::transport::RtmpVideoEvent& event) { on_video_(event); },
+        // Audio side-channel — RtmpServer routes both AAC csd and raw
+        // frames into our AudioPump. The pump itself drops them when the
+        // user hasn't enabled "Start replace sound", so wiring this here
+        // costs nothing in the camera-only case.
+        [this](const uint8_t* csd, size_t len) { on_aac_csd_(csd, len); }, [this](const uint8_t* aac, size_t len, int64_t pts_us) { audio_.on_aac_frame(aac, len, pts_us); });
+  }
+  catch (const std::exception& e)
+  {
+    cr::log::warn("obs", std::string("start failed: ") + e.what());
+  }
+  catch (...)
+  {
+    cr::log::warn("obs", "start failed: unknown exception");
+  }
   if (!ok)
   {
     emit(cb_, cr::device::DeployStatus::Kind::Err, "obs: RTMP listen failed", "port " + std::to_string(cfg_.rtmp_port) + " in use?");
+    rtmp_.stop();
+    preview_dec_.stop();
     {
       std::lock_guard<std::mutex> tx_lk(tx_mu_);
       tx_.close();
@@ -101,8 +128,7 @@ bool ObsRtmpSource::start(std::string serial, const Config& cfg, cr::device::Dep
 
 void ObsRtmpSource::stop()
 {
-  if (!running_.exchange(false))
-    return;
+  const bool was_running = running_.exchange(false);
   rtmp_.stop(); // joins server thread — no more on_nalu_ races
   preview_dec_.stop();
   audio_.stop();
@@ -112,7 +138,8 @@ void ObsRtmpSource::stop()
     tx_header_sent_ = false;
   }
   cr::render::LivePreview::instance().reset();
-  emit(cb_, cr::device::DeployStatus::Kind::Ok, "obs: stopped");
+  if (was_running)
+    emit(cb_, cr::device::DeployStatus::Kind::Ok, "obs: stopped");
 }
 
 void ObsRtmpSource::set_preview_decode(bool on)
@@ -154,7 +181,10 @@ bool ObsRtmpSource::set_video_forward(bool on)
       std::lock_guard<std::mutex> tx_lk(tx_mu_);
       connected = tx_.is_open();
     }
-    for (int i = 0; !connected && i < 20; ++i)
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    for (int i = 0; !connected && i < 20 &&
+                    std::chrono::steady_clock::now() < deadline;
+         ++i)
     {
       {
         std::lock_guard<std::mutex> tx_lk(tx_mu_);
@@ -165,7 +195,8 @@ bool ObsRtmpSource::set_video_forward(bool on)
           break;
         }
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      if (std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
     if (!connected)
     {
@@ -200,7 +231,16 @@ bool ObsRtmpSource::start_audio(const AudioPump::Config& cfg, cr::device::Deploy
 {
   if (!running_.load())
     return false; // RTMP must be up first
-  return audio_.start(serial_, cfg, std::move(cb));
+  if (!audio_.start(serial_, cfg, std::move(cb)))
+    return false;
+  std::vector<std::uint8_t> cached;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    cached = last_aac_csd_;
+  }
+  if (!cached.empty())
+    audio_.on_aac_csd(cached.data(), cached.size());
+  return true;
 }
 
 void ObsRtmpSource::stop_audio()
@@ -210,8 +250,15 @@ void ObsRtmpSource::stop_audio()
 
 ObsRtmpSource::Status ObsRtmpSource::status() const
 {
-  std::lock_guard<std::mutex> lk(mu_);
-  return status_;
+  Status result{};
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    result = status_;
+  }
+  const auto audio = audio_.status();
+  result.audio_health = audio.health;
+  result.audio_bytes_sent = audio.bytes_sent;
+  return result;
 }
 
 void ObsRtmpSource::on_meta_(const cr::transport::RtmpStreamMeta& m)
@@ -240,10 +287,25 @@ void ObsRtmpSource::on_conn_(bool connected, const std::string& detail)
   // accept() us cleanly when the next NALU triggers a reopen.
   if (!connected)
   {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      last_aac_csd_.clear();
+    }
     std::lock_guard<std::mutex> tx_lk(tx_mu_);
     tx_.close();
     tx_header_sent_ = false;
   }
+}
+
+void ObsRtmpSource::on_aac_csd_(const uint8_t* csd, size_t len)
+{
+  if (!csd || len < 2 || len > 64)
+    return;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    last_aac_csd_.assign(csd, csd + len);
+  }
+  audio_.on_aac_csd(csd, len);
 }
 
 void ObsRtmpSource::on_video_(const cr::transport::RtmpVideoEvent& event)
@@ -298,23 +360,13 @@ void ObsRtmpSource::on_nalu_(const uint8_t* data, size_t len, int64_t pts_us, bo
   // sessions keep preview_decode_ false so we do not burn CPU decoding
   // video nobody sees.
   const bool preview_decode = preview_decode_.load(std::memory_order_acquire);
-  if (preview_decode || wire_mode_ == WireMode::Nv21)
+  if (preview_decode)
   {
     preview_dec_.feed(data, len, pts_us);
   }
 
   if (!video_forward_.load(std::memory_order_acquire))
     return;
-
-  if (wire_mode_ == WireMode::Nv21)
-  {
-    // Don't ship the encoded NAL — phone receiver is tcp_nv21,
-    // expects raw NV21 frames. NV21 path runs in on_nv12_ once the
-    // decoder produces a frame.
-    return;
-  }
-
-  // --- WireMode::H264 (Compressed) ------------------------------------
 
   std::lock_guard<std::mutex> tx_lk(tx_mu_);
   if (!video_forward_.load(std::memory_order_acquire))
@@ -361,80 +413,6 @@ void ObsRtmpSource::on_nalu_(const uint8_t* data, size_t len, int64_t pts_us, bo
   {
     cr::log::warn("obs", "send_h264_chunk failed");
     return;
-  }
-}
-
-void ObsRtmpSource::on_nv12_(const uint8_t* nv12, int w, int h, int stride)
-{
-  // Same gating as on_nalu_'s tx_ branch: sound-only sessions never
-  // arm video_forward_, so this is unreachable when the user only
-  // asked for sound. Belt-and-braces though — the decoder thread
-  // doesn't know which mode the user is in.
-  if (!video_forward_.load(std::memory_order_acquire))
-    return;
-
-  std::lock_guard<std::mutex> tx_lk(tx_mu_);
-  if (!video_forward_.load(std::memory_order_acquire))
-    return;
-
-  // (Re-)open the phone-side TCP. cr_feed_proc on tcp_nv21:listen:
-  // is the receiver and it parses a CRTP header followed by a
-  // continuous NV21 byte stream — same socket, different framing
-  // from the H.264 (CRH2) path.
-  if (!tx_.is_open())
-  {
-    if (!tx_.open(cfg_.adb_port, cr::secure_channel::v2::StreamKind::Video))
-      return;
-    tx_header_sent_ = false;
-  }
-  if (!tx_header_sent_)
-  {
-    int fps = 30;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      fps = status_.stream_fps > 0 ? (int) (status_.stream_fps + 0.5) : 30;
-    }
-    if (!tx_.send_header(w, h, fps))
-    {
-      cr::log::warn("obs", "nv21 send_header failed");
-      return;
-    }
-    cr::log::info("obs", "nv21 header " + std::to_string(w) + "x" + std::to_string(h) + " @" + std::to_string(fps) + " fps");
-    tx_header_sent_ = true;
-  }
-
-  // NV12 → NV21 in scratch. NV12 = Y + interleaved U,V; NV21 swaps
-  // each chroma pair (V before U). MFT may use stride > w on some
-  // GPUs — pack tightly into nv21_scratch_ before send.
-  const std::size_t y_bytes = (std::size_t) w * h;
-  nv21_scratch_.resize(y_bytes + y_bytes / 2);
-  std::uint8_t* dst = nv21_scratch_.data();
-
-  // Y plane: copy row-by-row, no stride correction needed if
-  // stride==w (common); otherwise crop trailing padding bytes.
-  for (int y = 0; y < h; ++y)
-  {
-    std::memcpy(dst + (std::size_t) y * w, nv12 + (std::size_t) y * stride, (std::size_t) w);
-  }
-
-  // UV plane: chroma rows = h/2, chroma columns = w/2 pairs.
-  const std::uint8_t* uv_src = nv12 + (std::size_t) stride * h;
-  std::uint8_t* vu_dst = dst + y_bytes;
-  const int uv_rows = h / 2;
-  for (int y = 0; y < uv_rows; ++y)
-  {
-    const std::uint8_t* s = uv_src + (std::size_t) y * stride;
-    std::uint8_t* d = vu_dst + (std::size_t) y * w;
-    for (int x = 0; x < w; x += 2)
-    {
-      d[x + 0] = s[x + 1]; // V (was U[i] in NV12 pair)
-      d[x + 1] = s[x + 0]; // U
-    }
-  }
-
-  if (!tx_.send_frame(dst, nv21_scratch_.size()))
-  {
-    cr::log::warn("obs", "nv21 send_frame failed");
   }
 }
 

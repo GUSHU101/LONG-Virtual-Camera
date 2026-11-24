@@ -1,13 +1,11 @@
 // libcr_feed.so — entry point.
-// The host-side stack is OBS-only. Two active transports for video:
-//   `tcp_h264:listen:<port>`  — legacy. PC parses RTMP, packs each NAL into
-//                               a 16-byte-prefixed TCP frame, sends over
-//                               adb-forward; we read frames + decode.
-//   `tcp_nv21:listen:<port>`  — raw NV21 from the PC-side decoder.
-// And one for audio:
+// The unified release host has one selected video transport:
+//   `tcp_h264:listen:<port>`  — PC parses RTMP, sends authenticated H.264
+//                               over adb-forward; Android decodes into shm.
+// The raw and direct-RTMP entries are retained only for upstream compatibility
+// and diagnostic builds; they are not separate product engines.
+// And one explicit opt-in transport for audio:
 //   `tcp_pcm:listen:<port>`   — PCM frames, hooked up by the audhook.
-// The old direct `rtmp:listen:<port>` phone listener is opt-in via
-// CR_FEED_ENABLE_RTMP_DIRECT.
 
 #include "../include/cr_feed.h"
 
@@ -17,6 +15,8 @@
 #include <string.h>
 
 #include <atomic>
+#include <exception>
+#include <new>
 #include "util/Obf.h"
 
 #define TAG "cr_feed"
@@ -49,10 +49,10 @@ bool parse_scheme(const char* url, const char* prefix, const char** out_path)
 } // namespace
 
 extern "C" int cr_feed_run_tcp_h264(int port); // tcp_h264_feed.cpp
-extern "C" int cr_feed_run_tcp_nv21(int port); // tcp_nv21_feed.cpp (Transport::Raw)
+extern "C" int cr_feed_run_tcp_nv21(int port); // compatibility receiver
 extern "C" int cr_feed_run_tcp_pcm(int port);  // tcp_pcm_feed.cpp
 #if defined(CR_FEED_ENABLE_RTMP_DIRECT)
-extern "C" int cr_feed_run_rtmp(int port); // rtmp_h264_feed.cpp (sprint B)
+extern "C" int cr_feed_run_rtmp(int port);      // diagnostic build only
 #endif
 
 extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_feed_run(const char* feed_url)
@@ -67,54 +67,72 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_feed_run(c
   }
   LOGI(OBF("cr_feed_run url=%s").c_str(), feed_url);
 
-  const char* arg = nullptr;
-  if (parse_scheme(feed_url, OBF("tcp_h264:listen:").c_str(), &arg))
+  try
   {
-    int port = atoi(arg);
-    if (port < 1 || port > 65535)
+    const char* arg = nullptr;
+    if (parse_scheme(feed_url, OBF("tcp_h264:listen:").c_str(), &arg))
     {
-      LOGE(OBF("tcp_h264:listen:<port> missing or invalid port").c_str());
-      return -1;
+      int port = atoi(arg);
+      if (port < 1 || port > 65535)
+      {
+        LOGE(OBF("tcp_h264:listen:<port> missing or invalid port").c_str());
+        return -1;
+      }
+      return cr_feed_run_tcp_h264(port);
     }
-    return cr_feed_run_tcp_h264(port);
-  }
-  if (parse_scheme(feed_url, OBF("tcp_nv21:listen:").c_str(), &arg))
-  {
-    int port = atoi(arg);
-    if (port < 1 || port > 65535)
+    if (parse_scheme(feed_url, OBF("tcp_nv21:listen:").c_str(), &arg))
     {
-      LOGE(OBF("tcp_nv21:listen:<port> missing or invalid port").c_str());
-      return -1;
+      int port = atoi(arg);
+      if (port < 1 || port > 65535)
+      {
+        LOGE(OBF("tcp_nv21:listen:<port> missing or invalid port").c_str());
+        return -1;
+      }
+      return cr_feed_run_tcp_nv21(port);
     }
-    return cr_feed_run_tcp_nv21(port);
-  }
 #if defined(CR_FEED_ENABLE_RTMP_DIRECT)
-  if (parse_scheme(feed_url, OBF("rtmp:listen:").c_str(), &arg))
-  {
-    int port = atoi(arg);
-    if (port < 1 || port > 65535)
+    if (parse_scheme(feed_url, OBF("rtmp:listen:").c_str(), &arg))
     {
-      LOGE(OBF("rtmp:listen:<port> missing or invalid port").c_str());
-      return -1;
+      int port = atoi(arg);
+      if (port < 1 || port > 65535)
+      {
+        LOGE(OBF("rtmp:listen:<port> missing or invalid port").c_str());
+        return -1;
+      }
+      return cr_feed_run_rtmp(port);
     }
-    return cr_feed_run_rtmp(port);
-  }
 #endif
-  if (parse_scheme(feed_url, OBF("tcp_pcm:listen:").c_str(), &arg))
-  {
-    int port = atoi(arg);
-    if (port < 1 || port > 65535)
+    if (parse_scheme(feed_url, OBF("tcp_pcm:listen:").c_str(), &arg))
     {
-      LOGE(OBF("tcp_pcm:listen:<port> missing or invalid port").c_str());
-      return -1;
+      int port = atoi(arg);
+      if (port < 1 || port > 65535)
+      {
+        LOGE(OBF("tcp_pcm:listen:<port> missing or invalid port").c_str());
+        return -1;
+      }
+      return cr_feed_run_tcp_pcm(port);
     }
-    return cr_feed_run_tcp_pcm(port);
-  }
 
 #if defined(CR_FEED_ENABLE_RTMP_DIRECT)
-  LOGE(OBF("unsupported feed URL (tcp_h264:listen:<port>, tcp_nv21:listen:<port>, rtmp:listen:<port>, or tcp_pcm:listen:<port>)").c_str());
+    LOGE(OBF("unsupported feed URL (tcp_h264, tcp_nv21, rtmp, or tcp_pcm)").c_str());
 #else
-  LOGE(OBF("unsupported feed URL (tcp_h264:listen:<port>, tcp_nv21:listen:<port>, or tcp_pcm:listen:<port>)").c_str());
+    LOGE(OBF("unsupported feed URL (tcp_h264, tcp_nv21, or tcp_pcm)").c_str());
 #endif
-  return -1;
+    return -1;
+  }
+  catch (const std::bad_alloc&)
+  {
+    LOGE(OBF("cr_feed_run: memory exhausted; channel revoked during unwind").c_str());
+    return -1;
+  }
+  catch (const std::exception& e)
+  {
+    LOGE(OBF("cr_feed_run: exception: %s").c_str(), e.what());
+    return -1;
+  }
+  catch (...)
+  {
+    LOGE(OBF("cr_feed_run: unknown exception").c_str());
+    return -1;
+  }
 }

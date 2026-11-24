@@ -21,7 +21,7 @@
  *
  * Подтверждено:
  *   supported flow — CameraServer/AudioServer injection, AIDL/HIDL/tinyalsa
- *   audio paths, tcp_h264/tcp_nv21/tcp_pcm feed schemes. Sound Trigger/AOC
+ *   audio paths and tcp_h264/tcp_pcm feed schemes. Sound Trigger/AOC
  *   coverage не гарантируется phone-side hook'ом и диагностируется отдельно.
  *
  * Diagnostic-only:
@@ -96,8 +96,7 @@ enum class HostProc
 // contain the same string in their argv.
 enum class FeedScheme
 {
-  H264, // tcp_h264:listen:<port>  (Compressed transport)
-  Nv21, // tcp_nv21:listen:<port>  (Raw transport)
+  H264, // tcp_h264:listen:<port>  (the one video transport)
   Pcm,  // tcp_pcm:listen:<port>   (audio PCM)
 };
 
@@ -190,13 +189,17 @@ public:
   // `feed_url` is stored on the hook's init for diagnostics. The
   // hook's runtime shm path is hardcoded to /data/cr/feed (or
   // /data/cr/audio) — the URL doesn't pick a backend.
-  bool inject_lib(HostProc target, const std::string& lib_basename, const std::string& init_fn, const std::string& feed_url, const DeployCallback& cb);
+  // `refresh_service` is true only for the first hook owned by this host
+  // session. It evicts an older mapped build exactly once before injection.
+  bool inject_lib(HostProc target, const std::string& lib_basename,
+                  const std::string& init_fn, const std::string& feed_url,
+                  bool refresh_service, const DeployCallback& cb);
 
   // Restart the named system services. init.rc respawns each within
   // ~200 ms; respawned processes don't dlopen our .so files (the
   // injection happens via cr_injector + ptrace, init never knew about
   // them) so they come back hook-free.
-  void restart_services(std::initializer_list<const char*> names, const DeployCallback& cb);
+  bool restart_services(std::initializer_list<const char*> names, const DeployCallback& cb);
 
   // --- Camera client management ----------------------------------------
   std::string active_camera_client_packages() const;

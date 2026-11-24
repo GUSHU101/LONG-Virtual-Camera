@@ -7,8 +7,9 @@
 #                     FILE   "${ADB_EXE_PATH}"
 #                     OUT_NAME "adb.exe")     # filename when extracted to disk
 #
-# If FILE does not exist at configure time, an empty placeholder is embedded
-# so the build still succeeds (useful during bootstrap). A warning is printed.
+# Missing/empty input is a configuration error by default. A zero-byte
+# placeholder is available only when CR_ALLOW_MISSING_RESOURCES=ON is set
+# explicitly for a non-distributable UI bootstrap build.
 # Changing FILE after configure is detected because we re-run on reconfigure
 # and the generated .cpp carries the file's path literal.
 
@@ -36,17 +37,27 @@ function(cr_embed_resource)
     if(EXISTS "${CRE_FILE}")
         file(REAL_PATH "${CRE_FILE}" _abs)
         file(SIZE "${_abs}" _plain_size)
+        if(_plain_size EQUAL 0 AND NOT CR_ALLOW_MISSING_RESOURCES)
+            message(FATAL_ERROR
+                "cr_embed_resource: '${CRE_NAME}' is empty (${CRE_FILE})")
+        endif()
         set(_seed_literal "0ull")
         set(_encrypted_literal "false")
         set(_incbin "${_abs}")
     else()
+        if(NOT CR_ALLOW_MISSING_RESOURCES)
+            message(FATAL_ERROR
+                "cr_embed_resource: required file missing for '${CRE_NAME}' (${CRE_FILE}). "
+                "Build Android payloads/install platform-tools first, or use "
+                "-DCR_ALLOW_MISSING_RESOURCES=ON only for a non-distributable UI build.")
+        endif()
         set(_missing TRUE)
         set(_plain_size 0)
         set(_seed_literal "0ull")
         set(_encrypted_literal "false")
         message(WARNING
             "cr_embed_resource: file missing for '${CRE_NAME}' (${CRE_FILE}). "
-            "Embedding empty placeholder; rebuild once it exists.")
+            "Embedding explicitly permitted empty development placeholder.")
         # Still need *some* path the assembler can open at build time.
         set(_placeholder "${_gen_dir}/${CRE_NAME}.placeholder")
         file(WRITE "${_placeholder}" "")
@@ -90,7 +101,7 @@ Blob ${CRE_NAME}() noexcept {
         static_cast<std::size_t>(_binary_${CRE_NAME}_end - _binary_${CRE_NAME}_start),
         ${_seed_literal},
         ${_encrypted_literal},
-        \"\",
+        \"${CRE_OUT_NAME}\",
     };
 }
 }  // namespace cr::resources
@@ -99,7 +110,7 @@ Blob ${CRE_NAME}() noexcept {
     target_sources(${CRE_TARGET} PRIVATE "${_gen_cpp}")
     if(NOT _missing)
         set_source_files_properties("${_gen_cpp}" PROPERTIES
-            OBJECT_DEPENDS "${_enc}")
+            OBJECT_DEPENDS "${_abs}")
     endif()
 
     # Re-run CMake (and regenerate) if the source blob changes on disk.

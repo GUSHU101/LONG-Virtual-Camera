@@ -61,10 +61,48 @@ extern "C"
     // Secure-channel state; READY is published only by an authenticated
     // SCT2 session. Hook gating is fail-closed, not a root boundary.
     atomic_uint channel_state;
+    // reserved[0] is a writer seqlock: odd while ring bytes are changing,
+    // even after write_pos and the complete PCM chunk are published.
     uint32_t reserved[5]; // pad to 64 bytes
   } cr_audio_header;
 
   _Static_assert(sizeof(cr_audio_header) == 64, "cr_audio_header must stay 64 bytes");
+
+  // Generation zero is reserved by the hook as "nothing observed yet".
+  // Writers hold an exclusive file lease, so a load followed by a store is
+  // sufficient and, unlike fetch_add, cannot wrap a live generation to zero.
+  static inline uint32_t cr_audio_next_generation(cr_audio_header* h)
+  {
+    const uint32_t current =
+        atomic_load_explicit(&h->generation, memory_order_relaxed);
+    return current == UINT32_MAX ? 1u : current + 1u;
+  }
+
+  static inline uint32_t cr_audio_begin_write(cr_audio_header* h)
+  {
+    const uint32_t current =
+        __atomic_load_n(&h->reserved[0], __ATOMIC_RELAXED);
+    const uint32_t token = current | 1u;
+    __atomic_store_n(&h->reserved[0], token, __ATOMIC_RELEASE);
+    return token;
+  }
+
+  static inline void cr_audio_end_write(cr_audio_header* h, uint32_t token)
+  {
+    __atomic_store_n(&h->reserved[0], token + 1u, __ATOMIC_RELEASE);
+  }
+
+  static inline uint32_t cr_audio_write_sequence(const cr_audio_header* h)
+  {
+    return __atomic_load_n(&h->reserved[0], __ATOMIC_ACQUIRE);
+  }
+
+  static inline int cr_audio_write_sequence_stable(const cr_audio_header* h,
+                                                   uint32_t observed)
+  {
+    return (observed & 1u) == 0u &&
+           cr_audio_write_sequence(h) == observed;
+  }
 
 #define CR_AUDIO_PATH "/data/cr/audio"
 

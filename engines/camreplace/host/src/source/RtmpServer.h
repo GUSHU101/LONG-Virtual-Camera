@@ -2,8 +2,8 @@
 
 // Minimal RTMP 1.0 publisher server — just enough of the protocol to let
 // OBS (or any other RTMP-ingest client) stream to us on localhost and
-// hand us the raw H.264 NAL units. Audio, goodput ACKs, gotoLive, and
-// every "digest" variation of the handshake are intentionally out of
+// hand us bounded H.264 NAL units and AAC access units. Full RTMP playback,
+// digest-handshake variants and remote exposure are intentionally out of
 // scope. We accept one publisher at a time; subsequent connections wait
 // on accept() until the current session ends.
 // Exposed contract:
@@ -71,7 +71,7 @@ public:
 
 private:
   void accept_loop_();
-  bool serve_client_(int client);
+  bool serve_client_(std::uintptr_t client);
 
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_flag_{false};
@@ -86,8 +86,10 @@ private:
 
   int port_ = 0;
   // Listen socket exposed to stop() so it can shutdown() the fd and
-  // break accept() on the worker thread.
+  // break accept() on the worker thread. The active client is tracked too:
+  // shutting only the listener cannot unblock recv() when OBS pauses.
   std::uintptr_t srv_sock_ = ~std::uintptr_t{0};
+  std::uintptr_t client_sock_ = ~std::uintptr_t{0};
   std::mutex mu_;
 };
 

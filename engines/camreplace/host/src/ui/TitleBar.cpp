@@ -1,3 +1,5 @@
+#define NOMINMAX
+
 #include "ui/TitleBar.h"
 
 #include "app/App.h"

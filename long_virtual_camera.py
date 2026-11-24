@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Unified source-tree launcher for LONG Virtual Camera.
+"""Single source-tree entry point for LONG Virtual Camera.
 
-The stable engine is available on Windows, Linux and macOS.  The enhanced
-engine is a native Windows build that adds opt-in virtual microphone and still
-photo replacement.
+There is deliberately no user-selectable engine switch or fallback runtime.
+The product is the complete Windows native host (camera, photo, ReCam-derived
+desktop sources and opt-in microphone).
 """
 
 from __future__ import annotations
@@ -12,79 +12,61 @@ import argparse
 import os
 from pathlib import Path
 import subprocess
-import sys
 
 
 ROOT = Path(__file__).resolve().parent
-STABLE_ENTRY = ROOT / "desktop" / "main.py"
-ENHANCED_NAMES = (
-    "LONG-Virtual-Camera-Enhanced.exe",
-    "CameraReplace.exe",  # compatibility with an older local build tree
-)
+NATIVE_NAME = "LONG-Virtual-Camera.exe"
 
 
-def enhanced_candidates() -> list[Path]:
+def native_candidates() -> list[Path]:
     candidates: list[Path] = []
-    configured = os.environ.get("LONGVC_ENHANCED_EXE")
+    configured = os.environ.get("LONGVC_EXE")
     if configured:
         candidates.append(Path(configured).expanduser())
     build_dir = ROOT / "engines" / "camreplace" / "build" / "host-dev-dev" / "bin"
-    candidates.extend(build_dir / name for name in ENHANCED_NAMES)
+    candidates.append(build_dir / NATIVE_NAME)
     return candidates
 
 
-def find_enhanced() -> Path | None:
+def find_native() -> Path | None:
     if os.name != "nt":
         return None
-    return next((path.resolve() for path in enhanced_candidates() if path.is_file()), None)
+    return next((path.resolve() for path in native_candidates() if path.is_file()), None)
 
 
-def resolve_engine(requested: str) -> tuple[str, Path]:
-    enhanced = find_enhanced()
-    if requested == "enhanced":
-        if os.name != "nt":
-            raise RuntimeError("增强引擎仅支持 Windows x64")
-        if enhanced is None:
-            raise RuntimeError(
-                "未找到增强引擎。请先运行 engines\\camreplace\\build.bat，"
-                "或设置 LONGVC_ENHANCED_EXE。"
-            )
-        return "enhanced", enhanced
-    if requested == "stable":
-        return "stable", STABLE_ENTRY
-    if enhanced is not None:
-        return "enhanced", enhanced
-    return "stable", STABLE_ENTRY
+def resolve_entry() -> Path:
+    """Resolve the one product entry without selecting a second implementation."""
+    if os.name != "nt":
+        raise RuntimeError("统一原生工具目前需要 Windows 10/11 x64")
+    native = find_native()
+    if native is None:
+        raise RuntimeError(
+            "未找到 LONG-Virtual-Camera.exe。请先运行仓库根目录的 build.bat，"
+            "或设置 LONGVC_EXE。"
+        )
+    return native
 
 
-def command_for(engine: str, entry: Path) -> list[str]:
-    if engine == "enhanced":
-        return [str(entry)]
-    return [sys.executable, str(entry)]
+def command_for(entry: Path) -> list[str]:
+    return [str(entry)]
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="LONG Virtual Camera 统一启动器")
-    parser.add_argument(
-        "--engine",
-        choices=("auto", "stable", "enhanced"),
-        default="auto",
-        help="auto 在 Windows 上优先使用已构建的增强引擎，否则使用稳定引擎",
-    )
-    parser.add_argument("--check", action="store_true", help="只显示将使用的引擎，不启动")
+    parser.add_argument("--check", action="store_true", help="只检查统一程序入口，不启动")
     args = parser.parse_args(argv)
 
     try:
-        engine, entry = resolve_engine(args.engine)
+        entry = resolve_entry()
     except RuntimeError as exc:
         parser.error(str(exc))
 
     if not entry.is_file():
         parser.error(f"入口不存在：{entry}")
-    print(f"LONG Virtual Camera engine={engine} entry={entry}")
+    print(f"LONG Virtual Camera entry={entry}")
     if args.check:
         return 0
-    return subprocess.call(command_for(engine, entry), cwd=ROOT)
+    return subprocess.call(command_for(entry), cwd=ROOT)
 
 
 if __name__ == "__main__":

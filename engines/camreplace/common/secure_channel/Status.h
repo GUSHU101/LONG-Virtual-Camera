@@ -29,6 +29,7 @@ enum class Error : std::uint8_t
   SequenceTooOld,
   CryptoUnavailable,
   CryptoFailure,
+  ResourceExhausted,
 };
 
 struct Status

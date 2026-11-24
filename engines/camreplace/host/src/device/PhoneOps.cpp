@@ -19,7 +19,7 @@
  *   uninstall/wipe flow после остановки hooks.
  *
  * Подтверждено:
- *   Поддерживается CameraServer/AudioServer injection, tcp_h264/tcp_nv21/tcp_pcm
+ *   Поддерживается CameraServer/AudioServer injection, tcp_h264/tcp_pcm
  *   feed process и AIDL/HIDL/tinyalsa-facing audio replacement. Tensor Pixel
  *   не должен зависеть от Qualcomm decoder names на host-side orchestration.
  *
@@ -86,8 +86,6 @@ std::string scheme_tag(FeedScheme s)
   {
   case FeedScheme::H264:
     return "tcp_h264";
-  case FeedScheme::Nv21:
-    return "tcp_nv21";
   case FeedScheme::Pcm:
     return "tcp_pcm";
   }
@@ -132,7 +130,8 @@ bool safe_basename_char(char c)
 
 std::string safe_remote_basename(const std::string& name)
 {
-  if (name.empty() || name.size() > 96)
+  if (name.empty() || name.size() > 96 || name == "." || name == ".." ||
+      name.front() == '.')
     return {};
   for (char c : name)
   {
@@ -164,12 +163,6 @@ bool feed_launch_claims(const std::string& feed_url, std::string& stream_kind, s
   {
     stream_kind = "video";
     feed_scheme = "tcp_h264";
-    return true;
-  }
-  if (feed_url.rfind("tcp_nv21:listen:", 0) == 0)
-  {
-    stream_kind = "video";
-    feed_scheme = "tcp_nv21";
     return true;
   }
   if (feed_url.rfind("tcp_pcm:listen:", 0) == 0)
@@ -265,6 +258,17 @@ bool PhoneOps::wipe_artifacts(const DeployCallback& cb)
 
 bool PhoneOps::launch_feed(const std::string& feed_url, const std::string& log_basename, const DeployCallback& cb)
 {
+  const std::string log = safe_remote_basename(log_basename);
+  std::string stream_kind;
+  std::string feed_scheme;
+  if (log.empty() || !feed_launch_claims(feed_url, stream_kind, feed_scheme))
+  {
+    if (cb)
+      cb(DeployStatus::err("authorize Android launch",
+                           log.empty() ? "unsafe log basename" : "unsupported feed scheme"));
+    return false;
+  }
+
   // Root remains the producer. Each service owns only the file it maps; the
   // directory is searchable but neither listable nor writable by apps.
   std::string prep = std::string(
@@ -278,17 +282,9 @@ bool PhoneOps::launch_feed(const std::string& feed_url, const std::string& log_b
   if (!step(serial_, "prepare owner-restricted /data/cr", AdbClient::su_shell(prep), cb))
     return false;
 
-  std::string stream_kind;
-  std::string feed_scheme;
-  if (!feed_launch_claims(feed_url, stream_kind, feed_scheme))
-  {
-    if (cb)
-      cb(DeployStatus::err("authorize Android launch", "unsupported feed scheme"));
-    return false;
-  }
   std::string launch = std::string("LD_LIBRARY_PATH=") + "/data/local/tmp " + "nohup " + "/data/local/tmp/cr_feed_proc " + "--feed " + shell_single_quote(feed_url);
-  launch += " >" + std::string("/data/local/tmp/") + log_basename + " " + "2>&1 &";
-  return step(serial_, std::string("launch cr_feed_proc (") + log_basename + ")", AdbClient::su_shell(launch), cb);
+  launch += " >" + std::string("/data/local/tmp/") + log + " " + "2>&1 &";
+  return step(serial_, std::string("launch cr_feed_proc (") + log + ")", AdbClient::su_shell(launch), cb);
 }
 
 bool PhoneOps::wait_feed_ready(FeedScheme scheme, const std::string& log_basename, int timeout_ms, const DeployCallback& cb) const
@@ -441,47 +437,86 @@ bool PhoneOps::hook_loaded(HostProc target) const
   return r.exit_code == 0 && r.stdout_.find("YES") != std::string::npos;
 }
 
-bool PhoneOps::inject_lib(HostProc target, const std::string& lib_basename, const std::string& init_fn, const std::string& feed_url, const DeployCallback& cb)
+bool PhoneOps::inject_lib(HostProc target, const std::string& lib_basename,
+                          const std::string& init_fn, const std::string& feed_url,
+                          bool refresh_service, const DeployCallback& cb)
 {
-  if (hook_loaded(target))
+  const std::string fn = init_fn.empty() ? default_init_fn(target) : init_fn;
+  std::string stream_kind;
+  std::string feed_scheme;
+  if (lib_basename != "libcr_hooks.so" || fn != default_init_fn(target) ||
+      !feed_launch_claims(feed_url, stream_kind, feed_scheme) ||
+      (target == HostProc::CameraServer && stream_kind != "video") ||
+      (target == HostProc::AudioServer && stream_kind != "audio"))
+  {
+    if (cb)
+      cb(DeployStatus::err("authorize hook injection", "unexpected library, init symbol, or feed kind"));
+    return false;
+  }
+
+  if (!refresh_service && hook_loaded(target))
   {
     step(serial_, host_proc_name(target) + std::string(" hook already loaded - reusing"), AdbClient::su_shell("echo reused"), cb);
     return true;
   }
 
   bool live_camera_inject = false;
+  bool camera_clients_closed = false;
   std::string live_camera_clients;
+  const auto restore_camera_clients = [&]()
+  {
+    if (camera_clients_closed)
+    {
+      relaunch_remembered_camera_clients(cb);
+      camera_clients_closed = false;
+    }
+  };
   if (target == HostProc::CameraServer)
   {
-    live_camera_clients = active_camera_client_packages();
-    live_camera_inject = !live_camera_clients.empty();
-    if (live_camera_inject)
+    if (refresh_service)
     {
-      if (cb)
+      if (!close_camera_clients(/*remember_for_relaunch=*/true, cb))
+        return false;
+      camera_clients_closed = true;
+      if (!restart_services({"cameraserver"}, cb) ||
+          !wait_host_proc_alive(target, 3000, cb))
       {
-        cb(DeployStatus::info("active camera client detected - live inject"));
-        cb(DeployStatus::ok("skip cameraserver restart", live_camera_clients));
+        restore_camera_clients();
+        return false;
       }
     }
     else
     {
-      close_camera_clients(/*remember_for_relaunch=*/true, cb);
-      std::string restart_cmd = std::string("killall -q cameraserver 2>/dev/null; true");
-      if (!step(serial_, "restart cameraserver", AdbClient::su_shell(restart_cmd), cb))
-        return false;
-      if (!wait_host_proc_alive(target, 3000, cb))
-        return false;
+      live_camera_clients = active_camera_client_packages();
+      live_camera_inject = !live_camera_clients.empty();
+      if (live_camera_inject)
+      {
+        if (cb)
+        {
+          cb(DeployStatus::info("active camera client detected - live inject"));
+          cb(DeployStatus::ok("skip cameraserver restart", live_camera_clients));
+        }
+      }
+      else
+      {
+        if (!close_camera_clients(/*remember_for_relaunch=*/true, cb))
+          return false;
+        camera_clients_closed = true;
+        if (!restart_services({"cameraserver"}, cb) ||
+            !wait_host_proc_alive(target, 3000, cb))
+        {
+          restore_camera_clients();
+          return false;
+        }
+      }
     }
   }
-
-  const std::string fn = init_fn.empty() ? default_init_fn(target) : init_fn;
-  std::string stream_kind;
-  std::string feed_scheme;
-  if (!feed_launch_claims(feed_url, stream_kind, feed_scheme))
+  else if (refresh_service)
   {
-    if (cb)
-      cb(DeployStatus::err("authorize Android launch", "unsupported feed scheme"));
-    return false;
+    // Only the explicit microphone opt-in path can request this refresh.
+    if (!restart_services({"audioserver"}, cb) ||
+        !wait_host_proc_alive(target, 3000, cb))
+      return false;
   }
 
   std::string hook_feed_url = feed_url;
@@ -495,7 +530,10 @@ bool PhoneOps::inject_lib(HostProc target, const std::string& lib_basename, cons
                               " && chcon u:object_r:system_data_file:s0 " + ready;
   if (!step(serial_, std::string("prepare ") + host_proc_name(target) + " readiness marker",
             AdbClient::su_shell(prepare_ready), cb))
+  {
+    restore_camera_clients();
     return false;
+  }
 
   std::string inject = std::string("LD_LIBRARY_PATH=") + "/data/local/tmp " + "/data/local/tmp/cr_injector" + std::string(" --target ") + host_proc_name(target) + std::string(" --lib /data/local/tmp/") + lib_basename + std::string(" --init ") + fn + std::string(" --feed ") + shell_single_quote(hook_feed_url);
 
@@ -503,12 +541,14 @@ bool PhoneOps::inject_lib(HostProc target, const std::string& lib_basename, cons
   {
     if (live_camera_inject && cb)
       cb(DeployStatus::err("live camera inject failed", "camera app was left running; close the camera app or press Start software before opening it"));
+    restore_camera_clients();
     return false;
   }
   if (!hook_loaded(target))
   {
     if (cb)
       cb(DeployStatus::err(std::string("verify hook mapped in ") + host_proc_name(target), std::string("injector exited successfully but ") + hook_lib_basename(target) + " is absent from /proc maps"));
+    restore_camera_clients();
     return false;
   }
   if (cb)
@@ -522,14 +562,12 @@ bool PhoneOps::inject_lib(HostProc target, const std::string& lib_basename, cons
         cb(DeployStatus::ok("live camera inject complete", live_camera_clients));
     }
     else
-    {
-      relaunch_remembered_camera_clients(cb);
-    }
+      restore_camera_clients();
   }
   return true;
 }
 
-void PhoneOps::restart_services(std::initializer_list<const char*> names, const DeployCallback& cb)
+bool PhoneOps::restart_services(std::initializer_list<const char*> names, const DeployCallback& cb)
 {
   std::string list;
   for (const char* n : names)
@@ -539,7 +577,7 @@ void PhoneOps::restart_services(std::initializer_list<const char*> names, const 
     list += n;
   }
   std::string cmd = std::string("killall -q ") + list + std::string(" 2>/dev/null; sleep 0.5; true");
-  step(serial_, std::string("restart ") + list, AdbClient::su_shell(cmd), cb);
+  return step(serial_, std::string("restart ") + list, AdbClient::su_shell(cmd), cb);
 }
 
 // Camera clients

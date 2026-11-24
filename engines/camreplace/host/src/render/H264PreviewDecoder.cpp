@@ -11,7 +11,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstring>
+#include <exception>
+#include <new>
 #include <string>
 using Microsoft::WRL::ComPtr;
 
@@ -38,6 +41,24 @@ bool H264PreviewDecoder::start_failed()
 
 namespace
 {
+
+class ComWorkerScope
+{
+public:
+  ComWorkerScope() noexcept : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+  ~ComWorkerScope() noexcept
+  {
+    if (result_ == S_OK || result_ == S_FALSE)
+      CoUninitialize();
+  }
+  [[nodiscard]] bool usable() const noexcept
+  {
+    return SUCCEEDED(result_) || result_ == RPC_E_CHANGED_MODE;
+  }
+
+private:
+  HRESULT result_;
+};
 
 // BT.601 limited-range NV12 → BGRA. Same matrix the rest of the project
 // uses (TexturePreview, Nv21) so the preview colours match what the
@@ -75,17 +96,55 @@ inline void nv12_to_bgra_row(const uint8_t* y_row, const uint8_t* uv_row, uint8_
 
 } // namespace
 
-void H264PreviewDecoder::arm(PublishFn publish, Nv12PublishFn nv12_publish)
+void H264PreviewDecoder::arm(PublishFn publish)
 {
+  if (worker_.joinable())
+    return;
   publish_ = std::move(publish);
-  nv12_publish_ = std::move(nv12_publish);
   start_failed_ = false;
   g_start_failed_.store(false, std::memory_order_relaxed);
 
-  if (worker_.joinable())
-    return;
   stopping_.store(false);
-  worker_ = std::thread([this] { worker_loop_(); });
+  try
+  {
+    worker_ = std::thread([this]
+                          {
+                            ComWorkerScope com;
+                            if (!com.usable())
+                            {
+                              cr::log::warn("preview", "COM initialization failed");
+                              teardown_();
+                              start_failed_ = true;
+                              g_start_failed_.store(true, std::memory_order_relaxed);
+                              return;
+                            }
+                            try
+                            {
+                              worker_loop_();
+                            }
+                            catch (const std::exception& e)
+                            {
+                              cr::log::warn("preview", std::string("decoder worker stopped: ") + e.what());
+                              teardown_();
+                              start_failed_ = true;
+                              g_start_failed_.store(true, std::memory_order_relaxed);
+                            }
+                            catch (...)
+                            {
+                              cr::log::warn("preview", "decoder worker stopped: unknown exception");
+                              teardown_();
+                              start_failed_ = true;
+                              g_start_failed_.store(true, std::memory_order_relaxed);
+                            }
+                          });
+  }
+  catch (const std::exception& e)
+  {
+    publish_ = nullptr;
+    start_failed_ = true;
+    g_start_failed_.store(true, std::memory_order_relaxed);
+    cr::log::warn("preview", std::string("decoder worker unavailable: ") + e.what());
+  }
 }
 
 void H264PreviewDecoder::stop()
@@ -101,30 +160,39 @@ void H264PreviewDecoder::stop()
     worker_.join();
   }
   publish_ = nullptr;
-  nv12_publish_ = nullptr;
 }
 
 void H264PreviewDecoder::feed(const uint8_t* annexb, size_t len, int64_t pts_us)
 {
   if (!annexb || !len)
     return;
-  if (!g_enabled_.load(std::memory_order_relaxed) && !nv12_publish_)
+  if (g_start_failed_.load(std::memory_order_relaxed) ||
+      !g_enabled_.load(std::memory_order_relaxed))
     return;
   if (!worker_.joinable())
     return;
 
-  NaluPacket p;
-  p.data.assign(annexb, annexb + len);
-  p.pts_us = pts_us;
-
+  try
   {
-    std::lock_guard<std::mutex> lk(q_mu_);
-    q_.push_back(std::move(p));
-    // Backpressure: if the decoder is hopelessly behind we'd rather
-    // drop frames than balloon memory. Drops break inter-frame deps
-    // until the next IDR — fine for a preview pane.
-    while (q_.size() > kMaxQueue)
-      q_.pop_front();
+    NaluPacket p;
+    p.data.assign(annexb, annexb + len);
+    p.pts_us = pts_us;
+
+    {
+      std::lock_guard<std::mutex> lk(q_mu_);
+      q_.push_back(std::move(p));
+      // Backpressure: if the decoder is hopelessly behind we'd rather
+      // drop frames than balloon memory. Drops break inter-frame deps
+      // until the next IDR — fine for a preview pane.
+      while (q_.size() > kMaxQueue)
+        q_.pop_front();
+    }
+  }
+  catch (const std::bad_alloc&)
+  {
+    // Preview is optional. Under memory pressure drop this access unit rather
+    // than unwind through the RTMP server and disconnect the publisher.
+    return;
   }
   q_cv_.notify_one();
 }
@@ -149,7 +217,7 @@ void H264PreviewDecoder::worker_loop_()
 
 void H264PreviewDecoder::process_nalu_(const uint8_t* annexb, size_t len, int64_t pts_us)
 {
-  if (!ensure_started_())
+  if (len > MAXDWORD || !ensure_started_())
     return;
 
   using clock = std::chrono::steady_clock;
@@ -160,11 +228,15 @@ void H264PreviewDecoder::process_nalu_(const uint8_t* annexb, size_t len, int64_
     return;
   BYTE* p = nullptr;
   DWORD max_len = 0;
-  if (SUCCEEDED(buf->Lock(&p, &max_len, nullptr)))
+  if (FAILED(buf->Lock(&p, &max_len, nullptr)))
+    return;
+  if (max_len < len)
   {
-    std::memcpy(p, annexb, len);
     buf->Unlock();
+    return;
   }
+  std::memcpy(p, annexb, len);
+  buf->Unlock();
   buf->SetCurrentLength((DWORD) len);
 
   ComPtr<IMFSample> in;
@@ -349,9 +421,12 @@ void H264PreviewDecoder::drain_()
       DWORD sz = si.cbSize;
       if (cur_w_ > 0 && cur_h_ > 0)
       {
-        DWORD need = (DWORD) (cur_w_ * cur_h_ * 3 / 2);
+        const std::uint64_t need = static_cast<std::uint64_t>(cur_w_) *
+                                   static_cast<std::uint64_t>(cur_h_) * 3 / 2;
+        if (need > MAXDWORD)
+          return;
         if (sz < need)
-          sz = need;
+          sz = static_cast<DWORD>(need);
       }
       if (sz < 4096)
         sz = 4096;
@@ -396,7 +471,7 @@ void H264PreviewDecoder::drain_()
       continue;
     }
 
-    if ((publish_ && g_enabled_.load(std::memory_order_relaxed)) || nv12_publish_)
+    if (publish_ && g_enabled_.load(std::memory_order_relaxed))
     {
       ComPtr<IMFMediaBuffer> mbuf;
       if (SUCCEEDED(outs->ConvertToContiguousBuffer(mbuf.GetAddressOf())) && mbuf)
@@ -406,27 +481,49 @@ void H264PreviewDecoder::drain_()
         if (SUCCEEDED(mbuf->Lock(&src, &ml, &cl)))
         {
           const int stride = cur_stride_ > 0 ? cur_stride_ : cur_w_;
+          const std::uint64_t y_bytes = static_cast<std::uint64_t>(stride) * cur_h_;
+          const std::uint64_t uv_bytes = static_cast<std::uint64_t>(stride) *
+                                         ((static_cast<std::uint64_t>(cur_h_) + 1) / 2);
+          const std::uint64_t bgra_bytes = static_cast<std::uint64_t>(cur_w_) *
+                                           cur_h_ * 4;
 
-          // Raw tap: NV12 straight from MFT, before BGRA convert.
-          // Caller is responsible for any further pixel-format
-          // shuffle (e.g. NV12→NV21 swap of chroma pairs).
-          if (nv12_publish_)
+          // Do not trust MFT dimensions/stride blindly. A short sample or
+          // malformed media type must never drive an out-of-bounds Y/UV read.
+          const bool valid = (cur_w_ & 1) == 0 && (cur_h_ & 1) == 0 &&
+                             stride >= cur_w_ && y_bytes + uv_bytes <= cl &&
+                             bgra_bytes <= MAXDWORD && cur_w_ <= INT_MAX / 4;
+          if (!valid)
           {
-            nv12_publish_(src, cur_w_, cur_h_, stride);
+            mbuf->Unlock();
           }
-
-          if (publish_ && g_enabled_.load(std::memory_order_relaxed))
+          else
           {
-            bgra_.resize((size_t) cur_w_ * cur_h_ * 4);
-            const uint8_t* yp = src;
-            const uint8_t* uvp = src + (size_t) stride * cur_h_;
-            for (int y = 0; y < cur_h_; ++y)
+            try
             {
-              nv12_to_bgra_row(yp + (size_t) y * stride, uvp + (size_t) (y / 2) * stride, bgra_.data() + (size_t) y * cur_w_ * 4, cur_w_);
+              if (publish_ && g_enabled_.load(std::memory_order_relaxed))
+              {
+                bgra_.resize(static_cast<std::size_t>(bgra_bytes));
+                const uint8_t* yp = src;
+                const uint8_t* uvp = src + static_cast<std::size_t>(y_bytes);
+                for (int y = 0; y < cur_h_; ++y)
+                {
+                  nv12_to_bgra_row(yp + static_cast<std::size_t>(y) * stride,
+                                   uvp + static_cast<std::size_t>(y / 2) * stride,
+                                   bgra_.data() + static_cast<std::size_t>(y) * cur_w_ * 4,
+                                   cur_w_);
+                }
+                publish_(bgra_.data(), cur_w_, cur_h_, cur_w_ * 4);
+              }
             }
-            publish_(bgra_.data(), cur_w_, cur_h_, cur_w_ * 4);
+            catch (...)
+            {
+              mbuf->Unlock();
+              if (db.pSample && db.pSample != out_sample.Get())
+                db.pSample->Release();
+              throw;
+            }
+            mbuf->Unlock();
           }
-          mbuf->Unlock();
         }
       }
     }
@@ -454,7 +551,6 @@ void H264PreviewDecoder::teardown_()
   start_failed_ = false;
   g_start_failed_.store(false, std::memory_order_relaxed);
   bgra_.clear();
-  bgra_.shrink_to_fit();
   {
     std::lock_guard<std::mutex> lk(q_mu_);
     q_.clear();

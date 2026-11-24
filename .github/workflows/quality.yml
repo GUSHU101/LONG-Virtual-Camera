@@ -33,8 +33,30 @@ jobs:
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -pthread tests/ring_access_test.cpp -o /tmp/ring_access_test
           /tmp/ring_access_test
-          gcc -std=c11 -Wall -Wextra -Werror tests/camreplace_ring_test.c -o /tmp/camreplace_ring_test
+          gcc -std=c11 -Wall -Wextra -Werror -pthread tests/camreplace_ring_test.c -o /tmp/camreplace_ring_test
           /tmp/camreplace_ring_test
+      - name: Camera hook ABI dispatch tests
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Werror -pthread \
+            -Iengines/camreplace/android/camhook/src \
+            tests/native/hook_dispatch_test.cpp \
+            -o /tmp/hook_dispatch_test
+          /tmp/hook_dispatch_test
+          g++ -std=c++20 -Wall -Wextra -Werror \
+            -Iengines/camreplace/common \
+            tests/native/frame_layout_test.cpp \
+            -o /tmp/frame_layout_test
+          /tmp/frame_layout_test
+          g++ -std=c++20 -Wall -Wextra -Werror \
+            -Iengines/camreplace/common \
+            tests/native/pcm_resampler_test.cpp \
+            -o /tmp/pcm_resampler_test
+          /tmp/pcm_resampler_test
+          g++ -std=c++20 -Wall -Wextra -Werror \
+            -Iengines/camreplace/common \
+            tests/native/avcc_test.cpp \
+            -o /tmp/avcc_test
+          /tmp/avcc_test
       - name: Authenticated media channel tests
         run: |
           gcc -std=c99 -Wall -Wextra -Werror -c \
@@ -64,9 +86,9 @@ jobs:
             NDK_APPLICATION_MK=android/jni/Application.mk \
             -j4
 
-  enhanced-android-native:
+  unified-android-native:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned NDK
@@ -74,29 +96,41 @@ jobs:
           if [ ! -x "$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION/ndk-build" ]; then
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$CAMREPLACE_NDK_VERSION"
           fi
-      - name: Configure enhanced Android engine
+      - name: Configure unified Android payload
         run: |
           cmake -S engines/camreplace/android -B build/camreplace-android -G "Unix Makefiles" \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/android-ndk.cmake" \
             -DANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION" \
             -DCMAKE_BUILD_TYPE=Release
-      - name: Build enhanced Android engine
+      - name: Build unified Android payload
         run: cmake --build build/camreplace-android --parallel 4
+      - name: Compile diagnostic upstream feed variants
+        run: |
+          cmake -S engines/camreplace/android -B build/camreplace-android-threaded -G "Unix Makefiles" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/android-ndk.cmake" \
+            -DANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION" \
+            -DCR_FEED_USE_THREADED=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/camreplace-android-threaded --target cr_feed_proc --parallel 4
+          cmake -S engines/camreplace/android -B build/camreplace-android-direct -G "Unix Makefiles" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/android-ndk.cmake" \
+            -DANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION" \
+            -DCR_FEED_ENABLE_RTMP_DIRECT=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/camreplace-android-direct --target cr_feed_proc --parallel 4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: enhanced-android-payload
+          name: unified-android-payload
           path: build/camreplace-android/out/
           if-no-files-found: error
 
-  enhanced-windows-host:
-    needs: enhanced-android-native
+  unified-windows-host:
+    needs: unified-android-native
     runs-on: windows-2022
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: enhanced-android-payload
+          name: unified-android-payload
           path: build/camreplace-android/out
       - name: Install pinned LLVM-MinGW
         shell: pwsh
@@ -114,24 +148,67 @@ jobs:
             Select-Object -First 1
           if (-not $compiler) { throw 'LLVM-MinGW compiler was not found after extraction' }
           $root = $compiler.Directory.Parent.FullName
+          $runtime = Get-ChildItem -LiteralPath $root -Recurse -Filter 'libwinpthread-1.dll' |
+            Where-Object { $_.FullName -match 'x86_64' } |
+            Select-Object -First 1
+          if (-not $runtime) { throw 'x86_64 libwinpthread-1.dll was not found after extraction' }
           "LLVM_MINGW_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Configure enhanced Windows host
+          "MINGW_RUNTIME_DIR=$($runtime.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure unified Windows host
         shell: pwsh
         run: |
           cmake -S engines/camreplace/host -B build/camreplace-host -G Ninja `
             -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/llvm-mingw.cmake" `
             -DLLVM_MINGW_ROOT="$env:LLVM_MINGW_ROOT" `
+            -DMINGW_RUNTIME_DIR="$env:MINGW_RUNTIME_DIR" `
             -DANDROID_OUT_DIR="$PWD/build/camreplace-android/out" `
             -DADB_SRC_DIR="$env:ANDROID_HOME/platform-tools" `
             -DCMAKE_BUILD_TYPE=Release
-      - name: Build enhanced Windows host
+      - name: Build unified Windows host
         shell: pwsh
         run: |
           cmake --build build/camreplace-host --target CameraReplace --parallel 4
-          $exe = 'build/camreplace-host/bin/LONG-Virtual-Camera-Enhanced.exe'
+          $exe = 'build/camreplace-host/bin/LONG-Virtual-Camera.exe'
           if (-not (Test-Path -LiteralPath $exe)) { throw "Missing output: $exe" }
+          $imports = & "$env:LLVM_MINGW_ROOT/bin/llvm-objdump.exe" -p $exe
+          if ($imports -match '(?i)DLL Name:\s*lib(win)?pthread') {
+            throw 'Release executable imports libwinpthread and is not standalone'
+          }
+      - name: Write reproducible build manifest
+        shell: pwsh
+        run: |
+          $files = [ordered]@{
+            'LONG-Virtual-Camera.exe' = 'build/camreplace-host/bin/LONG-Virtual-Camera.exe'
+            'adb.exe' = "$env:ANDROID_HOME/platform-tools/adb.exe"
+            'AdbWinApi.dll' = "$env:ANDROID_HOME/platform-tools/AdbWinApi.dll"
+            'AdbWinUsbApi.dll' = "$env:ANDROID_HOME/platform-tools/AdbWinUsbApi.dll"
+            'libwinpthread-1.dll' = "$env:MINGW_RUNTIME_DIR/libwinpthread-1.dll"
+            'cr_injector' = 'build/camreplace-android/out/cr_injector'
+            'cr_feed_proc' = 'build/camreplace-android/out/cr_feed_proc'
+            'libcr_hooks.so' = 'build/camreplace-android/out/libcr_hooks.so'
+          }
+          $hashes = [ordered]@{}
+          foreach ($entry in $files.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value)) { throw "Manifest input missing: $($entry.Value)" }
+            $item = Get-Item -LiteralPath $entry.Value
+            $hashes[$entry.Key] = [ordered]@{
+              size = $item.Length
+              sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          $manifest = [ordered]@{
+            schema = 1
+            commit = $env:GITHUB_SHA
+            ndk = $env:CAMREPLACE_NDK_VERSION
+            llvm_mingw_url = $env:LLVM_MINGW_URL
+            llvm_mingw_sha256 = $env:LLVM_MINGW_SHA256
+            files = $hashes
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'build/camreplace-host/bin/build-manifest.json' -Encoding utf8
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: LONG-Virtual-Camera-Enhanced-windows-x64
-          path: build/camreplace-host/bin/LONG-Virtual-Camera-Enhanced.exe
+          name: LONG-Virtual-Camera-windows-x64
+          path: |
+            build/camreplace-host/bin/LONG-Virtual-Camera.exe
+            build/camreplace-host/bin/build-manifest.json
           if-no-files-found: error

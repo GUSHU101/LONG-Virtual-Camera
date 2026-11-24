@@ -1,94 +1,108 @@
 # Architecture and safety contracts
 
-## Product boundary
+## One product runtime
 
-`long_virtual_camera.py` selects one of two isolated engines. They share product
-policy and tests but never inject both camera payloads into the same service at
-the same time.
+The supported product is one Windows executable and one device-owned session.
+OBS, generated test video, file/URL playback and DirectShow capture are source
+adapters, not engines. Camera, still-photo and microphone replacement are
+independent leases on the same source and transport stack.
 
 ```text
-                         LONG Virtual Camera
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │                           │
-          stable engine                  enhanced engine
-       ReCam-derived / cross-OS       CamReplace-derived / Windows
-          video camera              video + optional mic + JPEG
-                    │                           │
-                    └──────── Root Android ─────┘
+DesktopSource adapters
+        │
+loopback RTMP ingest ── preview
+        │ H.264                    optional AAC
+        │                              │
+authenticated TCP/ADB            AudioPump/PCM
+        │                              │
+Android MediaCodec → 3-slot ring   audio ring
+        │                              │
+Camera3OutputStream hook          audioserver hook
 ```
 
-The desktop process, ADB transport, root device tools and selected injected
-payload are one authorized control plane. Camera/audio applications are
-untrusted consumers. Network listeners intentionally bind only desktop/device
-loopback.
+The release UI exposes one H.264 lane. Upstream raw/direct/threaded sources are
+retained as diagnostic build configurations so upstream behavior remains
+regression-testable; they are not selectable product modes.
 
-## Camera buffer contract
+## Camera ABI and buffer contract
 
-1. Unsupported status, geometry, format, layout or private ABI passes through.
-2. The original HAL fence FD remains owned by Camera3. A duplicate is handed to
-   AHB, or the GBM fallback waits for it before CPU access.
-3. Native window buffers use the official AHB conversion function when present;
-   private pointer reinterpretation is not a supported path.
-4. The selected source slot remains reader-pinned for the complete pixel copy or
-   JPEG encode.
-5. Linear CPU writes unlock synchronously. An asynchronous optimization is valid
-   only if its output fence is correctly merged into the fence forwarded to
-   Camera3 on every exit path.
-6. The original Camera3 method is called only after replacement writes complete.
+1. Only exact reviewed mangled symbols are candidates. Unknown firmware passes
+   through; prefix guessing is forbidden.
+2. Proxies have the reviewed argument count and return Android `status_t`; the
+   original method is called exactly once and its value is returned unchanged.
+3. Replacement failure never suppresses the original queue operation.
+4. A duplicated HAL fence is consumed before CPU access. Native window buffers
+   use `ANativeWindowBuffer_getHardwareBuffer` when supported.
+5. Geometry, format, codec `offset/size`, row span and mapped capacity are
+   checked before access. Unknown YUV layouts do not use a grayscale fallback.
+6. A source slot stays pinned for the full pixel copy or JPEG encode.
 
-## Shared frame ownership
+## Frame publication contract
 
-Both ring implementations enforce the same invariant:
+The producer holds an exclusive OS writer lease for `/data/cr/feed`. On a
+compatible reconnect it clears only an abandoned writer token and preserves
+live cameraserver reader counts. A writer claims only a free non-current slot,
+writes all bytes, publishes index then sequence while retaining the writer token,
+and releases that token last. Readers pin, snapshot and revalidate generation,
+index, sequence and geometry. If every alternate slot is pinned, the producer
+drops the new frame instead of overwriting an active reader.
 
-- a reader atomically pins a published slot and revalidates publication state;
-- a writer may claim only a slot with no readers and marks it exclusively owned;
-- pixels and metadata are written before release publication;
-- if no slot is available, the producer skips a publication and keeps the last
-  complete frame instead of overwriting an active reader.
+## Microphone contract
 
-The exact layouts remain engine-specific for protocol compatibility. Tests in
-`tests/ring_access_test.cpp` and `tests/camreplace_ring_test.c` exercise their
-ownership models.
+- Initial OFF is the default: there is no audio feeder or audio-hook injection,
+  so the phone microphone follows the original HAL path untouched.
+- ON is explicit. Once the authenticated channel is READY, the hook clears the
+  complete HAL result before copying virtual PCM, so errors/underruns are
+  silence rather than leaked real-microphone bytes.
+- Every HAL consumer has its own cursor, probe and exact rational resampling
+  phase. Fractional phase survives callback boundaries.
+- Disable invalidates the phone channel before stopping the host pump. If the
+  hook was loaded by an earlier enable, it may remain dormant until service or
+  session cleanup, but it calls the original HAL result and substitutes no bytes.
+- Health is observable as STARTING/READY/STALLED/UNSUPPORTED.
 
-## Virtual microphone contract
+## Lifecycle and ownership
 
-The microphone starts OFF and is independent of camera/photo state.
+A process-owned single-worker executor serializes install/start/stop/delete.
+Shutdown stops accepting jobs, cancels jobs that never started, joins the active
+transaction, then tears down host resources. The active serial cannot be
+silently replaced by the UI. Cleanup is restricted to serials this process
+actually touched; merely authorizing another connected phone does not make it a
+wipe target.
 
-- OFF before first enable: no audio feeder, no `audioserver` injection, phone
-  microphone passes through normally.
-- ON: after channel readiness, the hook clears the full real-HAL result buffer
-  before format probing or virtual delivery. Unknown format, underrun and short
-  delivery therefore produce silence rather than real microphone bytes.
-- Disable: stop audio transport and clear shared magic. Any resident hook sees
-  the channel as inactive and immediately calls through without substitution.
-- Service restart/reboot fully removes the resident hook mapping.
+Camera and photo share a video lease, so stopping one cannot disarm the other.
+Every partially completed start has an explicit reverse path. Blocking ADB,
+handshake, socket and child-process operations have deadlines or forced teardown.
 
-Audio callbacks must not allocate unbounded memory or wait on the network. New
-format conversion needs tests for mono/stereo, sample-rate change, non-frame
-tails, underrun and concurrent disable.
+## Parser and transport budgets
 
-## Lifecycle and privilege contract
+RTMP binds only to `127.0.0.1`. Socket handles remain pointer-width on Windows.
+The parser limits chunk streams, per-message bytes, aggregate buffered bytes,
+inbound chunk size and AMF nesting. Extended timestamps are consumed on every
+continuation. AVC configuration determines the 1/2/4-byte NAL length field;
+malformed configuration/access units are rejected transactionally.
 
-- Startup is transactional; failure rolls back every completed stage.
-- Shutdown attempts every stage even after an earlier error.
-- Runtime paths are not world writable. Camera and audio artifacts have separate
-  service owners.
-- SELinux remains enforcing. Only scoped, verified rules may be added.
-- Only target services create readiness evidence; the controller cannot forge it.
-- Hook-visible mappings/resources cannot be unmapped until callbacks are drained
-  or the owning system service exits.
+Each media lane performs an ephemeral X25519 exchange and ticket proof bound to
+stream kind and expiry. Records are authenticated, ordered and size-limited.
+This secures the local USB/loopback transport; it is not persistent device
+identity.
 
-Root access is still inherently high risk. Use a test device and keep a recovery
-path; reboot if a service cannot be restored deterministically.
+## Release boundary
 
-## Private ABI policy
+The build fails if adb, the MinGW runtime, Android payloads or UI assets are
+missing/empty. CI publishes the executable with a manifest containing source
+commit, pinned toolchains, payload sizes and SHA-256 hashes. A special
+`CR_ALLOW_MISSING_RESOURCES=ON` option exists only for non-distributable UI
+bootstrap builds.
 
-Android camera-service internals are not an NDK API. A hook candidate must have a
-known signature family, supported 64-bit architecture and valid loaded-module
-address. The stable engine additionally compares live prologue bytes with the
-ELF resolution source and validates relocation. Unknown cases fail closed.
+Generated video, file/URL playback and DirectShow adapters launch an external
+FFmpeg executable resolved from `LONGVC_FFMPEG` or `PATH`. OBS push mode enters
+the same loopback RTMP ingest directly and does not require the adapter process.
 
-Supporting a new Android release requires adding evidence for its mangling and
-structure layout plus a device regression result; a similar symbol prefix alone
-is never sufficient.
+## Validation boundary
+
+Host/unit/ABI/parser/ring tests and cross-compilation are mandatory gates, but
+cannot validate vendor Camera3, gralloc, MediaCodec or Audio HAL behavior.
+Physical-device testing remains required for each supported build fingerprint,
+orientation, format, preview/record/JPEG path, USB interruption and repeated
+start/stop cycle.

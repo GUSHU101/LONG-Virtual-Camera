@@ -2,7 +2,10 @@
 #
 # Built with Android NDK r29 clang, targeting arm64-v8a, API 21+.
 
-cmake_minimum_required(VERSION 3.24)
+# Android Studio/SDK still distributes CMake 3.22 broadly. This project uses
+# no newer language feature, so keep clean-checkout payload builds reproducible
+# without requiring a separately installed host CMake.
+cmake_minimum_required(VERSION 3.22)
 project(camera_replace_android CXX C ASM)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -88,38 +91,27 @@ set_target_properties(cr_secure_channel PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(cr_secure_channel PUBLIC log)
 cr_apply_defaults(cr_secure_channel)
 cr_enable_public_mode(cr_secure_channel)
+# SecureSession translates std::vector allocation failures into Status values
+# at noexcept boundaries; its catch blocks require exceptions for this target.
+target_compile_options(cr_secure_channel PRIVATE -fexceptions)
 
 # --- cr_feed (static multicall payload) --------------------------------------
-# Three transports for video, one for audio:
-#   tcp_h264   — legacy: PC parses RTMP, ships framed NALs to us (OBS only)
-#   rtmp       — sprint B: we are the RTMP listener, OBS pushes direct (no
-#                PC-side parser hop). Both video transports share the
-#                AMediaCodec pipe in h264_decode_pipe.h.
-#   tcp_pcm    — PCM audio → /data/cr/audio (audhook reads it)
-#
-# Sprint C (EXPERIMENTAL): swap the single-threaded tcp_h264_feed.cpp for
-# tcp_h264_feed_v2.cpp (network/decoder/publish split across threads with
-# bounded queues — see feed_queues.h). They both define
-# cr_feed_run_tcp_h264 so EXACTLY ONE must be in the library.
+# Release host selects one authenticated H.264 video lane and one explicit
+# opt-in PCM audio lane. The upstream raw receiver and opt-in diagnostic feed
+# variants remain buildable for compatibility/regression work, but are not a
+# second product engine or user-selectable runtime.
 option(CR_FEED_ENABLE_RTMP_DIRECT
        "Build the legacy direct phone-side RTMP listener" OFF)
-
 option(CR_FEED_USE_THREADED
-       "Use the threaded tcp_h264 transport (sprint C)" OFF)
-option(CR_CAMHOOK_DIAGNOSTIC_FALLBACK
-       "Enable non-production returnBufferCheckedLocked diagnostic fallback hook" OFF)
-set(_cr_feed_tcp_h264_src
-    feed/src/tcp_h264_feed.cpp)
-if(CR_FEED_USE_THREADED)
-    set(_cr_feed_tcp_h264_src
-        feed/src/tcp_h264_feed_v2.cpp)
-    message(STATUS "cr_feed: using threaded tcp_h264 transport (sprint C)")
-endif()
+       "Use the upstream experimental threaded tcp_h264 receiver" OFF)
 
+set(_cr_feed_tcp_h264_src feed/src/tcp_h264_feed.cpp)
+if(CR_FEED_USE_THREADED)
+    set(_cr_feed_tcp_h264_src feed/src/tcp_h264_feed_v2.cpp)
+endif()
 set(_cr_feed_optional_src)
 if(CR_FEED_ENABLE_RTMP_DIRECT)
     list(APPEND _cr_feed_optional_src feed/src/rtmp_h264_feed.cpp)
-    message(STATUS "cr_feed: building legacy direct RTMP listener")
 endif()
 
 add_library(cr_feed STATIC
@@ -131,7 +123,9 @@ add_library(cr_feed STATIC
     feed/src/tcp_pcm_feed.cpp
 )
 target_include_directories(cr_feed PUBLIC feed/include)
-target_include_directories(cr_feed PRIVATE ${CMAKE_SOURCE_DIR}/../host/src)
+target_include_directories(cr_feed PRIVATE
+    ${CMAKE_SOURCE_DIR}/../host/src
+    ${CMAKE_SOURCE_DIR}/../common)
 target_link_libraries(cr_feed PRIVATE cr_secure_channel log android mediandk)
 set_target_properties(cr_feed PROPERTIES POSITION_INDEPENDENT_CODE ON)
 cr_apply_defaults(cr_feed)
@@ -189,6 +183,7 @@ add_library(cr_hooks SHARED
     audhook/src/audhook_main.cpp
 )
 target_include_directories(cr_hooks PRIVATE
+    ${CMAKE_SOURCE_DIR}/../common
     ${CMAKE_SOURCE_DIR}/../third_party/shadowhook/shadowhook/src/main/cpp/include
     ${CMAKE_SOURCE_DIR}/../host/src
     ${CMAKE_SOURCE_DIR}/security
@@ -199,13 +194,6 @@ set_target_properties(cr_hooks PROPERTIES OUTPUT_NAME cr_hooks)
 cr_apply_defaults(cr_hooks)
 cr_enable_public_mode(cr_hooks)
 target_compile_options(cr_hooks PRIVATE -fexceptions)
-if(CR_CAMHOOK_DIAGNOSTIC_FALLBACK)
-    target_compile_definitions(cr_hooks PRIVATE CR_CAMHOOK_DIAGNOSTIC_FALLBACK=1)
-    message(WARNING
-        "CR_CAMHOOK_DIAGNOSTIC_FALLBACK=ON is diagnostic-only; it does not "
-        "make returnBufferCheckedLocked a production camera-replacement hook.")
-endif()
-
 # --- libcr_audhook.so --------------------------------------------------------
 # Mic substitution: hooks StreamInHalHidl::read inside audioserver and
 # overwrites the post-HAL buffer with PCM from /data/cr/audio.

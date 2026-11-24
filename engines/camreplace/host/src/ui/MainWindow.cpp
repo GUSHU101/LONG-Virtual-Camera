@@ -14,23 +14,28 @@
 
 
 #include <shellapi.h> // ShellExecuteW for "Launch OBS"
+#include <commdlg.h>
 
 #include <imgui.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
+#include <future>
 #include <new>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
@@ -61,6 +66,11 @@ struct UiState
   std::atomic_uint64_t photo_operation{0};
   bool preview_on = true;       // toggled by preview button
   bool log_expanded = false; // log collapsed by default
+  bool source_initialized = false;
+  int source_kind = static_cast<int>(cr::source::DesktopSourceKind::Obs);
+  std::array<char, 1024> source_file{};
+  std::array<char, 512> source_camera{};
+  std::vector<std::string> source_cameras;
 
   struct UiMotion
   {
@@ -69,8 +79,6 @@ struct UiState
     float device_panel_t = 0.0f;
     float device_panel_w = 340.0f;
     float log_t = 0.0f;
-    float transport_t = 0.0f;
-    bool transport_open = false;
     bool any_button_animating = false;
     float device_link_hover = 0.0f;
     float entrance_t = 1.0f;
@@ -360,13 +368,6 @@ struct DeviceWaveSample
   bool ready = false;
 };
 
-struct DeviceWavePlayback
-{
-  HWAVEOUT out = nullptr;
-  WAVEHDR header{};
-  HANDLE done = nullptr;
-};
-
 bool device_wav_chunk_id_is(const unsigned char* p, const char* id) noexcept
 {
   return std::memcmp(p, id, 4) == 0;
@@ -449,95 +450,149 @@ const DeviceWaveSample& device_wave_sample(DeviceMenuSound sound) noexcept
   return sound == DeviceMenuSound::Error ? error : granted;
 }
 
-void cleanup_device_wave_playback(DeviceWavePlayback* playback) noexcept
-{
-  if (!playback)
-    return;
-
-  if (playback->done)
-  {
-    const DWORD wait = ::WaitForSingleObject(playback->done, 5000);
-    if (wait != WAIT_OBJECT_0 && playback->out)
-      ::waveOutReset(playback->out);
-  }
-  if (playback->out && playback->header.lpData)
-    ::waveOutUnprepareHeader(playback->out, &playback->header, sizeof(playback->header));
-  if (playback->out)
-    ::waveOutClose(playback->out);
-  if (playback->done)
-    ::CloseHandle(playback->done);
-  delete playback;
-}
-
 void CALLBACK device_wave_done(HWAVEOUT, UINT msg, DWORD_PTR instance, DWORD_PTR, DWORD_PTR) noexcept
 {
-  if (msg != WOM_DONE)
+  if (msg != WOM_DONE || instance == 0)
     return;
-  auto* playback = reinterpret_cast<DeviceWavePlayback*>(instance);
-  if (playback && playback->done)
-    ::SetEvent(playback->done);
+  ::SetEvent(reinterpret_cast<HANDLE>(instance));
+}
+
+void play_device_wave_sample(const DeviceWaveSample& sample) noexcept
+{
+  if (!sample.ready)
+    return;
+  HANDLE done = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!done)
+    return;
+
+  HWAVEOUT out = nullptr;
+  MMRESULT rc = ::waveOutOpen(
+      &out, WAVE_MAPPER, &sample.format,
+      reinterpret_cast<DWORD_PTR>(&device_wave_done),
+      reinterpret_cast<DWORD_PTR>(done), CALLBACK_FUNCTION);
+  if (rc != MMSYSERR_NOERROR || !out)
+  {
+    ::CloseHandle(done);
+    return;
+  }
+
+  WAVEHDR header{};
+  header.lpData = const_cast<LPSTR>(reinterpret_cast<const char*>(sample.pcm));
+  header.dwBufferLength = sample.pcm_size;
+  bool prepared = ::waveOutPrepareHeader(out, &header, sizeof(header)) == MMSYSERR_NOERROR;
+  if (prepared && ::waveOutWrite(out, &header, sizeof(header)) == MMSYSERR_NOERROR)
+  {
+    if (::WaitForSingleObject(done, 5000) != WAIT_OBJECT_0)
+      ::waveOutReset(out);
+  }
+  else if (prepared)
+  {
+    ::waveOutReset(out);
+  }
+  if (prepared)
+  {
+    rc = ::waveOutUnprepareHeader(out, &header, sizeof(header));
+    if (rc == WAVERR_STILLPLAYING)
+    {
+      ::waveOutReset(out);
+      ::WaitForSingleObject(done, 1000);
+      ::waveOutUnprepareHeader(out, &header, sizeof(header));
+    }
+  }
+  ::waveOutClose(out);
+  ::CloseHandle(done);
+}
+
+class DeviceSoundPlayer
+{
+public:
+  ~DeviceSoundPlayer() { stop(); }
+  DeviceSoundPlayer(const DeviceSoundPlayer&) = delete;
+  DeviceSoundPlayer& operator=(const DeviceSoundPlayer&) = delete;
+
+  void enqueue(const DeviceWaveSample& sample) noexcept
+  {
+    if (!sample.ready)
+      return;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (stopping_)
+      return;
+    if (!worker_.joinable())
+    {
+      try
+      {
+        worker_ = std::thread([this] { run_(); });
+      }
+      catch (...)
+      {
+        stopping_ = true;
+        queue_.clear();
+        return;
+      }
+    }
+    if (queue_.size() >= kMaxQueuedSounds)
+      queue_.pop_front();
+    queue_.push_back(&sample);
+    cv_.notify_one();
+  }
+
+  void stop() noexcept
+  {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+      queue_.clear();
+    }
+    cv_.notify_all();
+    try
+    {
+      if (worker_.joinable())
+        worker_.join();
+    }
+    catch (...)
+    {
+    }
+  }
+
+private:
+  DeviceSoundPlayer() = default;
+  friend DeviceSoundPlayer& device_sound_player();
+  static constexpr size_t kMaxQueuedSounds = 8;
+
+  void run_() noexcept
+  {
+    for (;;)
+    {
+      const DeviceWaveSample* sample = nullptr;
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+        if (stopping_ && queue_.empty())
+          return;
+        sample = queue_.front();
+        queue_.pop_front();
+      }
+      if (sample)
+        play_device_wave_sample(*sample);
+    }
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<const DeviceWaveSample*> queue_;
+  std::thread worker_;
+  bool stopping_ = false;
+};
+
+DeviceSoundPlayer& device_sound_player()
+{
+  static DeviceSoundPlayer player;
+  return player;
 }
 
 void play_device_menu_sound(DeviceMenuSound sound) noexcept
 {
-  const auto& sample = device_wave_sample(sound);
-  if (!sample.ready)
-    return;
-
-  auto* playback = new (std::nothrow) DeviceWavePlayback();
-  if (!playback)
-    return;
-
-  playback->done = ::CreateEventA(nullptr, FALSE, FALSE, nullptr);
-  if (!playback->done)
-  {
-    delete playback;
-    return;
-  }
-
-  MMRESULT rc = ::waveOutOpen(
-      &playback->out,
-      WAVE_MAPPER,
-      &sample.format,
-      reinterpret_cast<DWORD_PTR>(&device_wave_done),
-      reinterpret_cast<DWORD_PTR>(playback),
-      CALLBACK_FUNCTION);
-  if (rc != MMSYSERR_NOERROR || !playback->out)
-  {
-    ::CloseHandle(playback->done);
-    delete playback;
-    return;
-  }
-
-  playback->header.lpData = const_cast<LPSTR>(reinterpret_cast<const char*>(sample.pcm));
-  playback->header.dwBufferLength = sample.pcm_size;
-  rc = ::waveOutPrepareHeader(playback->out, &playback->header, sizeof(playback->header));
-  if (rc != MMSYSERR_NOERROR)
-  {
-    ::waveOutClose(playback->out);
-    ::CloseHandle(playback->done);
-    delete playback;
-    return;
-  }
-  rc = ::waveOutWrite(playback->out, &playback->header, sizeof(playback->header));
-  if (rc != MMSYSERR_NOERROR)
-  {
-    ::waveOutUnprepareHeader(playback->out, &playback->header, sizeof(playback->header));
-    ::waveOutClose(playback->out);
-    ::CloseHandle(playback->done);
-    delete playback;
-    return;
-  }
-
-  try
-  {
-    std::thread(cleanup_device_wave_playback, playback).detach();
-  }
-  catch (...)
-  {
-    ::waveOutReset(playback->out);
-    cleanup_device_wave_playback(playback);
-  }
+  device_sound_player().enqueue(device_wave_sample(sound));
 }
 
 bool device_menu_button(const char* label, ImVec2 size = ImVec2(0, 0), ButtonVariant variant = ButtonVariant::Default)
@@ -548,73 +603,6 @@ bool device_menu_button(const char* label, ImVec2 size = ImVec2(0, 0), ButtonVar
   return true;
 }
 
-
-void draw_transport_dropdown(bool disabled)
-{
-  UiState& ui = state();
-  const cr::source::Transport cur = cr::source::FeedController::transport();
-  const std::string lbl_compressed = "Compressed";
-  const std::string lbl_uncompressed = "Uncompressed";
-  const bool raw = (cur == cr::source::Transport::Raw);
-  const std::string button_label = std::string(raw ? lbl_uncompressed : lbl_compressed) + "  v##transport_anim";
-
-  if (disabled)
-  {
-    ui.motion.transport_open = false;
-    ui.motion.transport_t = approach(ui.motion.transport_t, 0.0f, 10.0f);
-  }
-
-  ImGui::BeginDisabled(disabled);
-  if (animated_button(button_label.c_str(), ImVec2(150, 0)))
-  {
-    ui.motion.transport_open = !ui.motion.transport_open;
-    if (ui.motion.transport_open)
-    {
-      ImGui::OpenPopup("##transport_popup");
-    }
-  }
-  ImGui::EndDisabled();
-
-  const float popup_w = ImGui::GetItemRectSize().x;
-  ImVec2 popup_pos = ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y + 5.0f);
-  const bool popup_open = ImGui::IsPopupOpen("##transport_popup");
-  if (!popup_open)
-    ui.motion.transport_open = false;
-  ui.motion.transport_t = approach(ui.motion.transport_t, ui.motion.transport_open ? 1.0f : 0.0f, 9.0f);
-
-  if (ui.motion.transport_t > 0.001f)
-  {
-    const float t = ui.motion.transport_t;
-    ImGui::SetNextWindowPos(ImVec2(popup_pos.x, popup_pos.y - (1.0f - t) * 8.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(popup_w, 0.0f), ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * t);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 6));
-    if (ImGui::BeginPopup("##transport_popup", ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize))
-    {
-      auto option = [&](const std::string& label, cr::source::Transport tr)
-      {
-        const bool selected = (cur == tr);
-        if (selected)
-        {
-          ImGui::PushStyleColor(ImGuiCol_Text, accents().live_green);
-        }
-        if (animated_button(label.c_str(), ImVec2(-1, 28), selected ? ButtonVariant::Live : ButtonVariant::Default))
-        {
-          cr::source::FeedController::set_transport(tr);
-          ui.motion.transport_open = false;
-          ImGui::CloseCurrentPopup();
-        }
-        if (selected)
-          ImGui::PopStyleColor();
-      };
-      option(lbl_compressed, cr::source::Transport::Compressed);
-      option(lbl_uncompressed, cr::source::Transport::Raw);
-      ImGui::EndPopup();
-    }
-    ImGui::PopStyleVar(3);
-  }
-}
 
 const cr::device::DeviceInfo* resolve_selected(const std::vector<cr::device::DeviceInfo>& v)
 {
@@ -656,6 +644,26 @@ std::string wide_to_utf8(const std::wstring& w)
   if (n > 0)
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int) w.size(), out.data(), n, nullptr, nullptr);
   return out;
+}
+
+std::string choose_media_file()
+{
+  std::array<wchar_t, 32768> path{};
+  static constexpr wchar_t filter[] =
+      L"Video and audio files\0*.mp4;*.mkv;*.mov;*.webm;*.avi;*.m4v;*.ts;*.mp3;*.m4a;*.wav\0"
+      L"All files\0*.*\0\0";
+  OPENFILENAMEW dialog{};
+  dialog.lStructSize = sizeof(dialog);
+  dialog.hwndOwner = cr::app::App::hwnd();
+  dialog.lpstrFile = path.data();
+  dialog.nMaxFile = static_cast<DWORD>(path.size());
+  dialog.lpstrFilter = filter;
+  dialog.nFilterIndex = 1;
+  dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR |
+                 OFN_DONTADDTORECENT;
+  if (!GetOpenFileNameW(&dialog))
+    return {};
+  return wide_to_utf8(path.data());
 }
 
 bool file_exists_w(const std::wstring& p)
@@ -813,34 +821,161 @@ std::string find_obs_exe()
   return {};
 }
 
-void draw_obs_info_panel()
+void draw_source_info_panel()
 {
   const auto st = cr::source::FeedController::obs_status();
+  const auto source_status = cr::source::FeedController::desktop_source_status();
+  UiState& ui = state();
+  if (!ui.source_initialized)
+  {
+    const auto config = cr::source::FeedController::desktop_source();
+    ui.source_kind = static_cast<int>(config.kind);
+    if (config.kind == cr::source::DesktopSourceKind::Camera)
+      std::snprintf(ui.source_camera.data(), ui.source_camera.size(), "%s", config.value.c_str());
+    else
+      std::snprintf(ui.source_file.data(), ui.source_file.size(), "%s", config.value.c_str());
+    ui.source_initialized = true;
+  }
 
-  // Single-row panel: status dot + status text + RTMP URL + Copy + Launch OBS.
-  // Optional compact stream stats appended on the same line when connected.
-  const float row_h = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().WindowPadding.y * 2.0f;
-  ImGui::BeginChild("obs_info", ImVec2(0, row_h), true);
+  const bool any_active = ui.streaming || ui.sound_replacing || ui.photo_replacing;
+  auto commit_source = [&]()
+  {
+    cr::source::DesktopSourceConfig config{};
+    config.kind = static_cast<cr::source::DesktopSourceKind>(ui.source_kind);
+    if (config.kind == cr::source::DesktopSourceKind::FileOrUrl)
+      config.value = ui.source_file.data();
+    else if (config.kind == cr::source::DesktopSourceKind::Camera)
+      config.value = ui.source_camera.data();
+    if (!cr::source::FeedController::set_desktop_source(std::move(config)))
+      cr::log::warn("source", "source change rejected while a session is active");
+  };
 
-  const bool obs_pipeline_up = state().streaming || state().photo_replacing || state().sound_replacing;
+  // ReCam's desktop inputs and CamReplace's RTMP ingest now share this single
+  // source panel and downstream lifecycle.
+  const float panel_h = ImGui::GetFrameHeightWithSpacing() * 2.0f +
+                        ImGui::GetStyle().WindowPadding.y * 2.0f;
+  ImGui::BeginChild("source_info", ImVec2(0, panel_h), true);
+
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Source");
+  ImGui::SameLine();
+  ImGui::BeginDisabled(any_active);
+  ImGui::SetNextItemWidth(170.0f);
+  if (ImGui::Combo("##desktop_source", &ui.source_kind,
+                   "OBS / RTMP\0Test pattern\0Video file or URL\0Windows camera\0"))
+    commit_source();
+
+  ImGui::SameLine();
+  const auto source_kind = static_cast<cr::source::DesktopSourceKind>(ui.source_kind);
+  static std::future<std::vector<std::string>> camera_scan;
+  if (camera_scan.valid() &&
+      camera_scan.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+  {
+    try
+    {
+      ui.source_cameras = camera_scan.get();
+      if (ui.source_camera[0] == '\0' && !ui.source_cameras.empty())
+      {
+        std::snprintf(ui.source_camera.data(), ui.source_camera.size(), "%s",
+                      ui.source_cameras.front().c_str());
+        commit_source();
+      }
+    }
+    catch (...)
+    {
+      ui.source_cameras.clear();
+    }
+  }
+  if (source_kind == cr::source::DesktopSourceKind::Obs)
+  {
+    ImGui::TextDisabled("external publisher");
+  }
+  else if (source_kind == cr::source::DesktopSourceKind::TestPattern)
+  {
+    ImGui::TextDisabled("1280x720 low-latency testsrc2");
+  }
+  else if (source_kind == cr::source::DesktopSourceKind::FileOrUrl)
+  {
+    ImGui::SetNextItemWidth(-90.0f);
+    if (ImGui::InputTextWithHint("##source_file", "local file or media URL",
+                                 ui.source_file.data(), ui.source_file.size()))
+      commit_source();
+    ImGui::SameLine();
+    if (animated_button("Browse"))
+    {
+      const std::string selected = choose_media_file();
+      if (!selected.empty())
+      {
+        std::snprintf(ui.source_file.data(), ui.source_file.size(), "%s", selected.c_str());
+        commit_source();
+      }
+    }
+  }
+  else
+  {
+    ImGui::SetNextItemWidth(-90.0f);
+    if (!ui.source_cameras.empty())
+    {
+      const char* current = ui.source_camera[0] ? ui.source_camera.data() : "select camera";
+      if (ImGui::BeginCombo("##source_camera_combo", current))
+      {
+        for (const auto& camera : ui.source_cameras)
+        {
+          const bool selected = camera == ui.source_camera.data();
+          if (ImGui::Selectable(camera.c_str(), selected))
+          {
+            std::snprintf(ui.source_camera.data(), ui.source_camera.size(), "%s", camera.c_str());
+            commit_source();
+          }
+          if (selected)
+            ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+    }
+    else if (ImGui::InputTextWithHint("##source_camera", "exact DirectShow video device name",
+                                      ui.source_camera.data(), ui.source_camera.size()))
+    {
+      commit_source();
+    }
+    ImGui::SameLine();
+    const bool scanning = camera_scan.valid();
+    ImGui::BeginDisabled(scanning);
+    if (animated_button(scanning ? "Scanning" : "Scan"))
+    {
+      camera_scan = std::async(std::launch::async,
+                               [] { return cr::source::DesktopSource::list_cameras(); });
+    }
+    ImGui::EndDisabled();
+  }
+  ImGui::EndDisabled();
+
+  const bool obs_pipeline_up = any_active;
+  const bool managed_source = source_kind != cr::source::DesktopSourceKind::Obs;
 
   ImU32 col = accents().dim_text;
   // Store the chosen status until TextUnformatted consumes it below.
-  std::string status_text = "Waiting for OBS to connect…";
+  std::string status_text = managed_source ? "Built-in source is idle" : "Waiting for OBS to connect…";
   if (!obs_pipeline_up)
   {
     col = accents().dim_text;
-    status_text = "Press Start, then stream from OBS.";
+    status_text = managed_source ? "Press Start to launch the selected source."
+                                 : "Press Start, then stream from OBS.";
   }
   else if (st.obs_connected)
   {
     col = accents().live_green;
-    status_text = "OBS connected";
+    status_text = managed_source ? "Built-in source connected" : "OBS connected";
+  }
+  else if (managed_source && !source_status.running)
+  {
+    col = accents().error_red;
+    status_text = source_status.detail.empty() ? "Built-in source stopped" : source_status.detail;
   }
   else
   {
     col = accents().warn_amber;
-    status_text = "Waiting for OBS…";
+    status_text = managed_source ? "Starting built-in source…" : "Waiting for OBS…";
   }
   ImVec2 p = ImGui::GetCursorScreenPos();
   ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + 7, p.y + ImGui::GetFrameHeight() * 0.5f), 5.0f, col);
@@ -865,7 +1000,7 @@ void draw_obs_info_panel()
 
   ImGui::SameLine();
   static std::string obs_path = find_obs_exe();
-  ImGui::BeginDisabled(obs_path.empty());
+  ImGui::BeginDisabled(obs_path.empty() || managed_source);
   if (animated_button("Launch OBS"))
   {
     // Convert UTF-8 → UTF-16 properly so paths with non-ASCII (Steam
@@ -890,17 +1025,6 @@ void draw_obs_info_panel()
     cr::winapi::ShellExecuteW(nullptr, open.c_str(), w.c_str(), nullptr, dir.c_str(), SW_SHOWNORMAL);
   }
   ImGui::EndDisabled();
-
-  // --- Transport selector ----------------------------------------------
-  // Combo right of Launch OBS. Locked while ANY replace mode is active
-  // (camera/sound/photo) — switching transport requires teardown of the
-  // OBS source and the phone-side cr_feed_proc, both of which already
-  // happen on Stop.
-  ImGui::SameLine();
-  {
-    const bool any_active = state().streaming || state().sound_replacing || state().photo_replacing;
-    draw_transport_dropdown(any_active);
-  }
 
   // Stream info (resolution / fps) is rendered next to the PREVIEW
   // header — kept out of this panel so OBS-status row stays tight.
@@ -1232,7 +1356,7 @@ void draw_device_panel(float width, float alpha)
       {
         // Tint USB 2.0 amber: 480 Mbps caps raw-NV21 1080p30 at
         // about 720p, so the user knows what to expect when they
-        // pick the Raw transport in the OBS panel above.
+        // publish unusually high-bitrate media.
         const bool is_hs = d->usb_speed.find("USB 2.0") == 0;
         ImU32 col = is_hs ? accents().warn_amber : accents().dim_text;
         ImGui::PushStyleColor(ImGuiCol_Text, col);
@@ -1280,8 +1404,8 @@ void draw_device_panel(float width, float alpha)
   }
   // Inverse of Install — wipe artifacts + drop hooks. Sits directly
   // under Install so the lifecycle pair is visually obvious. Tinted
-  // red because it's destructive (kills cameraserver + audioserver
-  // briefly; harmless but visible).
+  // red because it removes device-side artifacts. Services are restarted
+  // only when this session actually injected their corresponding hook.
   {
     if (device_menu_button("Delete software", ImVec2(-1, 0), ButtonVariant::Destructive))
     {
@@ -1330,8 +1454,9 @@ void draw_device_panel(float width, float alpha)
   ImGui::Separator();
   ImGui::Spacing();
 
-  // Coexistence rules: camera and sound can run together OR
-  // independently; photo is exclusive (cannot coexist with either).
+  // Camera, still-photo and optional microphone replacement are independent
+  // feature leases on one shared source/session. They may run together; this
+  // is one runtime pipeline, not a choice between separate engines.
   // Each Start/Stop button manages its own mode flag; ObsRtmpSource
   // is brought up by whichever Start runs first and torn down by
   // whichever Stop leaves no mode active.
@@ -1341,8 +1466,7 @@ void draw_device_panel(float width, float alpha)
 
   if (!camera_active)
   {
-    // Camera disabled only when photo is exclusive-active.
-    ImGui::BeginDisabled(!can_deploy || photo_active);
+    ImGui::BeginDisabled(!can_deploy);
     if (device_menu_button("Start replace camera", ImVec2(-1, 0), ButtonVariant::Primary))
     {
       cr::log::section("Start replace camera", "serial=" + d->serial);
@@ -1383,10 +1507,10 @@ void draw_device_panel(float width, float alpha)
   // Coexists with camera. When started solo the host preview decoder
   // is bypassed entirely (ObsRtmpSource::set_video_forward(false))
   // so no OBS frames are decoded for display — handled inside the
-  // obs source. Photo is the only blocker.
+  // obs source.
   if (!sound_active)
   {
-    ImGui::BeginDisabled(!can_deploy || photo_active);
+    ImGui::BeginDisabled(!can_deploy);
     ImGui::TextDisabled("Virtual microphone: OFF (phone microphone is used)");
     if (device_menu_button("Enable virtual microphone", ImVec2(-1, 0), ButtonVariant::Primary))
     {
@@ -1410,7 +1534,24 @@ void draw_device_panel(float width, float alpha)
   }
   else
   {
-    ImGui::TextDisabled("Virtual microphone: ON (OBS audio is used)");
+    const auto audio = cr::source::FeedController::obs_status();
+    const char* health = "STARTING (waiting for OBS AAC)";
+    switch (audio.audio_health)
+    {
+    case cr::source::AudioPump::Health::Ready:
+      health = "READY (OBS audio is used)";
+      break;
+    case cr::source::AudioPump::Health::Stalled:
+      health = "STALLED (check OBS audio/USB)";
+      break;
+    case cr::source::AudioPump::Health::Unsupported:
+      health = "UNSUPPORTED (AAC decoder/format)";
+      break;
+    case cr::source::AudioPump::Health::Off:
+    case cr::source::AudioPump::Health::Waiting:
+      break;
+    }
+    ImGui::TextDisabled("Virtual microphone: %s", health);
     if (device_menu_button("Disable virtual microphone", ImVec2(-1, 0), ButtonVariant::Destructive))
     {
       cr::log::section("Stop replace sound", "serial=" + d->serial);
@@ -1430,7 +1571,7 @@ void draw_device_panel(float width, float alpha)
   // gets a JPEG of a stale/empty frame).
   if (!photo_active)
   {
-    ImGui::BeginDisabled(!can_deploy || camera_active || sound_active);
+    ImGui::BeginDisabled(!can_deploy);
     if (device_menu_button("Start replace photo", ImVec2(-1, 0), ButtonVariant::Primary))
     {
       cr::log::section("Start replace photo", "serial=" + d->serial);
@@ -1593,9 +1734,8 @@ void draw_main_window()
 
   ImGui::BeginChild("body", body, false);
 
-  // Source-only layout: OBS runs on PC and hands us a ready H.264 stream,
-  // so there's nothing for us to pick on the left anymore. The old
-  // source panel is gone; preview/log fill the freed width.
+  // Unified source controls live in the compact panel above preview; the
+  // selected producer always enters the same RTMP/media/device pipeline.
   const float spacing_x = ImGui::GetStyle().ItemSpacing.x;
   const float device_target_w = body.x < 980.0f ? 300.0f : 340.0f;
   ui.motion.device_panel_t = approach(ui.motion.device_panel_t, 1.0f, 4.5f);
@@ -1605,7 +1745,7 @@ void draw_main_window()
 
   ImGui::BeginChild("center", ImVec2(center_w, 0), false);
   {
-    draw_revealed_panel(obs_reveal, [] { draw_obs_info_panel(); }); // small OBS card at the top
+    draw_revealed_panel(obs_reveal, [] { draw_source_info_panel(); });
 
     // Dev build: show the unified log panel under the preview so a
     // maintainer can see the full session.log + phone-side logcat
@@ -1652,6 +1792,7 @@ void draw_main_window()
 
 void shutdown_main_window() noexcept
 {
+  device_sound_player().stop();
 }
 
 bool ui_animation_active() noexcept
@@ -1662,8 +1803,6 @@ bool ui_animation_active() noexcept
   if (needs_motion_frames(ui.motion.device_panel_w, ui.motion.device_panel_w < 320.0f ? 300.0f : 340.0f, 0.75f))
     return true;
   if (needs_motion_frames(ui.motion.log_t, ui.log_expanded ? 1.0f : 0.0f))
-    return true;
-  if (needs_motion_frames(ui.motion.transport_t, ui.motion.transport_open ? 1.0f : 0.0f))
     return true;
   if (needs_motion_frames(ui.motion.entrance_t, 1.0f))
     return true;

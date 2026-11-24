@@ -53,6 +53,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -62,6 +63,7 @@
 #include <vector>
 
 #include "shm.h"
+#include "media/FrameLayout.h"
 #include "util/Obf.h"
 
 #define CR_FEED_LOGI(...) __android_log_print(ANDROID_LOG_INFO, OBF("cr_feed").c_str(), __VA_ARGS__)
@@ -84,6 +86,11 @@ struct ShmOut
   size_t slot_bytes = 0;
   uint32_t cur_wi = 0;
 
+  ~ShmOut() { shutdown(); }
+  ShmOut() = default;
+  ShmOut(const ShmOut&) = delete;
+  ShmOut& operator=(const ShmOut&) = delete;
+
   bool init(int ww, int hh)
   {
     mkdir(OBF("/data/cr").c_str(), 0711);
@@ -101,6 +108,13 @@ struct ShmOut
     fd = open(OBF("/data/cr/feed").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0)
       return false;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      CR_FEED_LOGE(OBF("pipe shm writer lease is already owned: %s").c_str(), strerror(errno));
+      close(fd);
+      fd = -1;
+      return false;
+    }
     struct stat st;
     if (fstat(fd, &st) != 0)
     {
@@ -125,6 +139,7 @@ struct ShmOut
     map = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED)
     {
+      map = nullptr;
       close(fd);
       fd = -1;
       return false;
@@ -135,26 +150,32 @@ struct ShmOut
     h = hh;
 
     auto* hd = (cr_feed_header*) map;
-    const uint32_t prev_gen = atomic_load(&hd->generation);
-    hd->magic = 0u;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    const bool ownership_compatible = cr_feed_ownership_layout_valid(hd);
+    const uint32_t prev_gen =
+        ownership_compatible ? atomic_load(&hd->generation) : 0u;
+    const uint32_t prev_wi =
+        ownership_compatible ? atomic_load(&hd->write_index) : 0u;
+    __atomic_store_n(&hd->magic, 0u, __ATOMIC_RELEASE);
 
-    hd->version = CR_FEED_SHM_VERSION;
-    hd->width = (uint32_t) ww;
-    hd->height = (uint32_t) hh;
-    hd->stride = (uint32_t) ww;
-    hd->slot_size = (uint32_t) slot_bytes;
-    hd->num_slots = CR_FEED_NUM_SLOTS;
-    hd->format = 0;
-    atomic_store(&hd->write_index, 0u);
-    atomic_store(&hd->generation, prev_gen + 1u);
+    if (ownership_compatible)
+      cr_feed_recover_dead_writer(hd);
+    else
+      cr_feed_reset_slot_states(hd);
+
+    __atomic_store_n(&hd->version, CR_FEED_SHM_VERSION, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->width, (uint32_t) ww, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->height, (uint32_t) hh, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->stride, (uint32_t) ww, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->slot_size, (uint32_t) slot_bytes, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->num_slots, CR_FEED_NUM_SLOTS, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->format, 0u, __ATOMIC_RELAXED);
+    atomic_store(&hd->write_index, prev_wi % CR_FEED_NUM_SLOTS);
+    atomic_store(&hd->generation, cr_feed_next_generation(prev_gen));
     atomic_store(&hd->frame_counter, 0ull);
-    for (uint32_t i = 0; i < CR_FEED_NUM_SLOTS; ++i)
-      atomic_store(&hd->slot_state[i], 0u);
-    cur_wi = 0;
+    atomic_store(&hd->channel_state, CR_CHANNEL_STATE_NONE);
+    cur_wi = prev_wi % CR_FEED_NUM_SLOTS;
 
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    hd->magic = CR_FEED_MAGIC;
+    __atomic_store_n(&hd->magic, CR_FEED_MAGIC, __ATOMIC_RELEASE);
     return true;
   }
 
@@ -168,6 +189,8 @@ struct ShmOut
       return;
     memcpy(slot0 + (size_t) next * CR_FEED_MAX_NV21_BYTES, src, slot_bytes);
     cr_feed_publish(hd, next);
+    atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_READY,
+                          memory_order_release);
     cur_wi = next;
   }
 
@@ -175,8 +198,16 @@ struct ShmOut
   {
     if (map)
     {
+      if (mapped >= sizeof(cr_feed_header))
+      {
+        auto* hd = static_cast<cr_feed_header*>(map);
+        atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_NONE,
+                              memory_order_release);
+      }
       munmap(map, mapped);
       map = nullptr;
+      mapped = 0;
+      slot0 = nullptr;
     }
     if (fd >= 0)
     {
@@ -188,13 +219,15 @@ struct ShmOut
 
 // Colour-format converters (NV12 → NV21 / I420 → NV21). Same code that was
 // inline in tcp_h264_feed.cpp.
-inline void nv12_to_nv21(const uint8_t* src, int ww, int hh, int src_y_stride, int src_uv_stride, uint8_t* dst)
+inline void nv12_to_nv21(const uint8_t* src_y, const uint8_t* src_uv,
+                         int ww, int hh, int src_y_stride,
+                         int src_uv_stride, uint8_t* dst)
 {
   for (int y = 0; y < hh; ++y)
   {
-    memcpy(dst + (size_t) y * ww, src + (size_t) y * src_y_stride, (size_t) ww);
+    memcpy(dst + (size_t) y * ww,
+           src_y + (size_t) y * src_y_stride, (size_t) ww);
   }
-  const uint8_t* src_uv = src + (size_t) src_y_stride * hh;
   uint8_t* dst_vu = dst + (size_t) ww * hh;
   const int uv_rows = hh / 2;
   for (int y = 0; y < uv_rows; ++y)
@@ -209,14 +242,16 @@ inline void nv12_to_nv21(const uint8_t* src, int ww, int hh, int src_y_stride, i
   }
 }
 
-inline void i420_to_nv21(const uint8_t* src, int ww, int hh, int src_y_stride, int src_u_stride, int src_v_stride, uint8_t* dst)
+inline void i420_to_nv21(const uint8_t* src_y, const uint8_t* src_u,
+                         const uint8_t* src_v, int ww, int hh,
+                         int src_y_stride, int src_u_stride,
+                         int src_v_stride, uint8_t* dst)
 {
   for (int y = 0; y < hh; ++y)
   {
-    memcpy(dst + (size_t) y * ww, src + (size_t) y * src_y_stride, (size_t) ww);
+    memcpy(dst + (size_t) y * ww,
+           src_y + (size_t) y * src_y_stride, (size_t) ww);
   }
-  const uint8_t* src_u = src + (size_t) src_y_stride * hh;
-  const uint8_t* src_v = src_u + (size_t) src_u_stride * (hh / 2);
   uint8_t* dst_vu = dst + (size_t) ww * hh;
   for (int y = 0; y < hh / 2; ++y)
   {
@@ -238,6 +273,11 @@ inline void i420_to_nv21(const uint8_t* src, int ww, int hh, int src_y_stride, i
 class H264DecodePipe
 {
 public:
+  H264DecodePipe() = default;
+  ~H264DecodePipe() { stop(); }
+  H264DecodePipe(const H264DecodePipe&) = delete;
+  H264DecodePipe& operator=(const H264DecodePipe&) = delete;
+
   bool start(int ww, int hh)
   {
     w = ww;
@@ -341,13 +381,32 @@ public:
       if (in_buf && cap >= len)
       {
         memcpy(in_buf, nal, len);
-        AMediaCodec_queueInputBuffer(dec, (size_t) in_idx, 0, len, (uint64_t) pts_us, 0);
+        const media_status_t queued = AMediaCodec_queueInputBuffer(
+            dec, (size_t) in_idx, 0, len,
+            pts_us < 0 ? 0u : (uint64_t) pts_us, 0);
+        if (queued != AMEDIA_OK)
+        {
+          CR_FEED_LOGW(OBF("h264: queueInput failed status=%d").c_str(),
+                       (int) queued);
+          AMediaCodec_flush(dec);
+          return false;
+        }
         ++in_count;
       }
       else
       {
         CR_FEED_LOGW(OBF("h264: input buf too small: cap=%zu need=%zu").c_str(), cap, len);
+        // A dequeued input slot must always be returned to MediaCodec.
+        AMediaCodec_queueInputBuffer(dec, (size_t) in_idx, 0, 0,
+                                     pts_us < 0 ? 0u : (uint64_t) pts_us, 0);
+        AMediaCodec_flush(dec);
+        return false;
       }
+    }
+    else
+    {
+      drain();
+      return false;
     }
     drain();
     return true;
@@ -387,34 +446,83 @@ public:
         uint8_t* out_buf = AMediaCodec_getOutputBuffer(dec, (size_t) out_idx, &cap);
         const int sy = y_stride ? y_stride : w;
         const int suv = uv_stride ? uv_stride : sy;
-        (void) slice_height;
+        const int slice = slice_height > 0 ? slice_height : h;
 
         constexpr int32_t kFmtYUV420Planar = 19;
         constexpr int32_t kFmtYUV420SemiPlanar = 21;
         constexpr int32_t kFmtYUV420PackedSemiPlanar = 0x7fa30c04;
-        constexpr int32_t kFmtYUV420Flexible = 0x7f420888;
+        cr::media::PlaneSpan window;
+        const bool window_ok = out_buf && cr::media::valid_codec_window(
+                                                cap, info.offset, info.size, window);
+        const uint8_t* base = window_ok ? out_buf + window.offset : nullptr;
+        const size_t available = window_ok ? window.bytes : 0;
+        bool converted = false;
 
-        if (color_format == kFmtYUV420SemiPlanar || color_format == kFmtYUV420PackedSemiPlanar || color_format == kFmtYUV420Flexible)
+        if (!base || sy < w || suv < w || slice < h || sy <= 0 || suv <= 0)
         {
-          nv12_to_nv21(out_buf, w, h, sy, suv, nv21.data());
+          const uint64_t n = ++output_layout_warns;
+          if (n <= 3 || (n % 120) == 0)
+            CR_FEED_LOGW(OBF("h264 pipe output layout rejected color=0x%x off=%d size=%d cap=%zu stride=%d uv=%d slice=%d dims=%dx%d").c_str(),
+                         color_format, (int) info.offset, (int) info.size, cap,
+                         sy, suv, slice, w, h);
+        }
+        else if (color_format == kFmtYUV420SemiPlanar ||
+                 color_format == kFmtYUV420PackedSemiPlanar)
+        {
+          cr::media::Yuv420Layout layout;
+          if (cr::media::semiplanar_420(
+                  available, (uint32_t) w, (uint32_t) h, (uint32_t) sy,
+                  (uint32_t) slice, (uint32_t) suv, layout))
+          {
+            nv12_to_nv21(base, base + layout.u_or_uv.offset, w, h, sy, suv,
+                         nv21.data());
+            converted = true;
+          }
+          else
+          {
+            const uint64_t n = ++output_layout_warns;
+            if (n <= 3 || (n % 120) == 0)
+              CR_FEED_LOGW(OBF("h264 pipe semiplanar layout rejected available=%zu stride=%d uv=%d slice=%d").c_str(),
+                           available, sy, suv, slice);
+          }
         }
         else if (color_format == kFmtYUV420Planar)
         {
-          i420_to_nv21(out_buf, w, h, sy, sy / 2, sy / 2, nv21.data());
+          const int chroma_stride = sy > 1 ? sy / 2 : w / 2;
+          cr::media::Yuv420Layout layout;
+          if (chroma_stride > 0 && cr::media::planar_420(
+                                       available, (uint32_t) w, (uint32_t) h,
+                                       (uint32_t) sy, (uint32_t) slice,
+                                       (uint32_t) chroma_stride, layout))
+          {
+            i420_to_nv21(base, base + layout.u_or_uv.offset,
+                         base + layout.v.offset, w, h, sy, chroma_stride,
+                         chroma_stride, nv21.data());
+            converted = true;
+          }
+          else
+          {
+            const uint64_t n = ++output_layout_warns;
+            if (n <= 3 || (n % 120) == 0)
+              CR_FEED_LOGW(OBF("h264 pipe planar layout rejected available=%zu stride=%d chroma=%d slice=%d").c_str(),
+                           available, sy, chroma_stride, slice);
+          }
         }
         else
         {
-          for (int y = 0; y < h; ++y)
-          {
-            memcpy(nv21.data() + (size_t) y * w, out_buf + (size_t) y * sy, (size_t) w);
-          }
-          memset(nv21.data() + (size_t) w * h, 128, (size_t) w * h / 2);
+          const uint64_t n = ++output_layout_warns;
+          if (n <= 3 || (n % 120) == 0)
+            CR_FEED_LOGW(OBF("h264 pipe unsupported output format color=0x%x off=%d size=%d cap=%zu").c_str(),
+                         color_format, (int) info.offset, (int) info.size, cap);
         }
-        shm.publish_nv21(nv21.data());
-        ++out_count;
-        if (out_count <= 3 || (out_count % 120) == 0)
+        if (converted)
         {
-          CR_FEED_LOGI(OBF("h264: decoded frame #%llu (in=%llu)").c_str(), (unsigned long long) out_count, (unsigned long long) in_count);
+          shm.publish_nv21(nv21.data());
+          ++out_count;
+          if (out_count <= 3 || (out_count % 120) == 0)
+          {
+            CR_FEED_LOGI(OBF("h264: decoded frame #%llu (in=%llu)").c_str(), (unsigned long long) out_count, (unsigned long long) in_count);
+          }
         }
       }
       AMediaCodec_releaseOutputBuffer(dec, (size_t) out_idx, false);
@@ -444,6 +552,7 @@ private:
   std::vector<uint8_t> nv21;
   uint64_t in_count = 0;
   uint64_t out_count = 0;
+  uint64_t output_layout_warns = 0;
 };
 
 } // namespace cr_feed

@@ -41,6 +41,7 @@
 #include "../include/cr_feed.h"
 #include "shm.h"
 #include "secure_channel_reader.h"
+#include "interruptible_socket.h"
 
 #include <android/log.h>
 #include <arpa/inet.h>
@@ -52,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -104,6 +106,11 @@ struct ShmOut
   uint32_t cur_wi = 0;
   bool ready_logged = false;
 
+  ~ShmOut() { shutdown(OBF("scope exit").c_str()); }
+  ShmOut() = default;
+  ShmOut(const ShmOut&) = delete;
+  ShmOut& operator=(const ShmOut&) = delete;
+
   bool init(int ww, int hh)
   {
     mkdir(OBF("/data/cr").c_str(), 0711);
@@ -118,6 +125,13 @@ struct ShmOut
     fd = open(OBF("/data/cr/feed").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0)
       return false;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      LOGE(OBF("nv21 shm writer lease is already owned: %s").c_str(), strerror(errno));
+      close(fd);
+      fd = -1;
+      return false;
+    }
     struct stat st;
     if (fstat(fd, &st) != 0)
     {
@@ -144,6 +158,7 @@ struct ShmOut
     map = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED)
     {
+      map = nullptr;
       close(fd);
       fd = -1;
       return false;
@@ -154,27 +169,32 @@ struct ShmOut
     h = hh;
 
     auto* hd = (cr_feed_header*) map;
-    const uint32_t prev_gen = atomic_load(&hd->generation);
-    hd->magic = 0u;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    const bool ownership_compatible = cr_feed_ownership_layout_valid(hd);
+    const uint32_t prev_gen =
+        ownership_compatible ? atomic_load(&hd->generation) : 0u;
+    const uint32_t prev_wi =
+        ownership_compatible ? atomic_load(&hd->write_index) : 0u;
+    __atomic_store_n(&hd->magic, 0u, __ATOMIC_RELEASE);
 
-    hd->version = CR_FEED_SHM_VERSION;
-    hd->width = (uint32_t) ww;
-    hd->height = (uint32_t) hh;
-    hd->stride = (uint32_t) ww;
-    hd->slot_size = (uint32_t) slot_bytes;
-    hd->num_slots = CR_FEED_NUM_SLOTS;
-    hd->format = 0; // NV21
-    atomic_store(&hd->write_index, 0u);
-    atomic_store(&hd->generation, prev_gen + 1u);
+    if (ownership_compatible)
+      cr_feed_recover_dead_writer(hd);
+    else
+      cr_feed_reset_slot_states(hd);
+
+    __atomic_store_n(&hd->version, CR_FEED_SHM_VERSION, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->width, (uint32_t) ww, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->height, (uint32_t) hh, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->stride, (uint32_t) ww, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->slot_size, (uint32_t) slot_bytes, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->num_slots, CR_FEED_NUM_SLOTS, __ATOMIC_RELAXED);
+    __atomic_store_n(&hd->format, 0u, __ATOMIC_RELAXED); // NV21
+    atomic_store(&hd->write_index, prev_wi % CR_FEED_NUM_SLOTS);
+    atomic_store(&hd->generation, cr_feed_next_generation(prev_gen));
     atomic_store(&hd->frame_counter, 0ull);
     atomic_store(&hd->channel_state, CR_CHANNEL_STATE_NONE);
-    for (uint32_t i = 0; i < CR_FEED_NUM_SLOTS; ++i)
-      atomic_store(&hd->slot_state[i], 0u);
-    cur_wi = 0;
+    cur_wi = prev_wi % CR_FEED_NUM_SLOTS;
 
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    hd->magic = CR_FEED_MAGIC;
+    __atomic_store_n(&hd->magic, CR_FEED_MAGIC, __ATOMIC_RELEASE);
     return true;
   }
 
@@ -194,8 +214,9 @@ struct ShmOut
       cr_feed_abort_write(hd, next);
       return false;
     }
-    atomic_store(&hd->channel_state, CR_CHANNEL_STATE_READY);
     cr_feed_publish(hd, next);
+    atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_READY,
+                          memory_order_release);
     if (!ready_logged)
     {
       LOGI(OBF("nv21 shm READY transition on first publish (%dx%d slot=%zu)").c_str(), w, h, slot_bytes);
@@ -219,6 +240,8 @@ struct ShmOut
       }
       munmap(map, mapped);
       map = nullptr;
+      mapped = 0;
+      slot0 = nullptr;
     }
     if (fd >= 0)
     {
@@ -335,9 +358,11 @@ int cr_feed_run_tcp_nv21(int port)
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
-    int client = accept(srv, nullptr, nullptr);
+    int client = cr::feed::accept_interruptible(srv, g_stop);
     if (client < 0)
     {
+      if (g_stop.load(std::memory_order_relaxed))
+        break;
       if (errno == EINTR)
         continue;
       LOGW(OBF("nv21: accept: %s").c_str(), strerror(errno));

@@ -1,3 +1,5 @@
+#define NOMINMAX
+
 #include "ui/StartupIntro.h"
 
 #include "resources/Resources.h"

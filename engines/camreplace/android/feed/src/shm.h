@@ -25,6 +25,7 @@
 // debugger) map the same struct without any C++ runtime.
 
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C"
@@ -57,6 +58,8 @@ extern "C"
   } cr_feed_header;
 
   _Static_assert(sizeof(cr_feed_header) == 64, "header must stay 64 bytes");
+  _Static_assert(offsetof(cr_feed_header, channel_state) == 48,
+                 "host pass-through command depends on channel_state offset");
 
 #ifndef CR_CHANNEL_STATE_NONE
 #define CR_CHANNEL_STATE_NONE 0u
@@ -90,17 +93,64 @@ static inline int cr_feed_slot_try_read(cr_feed_header* h, uint32_t slot)
   return 0;
 }
 
-static inline void cr_feed_slot_release_read(cr_feed_header* h, uint32_t slot)
+static inline int cr_feed_slot_release_read(cr_feed_header* h, uint32_t slot)
 {
-  if (h && slot < CR_FEED_NUM_SLOTS)
-    atomic_fetch_sub_explicit(&h->slot_state[slot], 1u, memory_order_release);
+  if (!h || slot >= CR_FEED_NUM_SLOTS)
+    return 0;
+  unsigned value = atomic_load_explicit(&h->slot_state[slot], memory_order_acquire);
+  while (value > 0u && value < CR_FEED_SLOT_WRITER)
+  {
+    if (atomic_compare_exchange_weak_explicit(&h->slot_state[slot], &value,
+                                              value - 1u, memory_order_release,
+                                              memory_order_relaxed))
+      return 1;
+  }
+  return 0;
+}
+
+// A replacement producer may inherit a shared file after its predecessor
+// died while owning a writer token. It may reclaim only that exact token;
+// low values are live reader pins in cameraserver and must survive reconnect.
+static inline void cr_feed_recover_dead_writer(cr_feed_header* h)
+{
+  if (!h)
+    return;
+  for (uint32_t slot = 0; slot < CR_FEED_NUM_SLOTS; ++slot)
+  {
+    unsigned expected = CR_FEED_SLOT_WRITER;
+    (void) atomic_compare_exchange_strong_explicit(
+        &h->slot_state[slot], &expected, 0u, memory_order_acq_rel,
+        memory_order_relaxed);
+  }
+}
+
+// Ownership counters remain meaningful even after the previous producer
+// revoked `magic` during pass-through. A new producer must therefore not
+// clear reader pins merely because the channel is currently inactive: an
+// already-running camera callback may still be finishing a copy/JPEG encode.
+// Only an unknown ABI layout is safe to initialize from zero.
+static inline int cr_feed_ownership_layout_valid(const cr_feed_header* h)
+{
+  return h &&
+         __atomic_load_n(&h->version, __ATOMIC_ACQUIRE) ==
+             CR_FEED_SHM_VERSION &&
+         __atomic_load_n(&h->num_slots, __ATOMIC_ACQUIRE) ==
+             CR_FEED_NUM_SLOTS;
+}
+
+static inline void cr_feed_reset_slot_states(cr_feed_header* h)
+{
+  if (!h)
+    return;
+  for (uint32_t slot = 0; slot < CR_FEED_NUM_SLOTS; ++slot)
+    atomic_store_explicit(&h->slot_state[slot], 0u, memory_order_release);
 }
 
 static inline int cr_feed_claim_write(cr_feed_header* h, uint32_t current, uint32_t* claimed)
 {
   if (!h || !claimed)
     return 0;
-  unsigned n = h->num_slots;
+  unsigned n = __atomic_load_n(&h->num_slots, __ATOMIC_ACQUIRE);
   if (n == 0 || n > CR_FEED_NUM_SLOTS)
     return 0;
   current %= n;
@@ -127,11 +177,26 @@ static inline void cr_feed_abort_write(cr_feed_header* h, uint32_t slot)
     atomic_store_explicit(&h->slot_state[slot], 0u, memory_order_release);
 }
 
-static inline void cr_feed_publish(cr_feed_header* h, uint32_t slot)
+static inline uint32_t cr_feed_next_generation(uint32_t previous)
 {
-  atomic_store_explicit(&h->slot_state[slot], 0u, memory_order_release);
+  const uint32_t next = previous + 1u;
+  return next == 0u ? 1u : next;
+}
+
+static inline uint64_t cr_feed_publish(cr_feed_header* h, uint32_t slot)
+{
+  // Keep the writer token until every publication field is final. Index must
+  // precede sequence: a reader that acquires the new sequence then also sees
+  // its index. A reader that saw the old sequence plus the new index either
+  // fails to pin the writer-owned slot or acquires its final release and then
+  // rejects the changed sequence during the post-pin recheck.
+  uint64_t sequence = atomic_load_explicit(&h->frame_counter, memory_order_relaxed) + 1ull;
+  if (sequence == 0ull)
+    sequence = 1ull;
   atomic_store_explicit(&h->write_index, slot, memory_order_release);
-  atomic_fetch_add_explicit(&h->frame_counter, 1ull, memory_order_release);
+  atomic_store_explicit(&h->frame_counter, sequence, memory_order_release);
+  atomic_store_explicit(&h->slot_state[slot], 0u, memory_order_release);
+  return sequence;
 }
 
 #define CR_FEED_MAX_WIDTH 1920u

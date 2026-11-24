@@ -7,6 +7,7 @@ extern "C"
 }
 
 #include <cstring>
+#include <new>
 
 #if defined(_MSC_VER)
 #define CR_NOINLINE __declspec(noinline)
@@ -30,10 +31,6 @@ constexpr char kFinishedDomain[] = "CRSCv2 finished";
 constexpr std::uint64_t kTicketClockSkewMs = 5ull * 60ull * 1000ull;
 constexpr std::uint64_t kMaxLocalTicketLifetimeMs = 60ull * 60ull * 1000ull;
 
-Bytes literal(const char* value, std::size_t size) noexcept
-{
-  return {reinterpret_cast<const std::uint8_t*>(value), size};
-}
 bool equal(const std::uint8_t* a, const std::uint8_t* b, std::size_t size) noexcept
 {
   std::uint8_t diff = 0;
@@ -41,24 +38,27 @@ bool equal(const std::uint8_t* a, const std::uint8_t* b, std::size_t size) noexc
     diff |= a[i] ^ b[i];
   return diff == 0;
 }
-void append(std::vector<std::uint8_t>& out, Bytes in)
-{
-  if (in.size)
-    out.insert(out.end(), in.data, in.data + in.size);
-}
 void sequence_le(std::uint64_t sequence, std::array<std::uint8_t, 8>& out) noexcept
 {
   for (std::size_t i = 0; i < out.size(); ++i)
     out[i] = static_cast<std::uint8_t>(sequence >> (8 * i));
 }
-void derive(std::uint8_t* output, std::size_t output_size, const char* domain, std::size_t domain_size, const std::array<std::uint8_t, 64>& master, const std::array<std::uint8_t, kTicketUnsignedBytes>& ticket) noexcept
+bool derive(std::uint8_t* output, std::size_t output_size, const char* domain, std::size_t domain_size, const std::array<std::uint8_t, 64>& master, const std::array<std::uint8_t, kTicketUnsignedBytes>& ticket) noexcept
 {
-  std::vector<std::uint8_t> message;
-  message.reserve(domain_size + ticket.size());
-  append(message, literal(domain, domain_size));
-  append(message, bytes_of(ticket));
-  crypto_blake2b_keyed(output, output_size, master.data(), master.size(), message.data(), message.size());
+  // Every derivation input is small and fixed-size. Keeping it on the stack
+  // preserves the Status/noexcept contract even under memory pressure.
+  std::array<std::uint8_t, 192> message{};
+  if (domain_size + ticket.size() > message.size())
+  {
+    crypto_wipe(output, output_size);
+    return false;
+  }
+  std::memcpy(message.data(), domain, domain_size);
+  std::memcpy(message.data() + domain_size, ticket.data(), ticket.size());
+  crypto_blake2b_keyed(output, output_size, master.data(), master.size(),
+                       message.data(), domain_size + ticket.size());
   crypto_wipe(message.data(), message.size());
+  return true;
 }
 
 CR_NOINLINE Status validate_local_ticket(const TicketView& view, StreamKind expected_stream, std::uint64_t now_ms) noexcept
@@ -168,20 +168,28 @@ Status SecureSession::initialize(Role role, Bytes local_private, Bytes ticket_by
 
 Status SecureSession::derive_material(Bytes ticket_unsigned, Bytes shared) noexcept
 {
-  if (ticket_unsigned.size != ticket_unsigned_.size())
+  if (!ticket_unsigned.valid() || !shared.valid() ||
+      ticket_unsigned.size != ticket_unsigned_.size() || shared.size != kKeyBytes)
     return Status::failure(Error::InvalidField);
   std::memcpy(ticket_unsigned_.data(), ticket_unsigned.data, ticket_unsigned.size);
-  std::vector<std::uint8_t> input;
-  input.reserve(sizeof(kMasterDomain) + ticket_unsigned.size + shared.size);
-  append(input, literal(kMasterDomain, sizeof(kMasterDomain)));
-  append(input, ticket_unsigned);
-  append(input, shared);
-  crypto_blake2b(master_.data(), master_.size(), input.data(), input.size());
+  std::array<std::uint8_t, sizeof(kMasterDomain) + kTicketUnsignedBytes + kKeyBytes> input{};
+  std::size_t pos = 0;
+  std::memcpy(input.data() + pos, kMasterDomain, sizeof(kMasterDomain));
+  pos += sizeof(kMasterDomain);
+  std::memcpy(input.data() + pos, ticket_unsigned.data, ticket_unsigned.size);
+  pos += ticket_unsigned.size;
+  std::memcpy(input.data() + pos, shared.data, shared.size);
+  pos += shared.size;
+  crypto_blake2b(master_.data(), master_.size(), input.data(), pos);
   crypto_wipe(input.data(), input.size());
-  derive(send_key_.data(), send_key_.size(), role_ == Role::Host ? kHostKeyDomain : kPhoneKeyDomain, role_ == Role::Host ? sizeof(kHostKeyDomain) : sizeof(kPhoneKeyDomain), master_, ticket_unsigned_);
-  derive(receive_key_.data(), receive_key_.size(), role_ == Role::Host ? kPhoneKeyDomain : kHostKeyDomain, role_ == Role::Host ? sizeof(kPhoneKeyDomain) : sizeof(kHostKeyDomain), master_, ticket_unsigned_);
-  derive(send_nonce_base_.data(), send_nonce_base_.size(), role_ == Role::Host ? kHostNonceDomain : kPhoneNonceDomain, role_ == Role::Host ? sizeof(kHostNonceDomain) : sizeof(kPhoneNonceDomain), master_, ticket_unsigned_);
-  derive(receive_nonce_base_.data(), receive_nonce_base_.size(), role_ == Role::Host ? kPhoneNonceDomain : kHostNonceDomain, role_ == Role::Host ? sizeof(kPhoneNonceDomain) : sizeof(kHostNonceDomain), master_, ticket_unsigned_);
+  if (!derive(send_key_.data(), send_key_.size(), role_ == Role::Host ? kHostKeyDomain : kPhoneKeyDomain, role_ == Role::Host ? sizeof(kHostKeyDomain) : sizeof(kPhoneKeyDomain), master_, ticket_unsigned_) ||
+      !derive(receive_key_.data(), receive_key_.size(), role_ == Role::Host ? kPhoneKeyDomain : kHostKeyDomain, role_ == Role::Host ? sizeof(kPhoneKeyDomain) : sizeof(kHostKeyDomain), master_, ticket_unsigned_) ||
+      !derive(send_nonce_base_.data(), send_nonce_base_.size(), role_ == Role::Host ? kHostNonceDomain : kPhoneNonceDomain, role_ == Role::Host ? sizeof(kHostNonceDomain) : sizeof(kPhoneNonceDomain), master_, ticket_unsigned_) ||
+      !derive(receive_nonce_base_.data(), receive_nonce_base_.size(), role_ == Role::Host ? kPhoneNonceDomain : kHostNonceDomain, role_ == Role::Host ? sizeof(kPhoneNonceDomain) : sizeof(kHostNonceDomain), master_, ticket_unsigned_))
+  {
+    wipe();
+    return Status::failure(Error::CryptoFailure);
+  }
   return {};
 }
 
@@ -196,6 +204,8 @@ Status SecureSession::nonce_for(const std::array<std::uint8_t, kNonceBytes>& bas
 
 Status SecureSession::seal(RecordType type, Bytes plaintext, std::vector<std::uint8_t>& record) noexcept
 {
+  try
+  {
   if (!initialized_ || !plaintext.valid() || plaintext.size > kMaxCiphertextBytes || (type == RecordType::Application && !established()))
     return Status::failure(Error::InvalidState);
   if (send_sequence_ == UINT64_MAX)
@@ -212,10 +222,18 @@ Status SecureSession::seal(RecordType type, Bytes plaintext, std::vector<std::ui
   crypto_aead_lock(record.data() + aad.size(), record.data() + aad.size() + plaintext.size, send_key_.data(), nonce.data(), aad.data(), aad.size(), plaintext.data, plaintext.size);
   crypto_wipe(nonce.data(), nonce.size());
   return {};
+  }
+  catch (const std::bad_alloc&)
+  {
+    record.clear();
+    return Status::failure(Error::ResourceExhausted);
+  }
 }
 
 Status SecureSession::open(Bytes encoded, std::vector<std::uint8_t>& plaintext, RecordType& type) noexcept
 {
+  try
+  {
   if (!initialized_)
     return Status::failure(Error::InvalidState);
   RecordView record;
@@ -286,16 +304,23 @@ Status SecureSession::open(Bytes encoded, std::vector<std::uint8_t>& plaintext, 
     received_finished_ = true;
   }
   return {};
+  }
+  catch (const std::bad_alloc&)
+  {
+    if (!plaintext.empty())
+      crypto_wipe(plaintext.data(), plaintext.size());
+    plaintext.clear();
+    return Status::failure(Error::ResourceExhausted);
+  }
 }
 
 Status SecureSession::finished(std::array<std::uint8_t, 32>& output) const noexcept
 {
   if (!initialized_)
     return Status::failure(Error::InvalidState);
-  std::vector<std::uint8_t> message;
-  message.reserve(sizeof(kFinishedDomain) + ticket_unsigned_.size());
-  append(message, literal(kFinishedDomain, sizeof(kFinishedDomain)));
-  append(message, bytes_of(ticket_unsigned_));
+  std::array<std::uint8_t, sizeof(kFinishedDomain) + kTicketUnsignedBytes> message{};
+  std::memcpy(message.data(), kFinishedDomain, sizeof(kFinishedDomain));
+  std::memcpy(message.data() + sizeof(kFinishedDomain), ticket_unsigned_.data(), ticket_unsigned_.size());
   crypto_blake2b_keyed(output.data(), output.size(), master_.data(), master_.size(), message.data(), message.size());
   crypto_wipe(message.data(), message.size());
   return {};

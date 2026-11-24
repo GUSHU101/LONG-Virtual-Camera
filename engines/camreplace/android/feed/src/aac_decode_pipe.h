@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -58,6 +59,13 @@ public:
       CR_AUDIO_LOGE(OBF("aac: open %s: %s").c_str(), OBF("/data/cr/audio").c_str(), strerror(errno));
       return false;
     }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      CR_AUDIO_LOGE(OBF("aac: another audio producer owns %s: %s").c_str(),
+                    OBF("/data/cr/audio").c_str(), strerror(errno));
+      ::close(fd);
+      return false;
+    }
     struct stat st;
     if (fstat(fd, &st) != 0)
     {
@@ -85,6 +93,11 @@ public:
     audio_map_ = m;
     audio_size_ = want;
     audio_fd_ = fd;
+    // A crashed predecessor may have left READY and the magic published.
+    // Revoke it while this new writer prepares its first complete header.
+    atomic_store_explicit(&audio_hdr_->channel_state, CR_CHANNEL_STATE_NONE,
+                          memory_order_release);
+    __atomic_store_n(&audio_hdr_->magic, 0u, __ATOMIC_RELEASE);
     return true;
   }
 
@@ -93,7 +106,7 @@ public:
   // restart with a different format works without leaks.
   bool on_csd(const uint8_t* csd, size_t len)
   {
-    if (!csd || len < 2)
+    if (!csd || len < 2 || len > 64)
       return false;
 
     // Parse AudioSpecificConfig: object_type (5b), sr_idx (4b),
@@ -145,9 +158,13 @@ public:
 
     sample_rate_ = (uint32_t) sample_rate;
     channels_ = (uint16_t) channels;
+    pcm_encoding_ = 2; // Android AudioFormat.ENCODING_PCM_16BIT
 
     if (!open_shm())
+    {
+      teardown_decoder();
       return false;
+    }
     publish_audio_header();
     CR_AUDIO_LOGI(OBF("aac: pipe started sr=%u ch=%u").c_str(), sample_rate_, (unsigned) channels_);
     ready_ = true;
@@ -168,7 +185,24 @@ public:
       if (in_buf && cap >= len)
       {
         std::memcpy(in_buf, aac, len);
-        AMediaCodec_queueInputBuffer(dec_, (size_t) in_idx, 0, len, (uint64_t) pts_us, 0);
+        const media_status_t queued = AMediaCodec_queueInputBuffer(
+            dec_, (size_t) in_idx, 0, len,
+            pts_us < 0 ? 0u : (uint64_t) pts_us, 0);
+        if (queued != AMEDIA_OK)
+        {
+          CR_AUDIO_LOGW(OBF("aac: queueInput failed status=%d").c_str(),
+                        (int) queued);
+          ready_ = false;
+        }
+      }
+      else
+      {
+        // A dequeued codec buffer must always be returned. Leaving it owned by
+        // us permanently drains the input pool after a few oversized packets.
+        CR_AUDIO_LOGW(OBF("aac: input packet too large len=%zu cap=%zu").c_str(),
+                      len, cap);
+        AMediaCodec_queueInputBuffer(dec_, (size_t) in_idx, 0, 0,
+                                     pts_us < 0 ? 0u : (uint64_t) pts_us, 0);
       }
     }
     drain();
@@ -190,13 +224,19 @@ public:
         // from the codec's actual output and republish header.
         AMediaFormat* of = AMediaCodec_getOutputFormat(dec_);
         int32_t sr = sample_rate_, ch = channels_;
+        int32_t pcm_encoding = 2;
         AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_SAMPLE_RATE, &sr);
         AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &ch);
+        AMediaFormat_getInt32(of, OBF("pcm-encoding").c_str(), &pcm_encoding);
         AMediaFormat_delete(of);
-        if (sr > 0)
+        if (sr >= 8000 && sr <= 192000)
           sample_rate_ = (uint32_t) sr;
         if (ch == 1 || ch == 2)
           channels_ = (uint16_t) ch;
+        pcm_encoding_ = pcm_encoding;
+        if (pcm_encoding_ != 2)
+          CR_AUDIO_LOGW(OBF("aac: unsupported decoder PCM encoding=%d; dropping output").c_str(),
+                        pcm_encoding_);
         publish_audio_header();
         continue;
       }
@@ -209,7 +249,18 @@ public:
       {
         size_t cap = 0;
         uint8_t* out_buf = AMediaCodec_getOutputBuffer(dec_, (size_t) out_idx, &cap);
-        write_to_ring(out_buf, (size_t) info.size);
+        if (out_buf && info.offset >= 0 && info.size >= 0 &&
+            static_cast<size_t>(info.offset) <= cap &&
+            static_cast<size_t>(info.size) <= cap - static_cast<size_t>(info.offset))
+        {
+          write_to_ring(out_buf + info.offset, static_cast<size_t>(info.size));
+        }
+        else
+        {
+          CR_AUDIO_LOGW(OBF("aac: invalid output window off=%d size=%d cap=%zu").c_str(),
+                        static_cast<int>(info.offset),
+                        static_cast<int>(info.size), cap);
+        }
       }
       AMediaCodec_releaseOutputBuffer(dec_, (size_t) out_idx, false);
     }
@@ -220,9 +271,11 @@ public:
     teardown_decoder();
     if (audio_hdr_)
     {
-      // Zero magic so the audhook falls through to real mic.
-      audio_hdr_->magic = 0;
-      __atomic_thread_fence(__ATOMIC_RELEASE);
+      // Revoke replacement before invalidating metadata so the hook returns
+      // immediately to the phone microphone.
+      atomic_store_explicit(&audio_hdr_->channel_state,
+                            CR_CHANNEL_STATE_NONE, memory_order_release);
+      __atomic_store_n(&audio_hdr_->magic, 0u, __ATOMIC_RELEASE);
       munmap(audio_map_, audio_size_);
       audio_hdr_ = nullptr;
       audio_map_ = nullptr;
@@ -260,40 +313,63 @@ private:
     // Same magic-zero / write / fence / magic-restore dance the
     // legacy tcp_pcm path uses, so a partial header rewrite never
     // tricks the audhook into reading half-old fields.
-    h->magic = 0;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    h->version = CR_AUDIO_VERSION;
-    h->sample_rate = sample_rate_;
-    h->channels = channels_;
-    h->bytes_per_sample = 2;
-    h->ring_bytes = CR_AUDIO_RING_BYTES;
+    __atomic_store_n(&h->magic, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&h->version, CR_AUDIO_VERSION, __ATOMIC_RELAXED);
+    __atomic_store_n(&h->sample_rate, sample_rate_, __ATOMIC_RELAXED);
+    __atomic_store_n(&h->channels, static_cast<uint32_t>(channels_),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&h->bytes_per_sample, 2u, __ATOMIC_RELAXED);
+    __atomic_store_n(&h->ring_bytes, CR_AUDIO_RING_BYTES, __ATOMIC_RELAXED);
+    __atomic_store_n(&h->reserved[0], 0u, __ATOMIC_RELAXED);
     atomic_store(&h->write_pos, 0ull);
-    atomic_fetch_add(&h->generation, 1u);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    h->magic = CR_AUDIO_MAGIC;
+    atomic_store_explicit(&h->generation, cr_audio_next_generation(h),
+                          memory_order_relaxed);
+    atomic_store(&h->channel_state, CR_CHANNEL_STATE_NONE);
+    __atomic_store_n(&h->magic, CR_AUDIO_MAGIC, __ATOMIC_RELEASE);
   }
 
   void write_to_ring(const uint8_t* pcm, size_t bytes)
   {
-    if (!audio_hdr_ || !audio_ring_ || !pcm || !bytes)
+    if (!audio_hdr_ || !audio_ring_ || !pcm || !bytes || pcm_encoding_ != 2)
       return;
-    const uint32_t ring = audio_hdr_->ring_bytes;
+    const size_t frame_bytes = static_cast<size_t>(channels_) * 2u;
+    if (frame_bytes == 0)
+      return;
+    bytes -= bytes % frame_bytes;
+    if (bytes == 0)
+      return;
+    const uint32_t ring =
+        __atomic_load_n(&audio_hdr_->ring_bytes, __ATOMIC_ACQUIRE);
+    if (ring == 0)
+      return;
     const uint64_t wp = atomic_load(&audio_hdr_->write_pos);
-    const uint32_t off = (uint32_t) (wp % ring);
-    const size_t span1 = (off + bytes <= ring) ? bytes : (ring - off);
-    std::memcpy(audio_ring_ + off, pcm, span1);
-    if (span1 < bytes)
+    // Keep only the newest ring-sized suffix if a codec ever returns a
+    // malformed/oversized buffer. The monotonic cursor still accounts for
+    // every input byte, so consumers detect the overrun and resynchronise.
+    const size_t kept = bytes > ring ? ring : bytes;
+    const size_t dropped = bytes - kept;
+    const uint8_t* kept_pcm = pcm + dropped;
+    const uint64_t write_start = wp + dropped;
+    const uint32_t off = static_cast<uint32_t>(write_start % ring);
+    const size_t span1 = (off + kept <= ring) ? kept : (ring - off);
+    const uint32_t write_token = cr_audio_begin_write(audio_hdr_);
+    std::memcpy(audio_ring_ + off, kept_pcm, span1);
+    if (span1 < kept)
     {
-      std::memcpy(audio_ring_, pcm + span1, bytes - span1);
+      std::memcpy(audio_ring_, kept_pcm + span1, kept - span1);
     }
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    atomic_store(&audio_hdr_->write_pos, wp + bytes);
+    atomic_store_explicit(&audio_hdr_->write_pos, wp + bytes,
+                          memory_order_release);
+    atomic_store_explicit(&audio_hdr_->channel_state,
+                          CR_CHANNEL_STATE_READY, memory_order_release);
+    cr_audio_end_write(audio_hdr_, write_token);
   }
 
   AMediaCodec* dec_ = nullptr;
   bool ready_ = false;
   uint32_t sample_rate_ = 0;
   uint16_t channels_ = 0;
+  int32_t pcm_encoding_ = 2;
 
   // Owned audio shm.
   int audio_fd_ = -1;

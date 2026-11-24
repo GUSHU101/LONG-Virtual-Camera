@@ -33,18 +33,10 @@ class H264PreviewDecoder
 public:
   using PublishFn = std::function<void(const uint8_t* bgra, int w, int h, int pitch)>;
 
-  // Pre-conversion NV12 tap. Same decoded output as the BGRA path —
-  // gets called from the same drain() loop right before NV12→BGRA.
-  // Used by Transport::Raw to ship NV21 (NV12 with swapped chroma)
-  // straight to the phone without paying for a second decode there.
-  // Pitch (stride) may exceed `w` on some MFTs.
-  using Nv12PublishFn = std::function<void(const uint8_t* nv12, int w, int h, int stride)>;
-
   // Stash the publish callback and start the decoder worker thread. The
   // MFT itself is created lazily on the worker (some MFTs are picky
-  // about cross-thread activation). `nv12_publish` is optional — pass
-  // nullptr (or use the single-arg overload) if no raw tap is needed.
-  void arm(PublishFn publish, Nv12PublishFn nv12_publish = {});
+  // about cross-thread activation).
+  void arm(PublishFn publish);
 
   // Stop the worker, tear down the MFT, release MF. Idempotent.
   void stop();
@@ -74,7 +66,6 @@ private:
   void teardown_();
 
   PublishFn publish_;
-  Nv12PublishFn nv12_publish_;
   IMFTransform* dec_ = nullptr;
   bool mf_init_ = false;
   bool start_failed_ = false;

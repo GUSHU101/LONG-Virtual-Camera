@@ -1,7 +1,7 @@
 // Embeds the side-by-side application manifest into the .exe so Windows
 // reads it on launch:
-//   - requireAdministrator → UAC prompt before main() runs; refusal
-//     cancels CreateProcess so the program never starts unprivileged.
+//   - asInvoker keeps host media/ADB work at the caller's privilege level;
+//     phone-side root remains an explicit `adb shell su` operation.
 //   - Per-monitor DPI awareness for the borderless ImGui chrome.
 //
 // Resource ID 1, type RT_MANIFEST (24) — the canonical slot the loader

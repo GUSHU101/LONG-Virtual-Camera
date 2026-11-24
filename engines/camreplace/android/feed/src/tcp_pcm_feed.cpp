@@ -31,6 +31,7 @@
 #include "audio_shm.h"
 #include "../include/cr_feed.h"
 #include "secure_channel_reader.h"
+#include "interruptible_socket.h"
 
 #include <android/log.h>
 #include <arpa/inet.h>
@@ -42,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -78,6 +80,14 @@ struct AudioShm
   uint8_t* ring = nullptr;
   size_t map_size = 0;
 
+  ~AudioShm()
+  {
+    close_();
+  }
+  AudioShm() = default;
+  AudioShm(const AudioShm&) = delete;
+  AudioShm& operator=(const AudioShm&) = delete;
+
   bool open()
   {
     if (ensure_shm_dir() != 0)
@@ -89,10 +99,19 @@ struct AudioShm
       LOGE(OBF("open %s: %s").c_str(), OBF("/data/cr/audio").c_str(), strerror(errno));
       return false;
     }
+    // The direct-RTMP AAC decoder and the TCP PCM listener share this ABI.
+    // Only one of them may publish at a time or metadata/write_pos can tear.
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      LOGE(OBF("audio producer already active: %s").c_str(), strerror(errno));
+      close_();
+      return false;
+    }
     struct stat st;
     if (fstat(fd, &st) != 0)
     {
       LOGE(OBF("fstat: %s").c_str(), strerror(errno));
+      close_();
       return false;
     }
     if ((size_t) st.st_size < want)
@@ -100,6 +119,7 @@ struct AudioShm
       if (ftruncate(fd, (off_t) want) != 0)
       {
         LOGE(OBF("ftruncate: %s").c_str(), strerror(errno));
+        close_();
         return false;
       }
     }
@@ -107,16 +127,30 @@ struct AudioShm
     if (m == MAP_FAILED)
     {
       LOGE(OBF("mmap: %s").c_str(), strerror(errno));
+      close_();
       return false;
     }
     hdr = (cr_audio_header*) m;
     ring = (uint8_t*) m + sizeof(cr_audio_header);
     map_size = want;
+    // A previous producer may have died before publishing NONE. Revoke that
+    // stale lease before this listener accepts a new authenticated publisher.
+    revoke_();
     return true;
+  }
+
+  void revoke_()
+  {
+    if (!hdr)
+      return;
+    atomic_store_explicit(&hdr->channel_state, CR_CHANNEL_STATE_NONE,
+                          memory_order_release);
+    __atomic_store_n(&hdr->magic, 0u, __ATOMIC_RELEASE);
   }
 
   void close_()
   {
+    revoke_();
     if (hdr)
     {
       munmap((void*) hdr, map_size);
@@ -138,20 +172,21 @@ void publish_header(AudioShm& shm, uint32_t sr, uint16_t ch, uint16_t bps)
   // Clear magic during the metadata rewrite — same trick as the camera
   // shm — so any reader mid-flight sees "no signal" rather than a torn
   // header.
-  h->magic = 0;
-  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_store_n(&h->magic, 0u, __ATOMIC_RELEASE);
 
-  h->version = CR_AUDIO_VERSION;
-  h->sample_rate = sr;
-  h->channels = ch;
-  h->bytes_per_sample = bps;
-  h->ring_bytes = CR_AUDIO_RING_BYTES;
+  __atomic_store_n(&h->version, CR_AUDIO_VERSION, __ATOMIC_RELAXED);
+  __atomic_store_n(&h->sample_rate, sr, __ATOMIC_RELAXED);
+  __atomic_store_n(&h->channels, static_cast<uint32_t>(ch), __ATOMIC_RELAXED);
+  __atomic_store_n(&h->bytes_per_sample, static_cast<uint32_t>(bps),
+                   __ATOMIC_RELAXED);
+  __atomic_store_n(&h->ring_bytes, CR_AUDIO_RING_BYTES, __ATOMIC_RELAXED);
+  __atomic_store_n(&h->reserved[0], 0u, __ATOMIC_RELAXED);
   atomic_store(&h->write_pos, 0ull);
-  atomic_fetch_add(&h->generation, 1u);
+  atomic_store_explicit(&h->generation, cr_audio_next_generation(h),
+                        memory_order_relaxed);
   atomic_store(&h->channel_state, CR_CHANNEL_STATE_NONE);
 
-  __atomic_thread_fence(__ATOMIC_RELEASE);
-  h->magic = CR_AUDIO_MAGIC;
+  __atomic_store_n(&h->magic, CR_AUDIO_MAGIC, __ATOMIC_RELEASE);
   LOGI(OBF("audio shm armed: sr=%u ch=%u bps=%u ring=%u").c_str(), sr, (unsigned) ch, (unsigned) bps, (unsigned) CR_AUDIO_RING_BYTES);
 }
 
@@ -160,7 +195,8 @@ void publish_header(AudioShm& shm, uint32_t sr, uint16_t ch, uint16_t bps)
 int run_stream(cr::feed::SecureChannelReader& channel, AudioShm& shm)
 {
   auto* h = shm.hdr;
-  const uint32_t ring = h->ring_bytes;
+  const uint32_t ring =
+      __atomic_load_n(&h->ring_bytes, __ATOMIC_ACQUIRE);
   uint8_t buf[8192];
 
   uint64_t total = 0;
@@ -175,12 +211,16 @@ int run_stream(cr::feed::SecureChannelReader& channel, AudioShm& shm)
     const uint32_t off = (uint32_t) (wp % ring);
     const size_t n = sizeof(buf);
     const size_t span1 = (off + n <= ring) ? n : (ring - off);
+    const uint32_t write_token = cr_audio_begin_write(h);
     memcpy(shm.ring + off, buf, span1);
     if (span1 < n)
       memcpy(shm.ring, buf + span1, n - span1);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    atomic_store(&h->channel_state, CR_CHANNEL_STATE_READY);
-    atomic_store(&h->write_pos, wp + n);
+    // Publish bytes before READY. A hook that observes READY must not see an
+    // old cursor and mistake an empty ring for active virtual audio.
+    atomic_store_explicit(&h->write_pos, wp + n, memory_order_release);
+    atomic_store_explicit(&h->channel_state, CR_CHANNEL_STATE_READY,
+                          memory_order_release);
+    cr_audio_end_write(h, write_token);
     total += n;
   }
   return 0;
@@ -230,9 +270,11 @@ int cr_feed_run_tcp_pcm(int port)
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
-    int cli = accept(srv, nullptr, nullptr);
+    int cli = cr::feed::accept_interruptible(srv, g_stop);
     if (cli < 0)
     {
+      if (g_stop.load(std::memory_order_relaxed))
+        break;
       if (errno == EINTR)
         continue;
       LOGW(OBF("accept: %s").c_str(), strerror(errno));
@@ -279,9 +321,11 @@ int cr_feed_run_tcp_pcm(int port)
     run_stream(channel, shm);
     close(cli);
 
-    // Invalidate magic between sessions so the hook falls through to
-    // real mic until the next publisher arrives.
-    shm.hdr->magic = 0;
+    // Revoke the lease before invalidating metadata. Publisher loss and the
+    // explicit OFF path both restore phone-microphone pass-through.
+    atomic_store_explicit(&shm.hdr->channel_state, CR_CHANNEL_STATE_NONE,
+                          memory_order_release);
+    __atomic_store_n(&shm.hdr->magic, 0u, __ATOMIC_RELEASE);
     LOGI(OBF("tcp_pcm: publisher session ended; waiting for next").c_str());
   }
 

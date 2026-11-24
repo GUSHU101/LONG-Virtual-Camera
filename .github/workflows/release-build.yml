@@ -1,5 +1,4 @@
 name: Release build
-run-name: Release build ${{ inputs.version }}
 
 on:
   workflow_dispatch:
@@ -7,131 +6,200 @@ on:
       version:
         description: Release version (vMAJOR.MINOR.PATCH)
         required: true
-        default: v0.2.0
+        default: v0.3.0
         type: string
+      publish:
+        description: Create or update the GitHub release
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*.*.*'
 
 permissions:
   contents: read
 
 env:
-  RELEASE_VERSION: ${{ inputs.version }}
-  NDK_VERSION: 27.3.13750724
+  CAMREPLACE_NDK_VERSION: 27.3.13750724
+  LLVM_MINGW_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20261117/llvm-mingw-20261117-msvcrt-x86_64.zip
+  LLVM_MINGW_SHA256: 17db10bd2c0bcbf55e5e4382475190165d0fc90dfe52ca165a51f1dfb1ca19c8
 
 jobs:
-  android:
+  validate:
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.13'
-      - name: Build both Android architectures
-        shell: bash
+      - id: version
+        name: Validate release version
+        env:
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
           set -euo pipefail
-          if [ ! -x "$ANDROID_HOME/ndk/$NDK_VERSION/ndk-build" ]; then
-            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION"
+          if [[ ! "$REQUESTED_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $REQUESTED_VERSION" >&2
+            exit 1
           fi
-          "$ANDROID_HOME/ndk/$NDK_VERSION/ndk-build" NDK_PROJECT_PATH=android NDK_APPLICATION_MK=android/jni/Application.mk -j4
-          python3 tools/release.py android --version "$RELEASE_VERSION"
-          tar -czf android-payload.tar.gz -C android/libs arm64-v8a x86_64
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: android-payload
-          path: android-payload.tar.gz
-          if-no-files-found: error
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-android
-          path: release/*.zip
-          if-no-files-found: error
+          echo "value=$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
 
-  desktop:
-    needs: android
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: windows-x64
-            runner: windows-2022
-            architecture: x64
-          - target: windows-arm64
-            runner: windows-11-arm
-            architecture: arm64
-          - target: macos-arm64
-            runner: macos-15
-            architecture: arm64
-          - target: macos-x64
-            runner: macos-15-intel
-            architecture: x64
-          - target: linux-x64
-            runner: ubuntu-22.04
-            architecture: x64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.13'
-          architecture: ${{ matrix.architecture }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: android-payload
-      - name: Restore device binaries and install build dependencies
-        run: |
-          set -euo pipefail
-          mkdir -p android/libs
-          tar -xzf android-payload.tar.gz -C android/libs
-          python -m pip install --disable-pip-version-check PySide6==6.12.0 PyInstaller==6.22.3
-      - name: Install Linux Qt runtime dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libopengl0 libxcb-cursor0 libxkbcommon-x11-0
-      - name: Package and verify native desktop
-        run: |
-          set -euo pipefail
-          python tools/package.py --no-ndk
-          python tools/release.py desktop --version "$RELEASE_VERSION" --target "${{ matrix.target }}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-${{ matrix.target }}
-          path: |
-            release/*.zip
-            release/*.tar.gz
-          if-no-files-found: error
-      - name: Preserve build logs
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: build-logs-${{ matrix.target }}
-          path: |
-            build/**/*.txt
-            build/**/*.log
-
-  assemble:
-    needs: [android, desktop]
+  android:
+    needs: validate
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.13'
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: release-*
-          path: release
-          merge-multiple: true
-      - name: Verify complete asset set and generate checksums
-        run: python tools/release.py checksums --version "$RELEASE_VERSION"
+      - name: Install pinned NDK
+        run: |
+          set -euo pipefail
+          if [ ! -x "$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION/ndk-build" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$CAMREPLACE_NDK_VERSION"
+          fi
+      - name: Build unified ARM64 payload
+        run: |
+          set -euo pipefail
+          cmake -S engines/camreplace/android -B build/camreplace-android -G "Unix Makefiles" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/android-ndk.cmake" \
+            -DANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/camreplace-android --parallel 4
+          for file in cr_injector cr_feed_proc libcr_hooks.so; do
+            test -s "build/camreplace-android/out/$file"
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-assets
-          path: release/
+          name: release-android-payload
+          path: build/camreplace-android/out/
           if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: [validate, android]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-android-payload
+          path: build/camreplace-android/out
+      - name: Install and verify pinned LLVM-MinGW
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $archive = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'llvm-mingw'
+          Invoke-WebRequest -Uri $env:LLVM_MINGW_URL -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:LLVM_MINGW_SHA256) {
+            throw "LLVM-MinGW checksum mismatch: $actual"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          $compiler = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'x86_64-w64-mingw32-clang++.exe' |
+            Select-Object -First 1
+          if (-not $compiler) { throw 'LLVM-MinGW compiler was not found' }
+          $root = $compiler.Directory.Parent.FullName
+          $runtime = Get-ChildItem -LiteralPath $root -Recurse -Filter 'libwinpthread-1.dll' |
+            Where-Object { $_.FullName -match 'x86_64' } |
+            Select-Object -First 1
+          if (-not $runtime) { throw 'x86_64 libwinpthread-1.dll was not found' }
+          "LLVM_MINGW_ROOT=$root" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "MINGW_RUNTIME_DIR=$($runtime.Directory.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure and build unified host
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S engines/camreplace/host -B build/camreplace-host -G Ninja `
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/llvm-mingw.cmake" `
+            -DLLVM_MINGW_ROOT="$env:LLVM_MINGW_ROOT" `
+            -DMINGW_RUNTIME_DIR="$env:MINGW_RUNTIME_DIR" `
+            -DANDROID_OUT_DIR="$PWD/build/camreplace-android/out" `
+            -DADB_SRC_DIR="$env:ANDROID_HOME/platform-tools" `
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/camreplace-host --target CameraReplace --parallel 4
+          $exe = 'build/camreplace-host/bin/LONG-Virtual-Camera.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Missing output: $exe" }
+          $imports = & "$env:LLVM_MINGW_ROOT/bin/llvm-objdump.exe" -p $exe
+          if ($imports -match '(?i)DLL Name:\s*lib(win)?pthread') {
+            throw 'Release executable imports libwinpthread and is not standalone'
+          }
+      - name: Write manifest and package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = [ordered]@{
+            'LONG-Virtual-Camera.exe' = 'build/camreplace-host/bin/LONG-Virtual-Camera.exe'
+            'adb.exe' = "$env:ANDROID_HOME/platform-tools/adb.exe"
+            'AdbWinApi.dll' = "$env:ANDROID_HOME/platform-tools/AdbWinApi.dll"
+            'AdbWinUsbApi.dll' = "$env:ANDROID_HOME/platform-tools/AdbWinUsbApi.dll"
+            'libwinpthread-1.dll' = "$env:MINGW_RUNTIME_DIR/libwinpthread-1.dll"
+            'cr_injector' = 'build/camreplace-android/out/cr_injector'
+            'cr_feed_proc' = 'build/camreplace-android/out/cr_feed_proc'
+            'libcr_hooks.so' = 'build/camreplace-android/out/libcr_hooks.so'
+          }
+          $hashes = [ordered]@{}
+          foreach ($entry in $files.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value)) { throw "Missing manifest input: $($entry.Value)" }
+            $item = Get-Item -LiteralPath $entry.Value
+            if ($item.Length -le 0) { throw "Empty manifest input: $($entry.Value)" }
+            $hashes[$entry.Key] = [ordered]@{
+              size = $item.Length
+              sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          $manifest = [ordered]@{
+            schema = 1
+            product = 'LONG Virtual Camera'
+            version = $env:RELEASE_VERSION
+            commit = $env:GITHUB_SHA
+            ndk = $env:CAMREPLACE_NDK_VERSION
+            llvm_mingw_url = $env:LLVM_MINGW_URL
+            llvm_mingw_sha256 = $env:LLVM_MINGW_SHA256
+            files = $hashes
+          }
+          $bin = 'build/camreplace-host/bin'
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$bin/build-manifest.json" -Encoding utf8
+          $stage = Join-Path $env:RUNNER_TEMP "LONG-Virtual-Camera-$env:RELEASE_VERSION-windows-x64"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item -LiteralPath "$bin/LONG-Virtual-Camera.exe", "$bin/build-manifest.json", 'LICENSE', 'NOTICE' -Destination $stage
+          $archive = "dist/LONG-Virtual-Camera-$env:RELEASE_VERSION-windows-x64.zip"
+          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
+          Compress-Archive -LiteralPath $stage -DestinationPath $archive -CompressionLevel Optimal
+          $name = Split-Path -Leaf $archive
+          $sha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha *$name" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+          Copy-Item -LiteralPath "$bin/build-manifest.json" -Destination 'dist/build-manifest.json'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: LONG-Virtual-Camera-${{ needs.validate.outputs.version }}-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: [validate, windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: LONG-Virtual-Camera-${{ needs.validate.outputs.version }}-windows-x64
+          path: dist
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_VERSION" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_VERSION" dist/* \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "LONG Virtual Camera $RELEASE_VERSION" --generate-notes
+          fi

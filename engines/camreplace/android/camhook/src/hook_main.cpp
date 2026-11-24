@@ -4,15 +4,14 @@
 #include "shm.h"
 #include "nv21_blit.h"
 #include "jpeg_encode.h"
+#include "HookDispatch.h"
 #include "shadowhook.h"
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <errno.h>
-#include <elf.h>
 #include <fcntl.h>
-#include <link.h>
 #include <poll.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -24,6 +23,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 #include "util/Obf.h"
 
@@ -55,6 +55,11 @@ struct PinnedSlot
   cr_feed_header* header = nullptr;
   const uint8_t* data = nullptr;
   uint32_t index = 0;
+  uint32_t generation = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t slot_size = 0;
+  uint64_t frame_seq = 0;
 
   ~PinnedSlot()
   {
@@ -78,15 +83,56 @@ struct ShmView
     if (!header || !slot0)
       return false;
 
-    const uint32_t raw_n = header->num_slots;
-    const uint32_t n = (raw_n == 0 || raw_n > CR_FEED_NUM_SLOTS) ? 1u : raw_n;
-    const uint32_t wi = atomic_load(&header->write_index) % n;
+    const uint32_t magic = __atomic_load_n(&header->magic, __ATOMIC_ACQUIRE);
+    const uint32_t version = __atomic_load_n(&header->version, __ATOMIC_ACQUIRE);
+    const uint32_t generation = atomic_load_explicit(&header->generation, memory_order_acquire);
+    const uint32_t raw_n = __atomic_load_n(&header->num_slots, __ATOMIC_ACQUIRE);
+    if (raw_n == 0 || raw_n > CR_FEED_NUM_SLOTS)
+      return false;
+    const uint32_t n = raw_n;
+    const uint32_t width = __atomic_load_n(&header->width, __ATOMIC_ACQUIRE);
+    const uint32_t height = __atomic_load_n(&header->height, __ATOMIC_ACQUIRE);
+    const uint32_t stride = __atomic_load_n(&header->stride, __ATOMIC_ACQUIRE);
+    const uint32_t slot_size = __atomic_load_n(&header->slot_size, __ATOMIC_ACQUIRE);
+    const uint32_t format = __atomic_load_n(&header->format, __ATOMIC_ACQUIRE);
+    const uint64_t frame_seq = atomic_load_explicit(&header->frame_counter, memory_order_acquire);
+    const uint32_t wi = atomic_load_explicit(&header->write_index, memory_order_acquire) % n;
+    if (magic != CR_FEED_MAGIC || version != CR_FEED_SHM_VERSION || frame_seq == 0)
+      return false;
     if (!cr_feed_slot_try_read(header, wi))
       return false;
 
+    // Pin first, then prove the publication and geometry snapshot did not
+    // change under us. Later generations may start while this guard is alive,
+    // but preserving slot_state prevents them from reusing this slot.
+    const bool stable = __atomic_load_n(&header->magic, __ATOMIC_ACQUIRE) == magic &&
+                        __atomic_load_n(&header->version, __ATOMIC_ACQUIRE) == version &&
+                        atomic_load_explicit(&header->generation, memory_order_acquire) == generation &&
+                        atomic_load_explicit(&header->write_index, memory_order_acquire) % n == wi &&
+                        atomic_load_explicit(&header->frame_counter, memory_order_acquire) == frame_seq &&
+                        __atomic_load_n(&header->width, __ATOMIC_ACQUIRE) == width &&
+                        __atomic_load_n(&header->height, __ATOMIC_ACQUIRE) == height &&
+                        __atomic_load_n(&header->stride, __ATOMIC_ACQUIRE) == stride &&
+                        __atomic_load_n(&header->slot_size, __ATOMIC_ACQUIRE) == slot_size &&
+                        __atomic_load_n(&header->num_slots, __ATOMIC_ACQUIRE) == n &&
+                        __atomic_load_n(&header->format, __ATOMIC_ACQUIRE) == format;
+    if (!stable)
+    {
+      cr_feed_slot_release_read(header, wi);
+      return false;
+    }
+
     const size_t off = (size_t) wi * CR_FEED_MAX_NV21_BYTES;
     const size_t hdr = sizeof(cr_feed_header);
-    if (size < hdr || off > (size - hdr) || CR_FEED_MAX_NV21_BYTES > (size - hdr - off))
+    const uint64_t min_slot =
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 3ull /
+        2ull;
+    if (width == 0 || height == 0 || (width & 1u) || (height & 1u) ||
+        width > CR_FEED_MAX_WIDTH || height > CR_FEED_MAX_HEIGHT ||
+        stride != width || format != 0 || slot_size == 0 ||
+        min_slot == 0 || min_slot > slot_size ||
+        slot_size > CR_FEED_MAX_NV21_BYTES || size < hdr || off > (size - hdr) ||
+        slot_size > (size - hdr - off))
     {
       cr_feed_slot_release_read(header, wi);
       return false;
@@ -94,6 +140,11 @@ struct ShmView
     out.header = header;
     out.index = wi;
     out.data = slot0 + off;
+    out.generation = generation;
+    out.width = width;
+    out.height = height;
+    out.slot_size = slot_size;
+    out.frame_seq = frame_seq;
     return true;
   }
 };
@@ -101,40 +152,58 @@ struct ShmView
 static std::atomic<bool> g_installed{false};
 static ShmView g_shm;
 static std::mutex g_shm_mutex;
+static std::atomic<bool> g_shm_ready{false};
 static void* g_hook_stub = nullptr;
 
 static bool feed_header_sane(const cr_feed_header* h, size_t map_size)
 {
   if (!h || map_size < sizeof(cr_feed_header))
     return false;
-  if (h->magic != CR_FEED_MAGIC)
+  const uint32_t magic = __atomic_load_n(&h->magic, __ATOMIC_ACQUIRE);
+  const uint32_t version = __atomic_load_n(&h->version, __ATOMIC_ACQUIRE);
+  const uint32_t width = __atomic_load_n(&h->width, __ATOMIC_ACQUIRE);
+  const uint32_t height = __atomic_load_n(&h->height, __ATOMIC_ACQUIRE);
+  const uint32_t stride = __atomic_load_n(&h->stride, __ATOMIC_ACQUIRE);
+  const uint32_t slot_size = __atomic_load_n(&h->slot_size, __ATOMIC_ACQUIRE);
+  const uint32_t n = __atomic_load_n(&h->num_slots, __ATOMIC_ACQUIRE);
+  const uint32_t format = __atomic_load_n(&h->format, __ATOMIC_ACQUIRE);
+  if (magic != CR_FEED_MAGIC)
     return false;
-  if (h->version != CR_FEED_SHM_VERSION)
+  if (version != CR_FEED_SHM_VERSION)
     return false;
-  if (h->width == 0 || h->height == 0 || h->width > CR_FEED_MAX_WIDTH || h->height > CR_FEED_MAX_HEIGHT)
+  if (width == 0 || height == 0 || (width & 1u) || (height & 1u) ||
+      width > CR_FEED_MAX_WIDTH || height > CR_FEED_MAX_HEIGHT ||
+      stride != width || format != 0)
   {
     return false;
   }
-  if (h->slot_size == 0 || h->slot_size > CR_FEED_MAX_NV21_BYTES)
+  if (slot_size == 0 || slot_size > CR_FEED_MAX_NV21_BYTES)
     return false;
-  const uint64_t min_slot = (uint64_t) h->width * (uint64_t) h->height * 3ull / 2ull;
-  if (min_slot == 0 || min_slot > h->slot_size)
+  const uint64_t min_slot = (uint64_t) width * (uint64_t) height * 3ull / 2ull;
+  if (min_slot == 0 || min_slot > slot_size)
     return false;
 
-  const uint32_t n = h->num_slots;
   if (n == 0 || n > CR_FEED_NUM_SLOTS)
     return false;
 
   uint64_t required = sizeof(cr_feed_header);
   if (n <= 1)
   {
-    required += (uint64_t) h->slot_size;
+    required += (uint64_t) slot_size;
   }
   else
   {
     required += (uint64_t) n * (uint64_t) CR_FEED_MAX_NV21_BYTES;
   }
-  return required <= map_size;
+  return required <= map_size &&
+         __atomic_load_n(&h->magic, __ATOMIC_ACQUIRE) == magic &&
+         __atomic_load_n(&h->version, __ATOMIC_ACQUIRE) == version &&
+         __atomic_load_n(&h->width, __ATOMIC_ACQUIRE) == width &&
+         __atomic_load_n(&h->height, __ATOMIC_ACQUIRE) == height &&
+         __atomic_load_n(&h->stride, __ATOMIC_ACQUIRE) == stride &&
+         __atomic_load_n(&h->slot_size, __ATOMIC_ACQUIRE) == slot_size &&
+         __atomic_load_n(&h->num_slots, __ATOMIC_ACQUIRE) == n &&
+         __atomic_load_n(&h->format, __ATOMIC_ACQUIRE) == format;
 }
 
 typedef void (*cr_blit_fn)(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped);
@@ -199,6 +268,32 @@ static inline int64_t monotonic_ns()
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t) ts.tv_sec * 1000000000LL + (int64_t) ts.tv_nsec;
+}
+
+// ReCam rejects a publication once it has stopped advancing. Preserve that
+// fail-open privacy/safety property without changing CamReplace's compact shm
+// ABI: cameraserver tracks progress locally and falls back to the real sensor
+// if a connected-but-stalled feeder leaves READY on an old frame.
+static constexpr int64_t kFrameStaleNs = 2LL * 1000LL * 1000LL * 1000LL;
+static std::mutex g_frame_freshness_mu;
+static uint32_t g_fresh_generation = 0;
+static uint64_t g_fresh_sequence = 0;
+static int64_t g_fresh_progress_ns = 0;
+
+static bool frame_is_fresh(const PinnedSlot& frame)
+{
+  const int64_t now = monotonic_ns();
+  std::lock_guard<std::mutex> lock(g_frame_freshness_mu);
+  if (frame.generation != g_fresh_generation ||
+      frame.frame_seq != g_fresh_sequence || g_fresh_progress_ns <= 0 ||
+      now < g_fresh_progress_ns)
+  {
+    g_fresh_generation = frame.generation;
+    g_fresh_sequence = frame.frame_seq;
+    g_fresh_progress_ns = now;
+    return true;
+  }
+  return now - g_fresh_progress_ns <= kFrameStaleNs;
 }
 
 static std::atomic<bool> g_photo_mode{false};
@@ -330,6 +425,8 @@ static GBM_unlock_v1_fn g_gbm_unlock_v1 = nullptr;
 static GBM_unlock_v2_fn g_gbm_unlock_v2 = nullptr;
 static GBM_lock_v1_fn g_gbm_lock_v1 = nullptr;
 static GBM_lock_v2_fn g_gbm_lock_v2 = nullptr;
+static std::shared_mutex g_runtime_ops_mu;
+static std::atomic<bool> g_runtime_preview_ready{false};
 
 static int gbm_call_unlock(const void* handle)
 {
@@ -345,10 +442,15 @@ static bool gbm_ready()
   return g_gbm && g_gbm_lockYCbCr && (g_gbm_unlock_v1 || g_gbm_unlock_v2);
 }
 
+static bool ahb_planes_ready()
+{
+  return g_ahb_lockPlanes && g_ahb_unlock && g_get_hardware_buffer;
+}
+
 static int open_shm()
 {
   std::lock_guard<std::mutex> guard(g_shm_mutex);
-  if (g_shm.header)
+  if (g_shm_ready.load(std::memory_order_acquire))
     return 0;
   int fd = open(OBF("/data/cr/feed").c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0)
@@ -373,7 +475,11 @@ static int open_shm()
   auto* h = (cr_feed_header*) map;
   if (!feed_header_sane(h, (size_t) st.st_size))
   {
-    LOGW(OBF("bad feed shape: %ux%u slot=%u slots=%u").c_str(), h->width, h->height, h->slot_size, h->num_slots);
+    LOGW(OBF("bad feed shape: %ux%u slot=%u slots=%u").c_str(),
+         __atomic_load_n(&h->width, __ATOMIC_ACQUIRE),
+         __atomic_load_n(&h->height, __ATOMIC_ACQUIRE),
+         __atomic_load_n(&h->slot_size, __ATOMIC_ACQUIRE),
+         __atomic_load_n(&h->num_slots, __ATOMIC_ACQUIRE));
     munmap(map, st.st_size);
     close(fd);
     return -1;
@@ -382,7 +488,10 @@ static int open_shm()
   g_shm.slot0 = (const uint8_t*) map + sizeof(cr_feed_header);
   g_shm.size = (size_t) st.st_size;
   g_shm.fd = fd;
-  LOGI(OBF("shm mapped: %ux%u (%zu bytes)").c_str(), h->width, h->height, g_shm.size);
+  g_shm_ready.store(true, std::memory_order_release);
+  LOGI(OBF("shm mapped: %ux%u (%zu bytes)").c_str(),
+       __atomic_load_n(&h->width, __ATOMIC_ACQUIRE),
+       __atomic_load_n(&h->height, __ATOMIC_ACQUIRE), g_shm.size);
   return 0;
 }
 
@@ -394,287 +503,6 @@ template <typename Fn> static Fn resolve_sym(void* dl_handle, void* sh_handle, c
     fn = (Fn) shadowhook_dlsym(sh_handle, sym);
   }
   return fn;
-}
-
-struct elf_dynsym_query
-{
-  const char* libname;
-  const ElfW(Sym) * symtab;
-  const char* strtab;
-  size_t strtab_size;
-  ElfW(Addr) load_bias;
-  uint32_t nsyms;
-  bool found;
-};
-
-static bool loaded_object_matches(const dl_phdr_info* info, const char* libname)
-{
-  if (!libname || !*libname)
-    return false;
-
-  if (strcmp(libname, OBF("cameraserver").c_str()) == 0)
-  {
-    if (!info->dlpi_name || !*info->dlpi_name)
-      return true;
-    const char* base = strrchr(info->dlpi_name, '/');
-    base = base ? base + 1 : info->dlpi_name;
-    return strcmp(base, libname) == 0;
-  }
-
-  if (!info->dlpi_name || !*info->dlpi_name)
-    return false;
-
-  const char* base = strrchr(info->dlpi_name, '/');
-  base = base ? base + 1 : info->dlpi_name;
-  return strcmp(base, libname) == 0;
-}
-
-static int dynsym_iterate_cb(struct dl_phdr_info* info, size_t, void* data)
-{
-  auto* q = (elf_dynsym_query*) data;
-  if (!loaded_object_matches(info, q->libname))
-    return 0;
-
-  const ElfW(Phdr)* dynamic_ph = nullptr;
-  for (int i = 0; i < info->dlpi_phnum; ++i)
-  {
-    if (info->dlpi_phdr[i].p_type == PT_DYNAMIC)
-    {
-      dynamic_ph = &info->dlpi_phdr[i];
-      break;
-    }
-  }
-  if (!dynamic_ph)
-    return 0;
-
-  const ElfW(Dyn)* dyn = (const ElfW(Dyn)*) (info->dlpi_addr + dynamic_ph->p_vaddr);
-  const ElfW(Sym)* symtab = nullptr;
-  const char* strtab = nullptr;
-  size_t strtab_size = 0;
-  const uint32_t* hash = nullptr;
-  const uint32_t* gnu_hash = nullptr;
-
-  for (; dyn->d_tag != DT_NULL; ++dyn)
-  {
-    switch (dyn->d_tag)
-    {
-    case DT_SYMTAB:
-      symtab = (const ElfW(Sym)*) (info->dlpi_addr + dyn->d_un.d_ptr);
-      break;
-    case DT_STRTAB:
-      strtab = (const char*) (info->dlpi_addr + dyn->d_un.d_ptr);
-      break;
-    case DT_STRSZ:
-      strtab_size = dyn->d_un.d_val;
-      break;
-    case DT_HASH:
-      hash = (const uint32_t*) (info->dlpi_addr + dyn->d_un.d_ptr);
-      break;
-    case DT_GNU_HASH:
-      gnu_hash = (const uint32_t*) (info->dlpi_addr + dyn->d_un.d_ptr);
-      break;
-    }
-  }
-  if (!symtab || !strtab)
-    return 0;
-
-  uint32_t nsyms = 0;
-  if (hash)
-  {
-    nsyms = hash[1];
-  }
-  else if (gnu_hash)
-  {
-    uint32_t nbuckets = gnu_hash[0];
-    uint32_t symoffset = gnu_hash[1];
-    uint32_t bloom_size = gnu_hash[2];
-    const ElfW(Addr)* bloom = (const ElfW(Addr)*) &gnu_hash[4];
-    const uint32_t* buckets = (const uint32_t*) &bloom[bloom_size];
-    const uint32_t* chains = &buckets[nbuckets];
-    uint32_t max_idx = 0;
-    for (uint32_t i = 0; i < nbuckets; ++i)
-    {
-      if (buckets[i] > max_idx)
-        max_idx = buckets[i];
-    }
-    if (max_idx < symoffset)
-    {
-      nsyms = symoffset;
-    }
-    else
-    {
-      uint32_t i = max_idx - symoffset;
-      while ((chains[i] & 1u) == 0u)
-        ++i;
-      nsyms = symoffset + i + 1;
-    }
-  }
-  else
-  {
-    return 0;
-  }
-
-  q->symtab = symtab;
-  q->strtab = strtab;
-  q->strtab_size = strtab_size;
-  q->load_bias = info->dlpi_addr;
-  q->nsyms = nsyms;
-  q->found = true;
-  return 1;
-}
-
-static void* find_sym_by_prefix(const char* libname, const char* prefix, char* out_name, size_t out_size)
-{
-  elf_dynsym_query q{libname, nullptr, nullptr, 0, 0, 0, false};
-  dl_iterate_phdr(dynsym_iterate_cb, &q);
-  if (!q.found)
-    return nullptr;
-
-  const size_t prefix_len = strlen(prefix);
-  for (uint32_t i = 0; i < q.nsyms; ++i)
-  {
-    const ElfW(Sym)* sym = &q.symtab[i];
-    if (sym->st_value == 0)
-      continue;
-    if (sym->st_name >= q.strtab_size)
-      continue;
-    if (ELF64_ST_TYPE(sym->st_info) != STT_FUNC)
-      continue;
-    const char* name = q.strtab + sym->st_name;
-    if (strncmp(name, prefix, prefix_len) != 0)
-      continue;
-    if (out_name && out_size)
-    {
-      strncpy(out_name, name, out_size - 1);
-      out_name[out_size - 1] = '\0';
-    }
-    return (void*) (q.load_bias + sym->st_value);
-  }
-  return nullptr;
-}
-
-struct loaded_lib_query
-{
-  const char* libname;
-  char path[512];
-  ElfW(Addr) load_bias;
-  bool found;
-};
-
-static int loaded_lib_cb(struct dl_phdr_info* info, size_t, void* data)
-{
-  auto* q = (loaded_lib_query*) data;
-  if (!loaded_object_matches(info, q->libname))
-    return 0;
-
-  if (info->dlpi_name && *info->dlpi_name)
-  {
-    strncpy(q->path, info->dlpi_name, sizeof(q->path) - 1);
-  }
-  else
-  {
-    ssize_t n = readlink(OBF("/proc/self/exe").c_str(), q->path, sizeof(q->path) - 1);
-    if (n <= 0)
-      return 0;
-    q->path[n] = '\0';
-  }
-  q->path[sizeof(q->path) - 1] = '\0';
-  q->load_bias = info->dlpi_addr;
-  q->found = true;
-  return 1;
-}
-
-static bool pread_exact(int fd, off_t off, void* buf, size_t size)
-{
-  auto* p = (uint8_t*) buf;
-  while (size > 0)
-  {
-    ssize_t n = pread(fd, p, size, off);
-    if (n <= 0)
-      return false;
-    p += n;
-    off += n;
-    size -= (size_t) n;
-  }
-  return true;
-}
-
-static void* find_file_sym_by_prefix(const char* libname, const char* prefix, char* out_name, size_t out_size)
-{
-  loaded_lib_query q{libname, {}, 0, false};
-  dl_iterate_phdr(loaded_lib_cb, &q);
-  if (!q.found || !q.path[0])
-    return nullptr;
-
-  int fd = open(q.path, O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
-    return nullptr;
-
-  ElfW(Ehdr) eh{};
-  if (!pread_exact(fd, 0, &eh, sizeof(eh)) || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 || eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shentsize != sizeof(ElfW(Shdr)))
-  {
-    close(fd);
-    return nullptr;
-  }
-
-  std::vector<ElfW(Shdr)> sections(eh.e_shnum);
-  if (!pread_exact(fd, (off_t) eh.e_shoff, sections.data(), sections.size() * sizeof(ElfW(Shdr))))
-  {
-    close(fd);
-    return nullptr;
-  }
-
-  const size_t prefix_len = strlen(prefix);
-  for (const auto& sh : sections)
-  {
-    if (sh.sh_type != SHT_SYMTAB && sh.sh_type != SHT_DYNSYM)
-      continue;
-    if (sh.sh_link >= sections.size() || sh.sh_entsize < sizeof(ElfW(Sym)))
-      continue;
-
-    const auto& str_sh = sections[sh.sh_link];
-    if (str_sh.sh_size == 0 || str_sh.sh_size > (16u * 1024u * 1024u))
-      continue;
-
-    std::vector<char> strtab((size_t) str_sh.sh_size + 1u, '\0');
-    if (!pread_exact(fd, (off_t) str_sh.sh_offset, strtab.data(), (size_t) str_sh.sh_size))
-    {
-      continue;
-    }
-
-    const size_t sym_count = (size_t) (sh.sh_size / sh.sh_entsize);
-    if (sym_count == 0 || sym_count > (2u * 1024u * 1024u))
-      continue;
-
-    std::vector<ElfW(Sym)> syms(sym_count);
-    if (!pread_exact(fd, (off_t) sh.sh_offset, syms.data(), sym_count * sizeof(ElfW(Sym))))
-    {
-      continue;
-    }
-
-    for (const auto& sym : syms)
-    {
-      if (sym.st_value == 0)
-        continue;
-      if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC)
-        continue;
-      if (sym.st_name >= strtab.size())
-        continue;
-      const char* name = strtab.data() + sym.st_name;
-      if (strncmp(name, prefix, prefix_len) != 0)
-        continue;
-      if (out_name && out_size)
-      {
-        strncpy(out_name, name, out_size - 1);
-        out_name[out_size - 1] = '\0';
-      }
-      close(fd);
-      return (void*) (q.load_bias + sym.st_value);
-    }
-  }
-
-  close(fd);
-  return nullptr;
 }
 
 static bool resolve_gbm_in_lib(void* dl_handle, void* sh_handle, const char* lib_tag)
@@ -689,10 +517,9 @@ static bool resolve_gbm_in_lib(void* dl_handle, void* sh_handle, const char* lib
 
   auto plain_lock_v1 = resolve_sym<GBM_lock_v1_fn>(dl_handle, sh_handle, "_ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPv");
 
-  char lock_v2_sym_buf[256] = {0};
-  GBM_lock_v2_fn plain_lock_v2 = (GBM_lock_v2_fn) find_sym_by_prefix(lib_tag, "_ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPvPi", lock_v2_sym_buf, sizeof(lock_v2_sym_buf));
-  const char* lock_v2_match = plain_lock_v2 ? lock_v2_sym_buf : nullptr;
-  if (!plain_lock_v2)
+  GBM_lock_v2_fn plain_lock_v2 = nullptr;
+  const char* lock_v2_match = nullptr;
+  char lock_v2_sym_buf[256] = {};
   {
     static const char* const kV2Suffixes[] = {
         "S5_", "S6_", "S7_", "S8_", "S9_", "SA_", "SB_", "SC_",
@@ -731,7 +558,7 @@ static bool resolve_gbm_in_lib(void* dl_handle, void* sh_handle, const char* lib
   return false;
 }
 
-static void resolve_runtime_ops()
+static void resolve_runtime_ops_unlocked()
 {
   void* libnw = dlopen(OBF("libnativewindow.so").c_str(), RTLD_NOW | RTLD_NOLOAD);
   if (!libnw)
@@ -769,6 +596,21 @@ static void resolve_runtime_ops()
   }
 
   LOGI(OBF("resolve: AHB lock=%p unlock=%p | GBM this=%p lockYCbCr=%p unlock_v1=%p unlock_v2=%p").c_str(), g_ahb_lockPlanes, g_ahb_unlock, g_gbm, g_gbm_lockYCbCr, g_gbm_unlock_v1, g_gbm_unlock_v2);
+}
+
+static void resolve_runtime_ops()
+{
+  if (g_runtime_preview_ready.load(std::memory_order_acquire))
+    return;
+  std::unique_lock<std::shared_mutex> lock(g_runtime_ops_mu);
+  if (ahb_planes_ready() || gbm_ready())
+  {
+    g_runtime_preview_ready.store(true, std::memory_order_release);
+    return;
+  }
+  resolve_runtime_ops_unlocked();
+  if (ahb_planes_ready() || gbm_ready())
+    g_runtime_preview_ready.store(true, std::memory_order_release);
 }
 
 struct ANativeBaseHeader
@@ -816,6 +658,7 @@ struct ANWBInfo
 static std::atomic<int> g_stat_skip_noshm{0};
 static std::atomic<int> g_stat_skip_channel{0};
 static std::atomic<int> g_stat_skip_noframe{0};
+static std::atomic<int> g_stat_skip_stale{0};
 static std::atomic<int> g_stat_skip_layout{0};
 static std::atomic<int> g_stat_skip_nogbm{0};
 static std::atomic<int> g_stat_skip_noanb{0};
@@ -864,7 +707,7 @@ static bool inspect_anwb(const ANWB* anb, ANWBInfo& out)
 
 static void try_lazy_init()
 {
-  if (!g_shm.header)
+  if (!g_shm_ready.load(std::memory_order_acquire))
   {
     static std::atomic<int> n{0};
     if ((n.fetch_add(1, std::memory_order_relaxed) % 30) == 0)
@@ -872,14 +715,9 @@ static void try_lazy_init()
       open_shm();
     }
   }
-  if (!g_ahb_lockPlanes && !gbm_ready())
-  {
-    static std::atomic<int> n{0};
-    if ((n.fetch_add(1, std::memory_order_relaxed) % 30) == 0)
-    {
-      resolve_runtime_ops();
-    }
-  }
+  static std::atomic<int> runtime_attempt{0};
+  if ((runtime_attempt.fetch_add(1, std::memory_order_relaxed) % 30) == 0)
+    resolve_runtime_ops();
 }
 
 struct LockedView
@@ -921,6 +759,9 @@ static bool lock_via_ahb(const void* anb, int W, int H, int fence,
     if (lock_fence < 0)
       return false;
   }
+  // AHardwareBuffer_lockPlanes takes ownership of the fence descriptor,
+  // including on failure. The camera framework retains the original fd;
+  // only the duplicate is transferred here.
   CR_ARect rect{0, 0, W, H};
   CR_AHB_Planes planes{};
   int rc = g_ahb_lockPlanes(ahb, kAhbUsageCpuRW, lock_fence, &rect, &planes);
@@ -936,15 +777,22 @@ static bool lock_via_ahb(const void* anb, int W, int H, int fence,
   auto& p1 = planes.planes[1];
   auto& p2 = planes.planes[2];
 
-  view.y = (uint8_t*) p0.data;
-  view.ystride = p0.rowStride;
-  view.uvstride = p1.rowStride;
-  if (p1.pixelStride != 2)
+  const uintptr_t cb = reinterpret_cast<uintptr_t>(p1.data);
+  const uintptr_t cr = reinterpret_cast<uintptr_t>(p2.data);
+  const uintptr_t chroma_delta = cb > cr ? cb - cr : cr - cb;
+  if (!p0.data || !p1.data || !p2.data || p0.pixelStride != 1 ||
+      p1.pixelStride != 2 || p2.pixelStride != 2 ||
+      p0.rowStride < static_cast<uint32_t>(W) ||
+      p1.rowStride < static_cast<uint32_t>(W) ||
+      p2.rowStride != p1.rowStride || chroma_delta != 1u)
   {
     g_ahb_unlock(ahb, nullptr);
     return false;
   }
-  if (p2.data < p1.data)
+  view.y = static_cast<uint8_t*>(p0.data);
+  view.ystride = p0.rowStride;
+  view.uvstride = p1.rowStride;
+  if (cr < cb)
   {
     view.vu = (uint8_t*) p2.data;
     view.uv_swapped = false;
@@ -971,13 +819,17 @@ static bool lock_via_gbm(const void* anb, const void* handle, int W, int H,
   if (rc != 0)
     return false;
 
-  view.y = (uint8_t*) yc.y;
-  view.ystride = yc.ystride;
-  view.uvstride = yc.cstride;
-
-  if (yc.chroma_step == 2 && yc.cb && yc.cr)
+  const uintptr_t cb = reinterpret_cast<uintptr_t>(yc.cb);
+  const uintptr_t cr = reinterpret_cast<uintptr_t>(yc.cr);
+  const uintptr_t chroma_delta = cb > cr ? cb - cr : cr - cb;
+  if (yc.y && yc.cb && yc.cr && yc.chroma_step == 2 &&
+      yc.ystride >= static_cast<size_t>(W) &&
+      yc.cstride >= static_cast<size_t>(W) && chroma_delta == 1u)
   {
-    if (yc.cr < yc.cb)
+    view.y = static_cast<uint8_t*>(yc.y);
+    view.ystride = yc.ystride;
+    view.uvstride = yc.cstride;
+    if (cr < cb)
     {
       view.vu = (uint8_t*) yc.cr;
       view.uv_swapped = false;
@@ -1018,10 +870,10 @@ static std::atomic<int> g_stat_blob_cache_hit{0};
 
 static std::mutex g_jpeg_cache_mutex;
 static std::vector<uint8_t> g_jpeg_cache;
+static uint32_t g_jpeg_cache_generation = 0;
 static uint64_t g_jpeg_cache_frame = 0;
 static int g_jpeg_cache_src_w = 0;
 static int g_jpeg_cache_src_h = 0;
-static int64_t g_jpeg_cache_ts_ns = 0;
 
 static bool lock_blob(const void* anb, const void* handle, int W, int H, int fence,
                       void*& out_vaddr, void*& out_ahb_handle, int& out_lock_path)
@@ -1030,15 +882,18 @@ static bool lock_blob(const void* anb, const void* handle, int W, int H, int fen
   out_ahb_handle = nullptr;
   out_lock_path = -1;
 
-  if (g_ahb_lock && g_get_hardware_buffer)
+  // BLOB buffers use their width as byte capacity and commonly have height 1.
+  // Lock the whole allocation instead of applying the camera stream rectangle,
+  // and never enter the AHB path unless the matching unlock API is available.
+  if (g_ahb_lock && g_ahb_unlock && g_get_hardware_buffer)
   {
     void* ahb = g_get_hardware_buffer((void*) anb);
     int lock_fence = ahb && fence >= 0 ? dup(fence) : -1;
     if (ahb && (fence < 0 || lock_fence >= 0))
     {
       void* vaddr = nullptr;
-      CR_ARect rect{0, 0, W, H};
-      int rc = g_ahb_lock(ahb, kAhbUsageCpuRW, lock_fence, &rect, &vaddr);
+      // AHardwareBuffer_lock takes ownership of lock_fence on every return.
+      int rc = g_ahb_lock(ahb, kAhbUsageCpuRW, lock_fence, nullptr, &vaddr);
       if (rc == 0 && vaddr)
       {
         out_vaddr = vaddr;
@@ -1046,6 +901,8 @@ static bool lock_blob(const void* anb, const void* handle, int W, int H, int fen
         out_lock_path = 0;
         return true;
       }
+      if (rc == 0)
+        g_ahb_unlock(ahb, nullptr);
     }
   }
   if (!wait_for_fence(fence))
@@ -1061,6 +918,8 @@ static bool lock_blob(const void* anb, const void* handle, int W, int H, int fen
       out_lock_path = 1;
       return true;
     }
+    if (rc == 0)
+      gbm_call_unlock(handle);
   }
   if (g_gbm && g_gbm_lock_v1)
   {
@@ -1073,35 +932,69 @@ static bool lock_blob(const void* anb, const void* handle, int W, int H, int fen
       out_lock_path = 1;
       return true;
     }
+    if (rc == 0)
+      gbm_call_unlock(handle);
   }
   return false;
 }
 
+struct BlobLockGuard
+{
+  const void* handle = nullptr;
+  void* ahb = nullptr;
+  int path = -1;
+
+  ~BlobLockGuard() { unlock(); }
+  BlobLockGuard(const void* native_handle, void* ahb_handle, int lock_path)
+      : handle(native_handle), ahb(ahb_handle), path(lock_path)
+  {
+  }
+  BlobLockGuard(const BlobLockGuard&) = delete;
+  BlobLockGuard& operator=(const BlobLockGuard&) = delete;
+
+  void unlock() noexcept
+  {
+    if (path == 0 && ahb && g_ahb_unlock)
+      g_ahb_unlock(ahb, nullptr);
+    else if (path == 1 && handle)
+      gbm_call_unlock(handle);
+    path = -1;
+  }
+};
+
 static bool overwrite_blob_jpeg(ANWB* anb, int fence)
 {
-  if (!g_shm.header)
+  if (!g_shm_ready.load(std::memory_order_acquire))
     return false;
   if (!feed_header_sane(g_shm.header, g_shm.size))
     return false;
   PinnedSlot source;
   if (!g_shm.pin_current(source))
     return false;
-  const uint64_t cur_frame = atomic_load(&g_shm.header->frame_counter);
+  if (!frame_is_fresh(source))
+  {
+    ++g_stat_skip_stale;
+    return false;
+  }
+  const uint64_t cur_frame = source.frame_seq;
   if (cur_frame == 0)
     return false;
 
-  const int src_w = (int) g_shm.header->width;
-  const int src_h = (int) g_shm.header->height;
+  const int src_w = (int) source.width;
+  const int src_h = (int) source.height;
   if (src_w < 16 || src_h < 16)
     return false;
 
   const int W = anb->width;
   const int H = anb->height;
+  // Android's BLOB ABI is one-dimensional: height must be exactly one and
+  // width is the allocation size in bytes. Refuse malformed descriptors
+  // rather than multiplying dimensions and risking an out-of-bounds trailer.
   if (W < 16 || W > 64 * 1024 * 1024)
     return false;
-  if (H < 1 || H > 8192)
+  if (H != 1)
     return false;
-  const size_t buf_capacity = (size_t) W * (size_t) H;
+  const size_t buf_capacity = (size_t) W;
   const size_t trailer_size = sizeof(CR_Camera3JpegBlob);
   if (buf_capacity < trailer_size + 1024)
     return false;
@@ -1123,22 +1016,19 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     }
     return false;
   }
+  BlobLockGuard blob_lock(handle, ahb_handle, lock_path);
 
   bool cache_hit = false;
   size_t jpeg_bytes = 0;
-  const int64_t now_ns = monotonic_ns();
-  auto unlock_blob = [&]()
-  {
-    if (lock_path == 0 && g_ahb_unlock)
-      g_ahb_unlock(ahb_handle, nullptr);
-    else if (lock_path == 1)
-      gbm_call_unlock(handle);
-  };
   bool need_encode = true;
   {
     std::lock_guard<std::mutex> g(g_jpeg_cache_mutex);
 
-    const bool cache_valid = !g_jpeg_cache.empty() && g_jpeg_cache.size() <= encode_cap && g_jpeg_cache_src_w == src_w && g_jpeg_cache_src_h == src_h;
+    const bool cache_valid = !g_jpeg_cache.empty() &&
+                             g_jpeg_cache.size() <= encode_cap &&
+                             g_jpeg_cache_generation == source.generation &&
+                             g_jpeg_cache_src_w == src_w &&
+                             g_jpeg_cache_src_h == src_h;
 
     const bool same_frame = cache_valid && g_jpeg_cache_frame == cur_frame;
     if (same_frame)
@@ -1161,16 +1051,16 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
       {
         LOGW(OBF("blob: nv21->jpeg failed rc=%d jpeg=%zu cap=%zu (src %dx%d -> buf %dx%d)").c_str(), rc, jpeg_bytes, encode_cap, src_w, src_h, W, H);
       }
-      unlock_blob();
+      blob_lock.unlock();
       return false;
     }
 
     std::lock_guard<std::mutex> g(g_jpeg_cache_mutex);
     g_jpeg_cache.assign((const uint8_t*) vaddr, (const uint8_t*) vaddr + jpeg_bytes);
+    g_jpeg_cache_generation = source.generation;
     g_jpeg_cache_frame = cur_frame;
     g_jpeg_cache_src_w = src_w;
     g_jpeg_cache_src_h = src_h;
-    g_jpeg_cache_ts_ns = now_ns;
   }
 
   CR_Camera3JpegBlob trailer;
@@ -1178,7 +1068,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   trailer.jpeg_size = (uint32_t) jpeg_bytes;
   memcpy((uint8_t*) vaddr + buf_capacity - trailer_size, &trailer, sizeof(trailer));
 
-  unlock_blob();
+  blob_lock.unlock();
 
   int n = ++g_stat_blob_ok;
   if (n <= 5 || (n % 30) == 0)
@@ -1188,25 +1078,23 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   return true;
 }
 
-static void overwrite_nv21(ANWB* anb, int fence)
+static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
 {
   ANWBInfo bi;
   if (!inspect_anwb(anb, bi))
-    return;
+    return cr::camhook::ReplacementOutcome::PassThrough;
 
-  if (!g_shm.header || (!g_ahb_lockPlanes && !gbm_ready()))
-  {
-    try_lazy_init();
-  }
-  if (!g_shm.header)
+  try_lazy_init();
+  if (!g_shm_ready.load(std::memory_order_acquire))
   {
     ++g_stat_skip_noshm;
-    return;
+    return cr::camhook::ReplacementOutcome::PassThrough;
   }
   if (!feed_header_sane(g_shm.header, g_shm.size))
-    return;
+    return cr::camhook::ReplacementOutcome::PassThrough;
 
-  const uint32_t channel_state = atomic_load(&g_shm.header->channel_state);
+  const uint32_t channel_state = atomic_load_explicit(
+      &g_shm.header->channel_state, memory_order_acquire);
   if (channel_state != CR_CHANNEL_STATE_READY)
   {
     int n = ++g_stat_skip_channel;
@@ -1217,9 +1105,9 @@ static void overwrite_nv21(ANWB* anb, int fence)
            channel_state,
            (unsigned long long) atomic_load(&g_shm.header->frame_counter),
            atomic_load(&g_shm.header->generation),
-           g_shm.header->magic);
+           __atomic_load_n(&g_shm.header->magic, __ATOMIC_ACQUIRE));
     }
-    return;
+    return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
   if (atomic_load(&g_shm.header->frame_counter) == 0)
@@ -1230,12 +1118,17 @@ static void overwrite_nv21(ANWB* anb, int fence)
       LOGW(OBF("skip_noframe#%d state=%u dims=%ux%u gen=%u").c_str(),
            n,
            channel_state,
-           g_shm.header->width,
-           g_shm.header->height,
+           __atomic_load_n(&g_shm.header->width, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&g_shm.header->height, __ATOMIC_ACQUIRE),
            atomic_load(&g_shm.header->generation));
     }
-    return;
+    return cr::camhook::ReplacementOutcome::PassThrough;
   }
+
+  // Runtime buffer-mapper pointers are retried lazily because vendor DSOs may
+  // appear after injection. Hold a shared lock for the complete lock/blit/
+  // unlock operation so no retry publishes a new function set mid-callback.
+  std::shared_lock<std::shared_mutex> runtime_ops(g_runtime_ops_mu);
 
   const int fmt = bi.format;
 
@@ -1249,16 +1142,16 @@ static void overwrite_nv21(ANWB* anb, int fence)
       LOGI(OBF("BLOB qbtc#%d %dx%d photo_mode=%s").c_str(), bn, bi.width, bi.height, photo_on ? "ON" : OBF("OFF").c_str());
     }
     if (photo_on)
-    {
-      overwrite_blob_jpeg(anb, fence);
-    }
-    return;
+      return overwrite_blob_jpeg(anb, fence)
+                 ? cr::camhook::ReplacementOutcome::Succeeded
+                 : cr::camhook::ReplacementOutcome::AttemptedFailed;
+    return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
-  if (!g_ahb_lockPlanes && !gbm_ready())
+  if (!ahb_planes_ready() && !gbm_ready())
   {
     ++g_stat_skip_nogbm;
-    return;
+    return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
   const int W = bi.width;
@@ -1266,13 +1159,13 @@ static void overwrite_nv21(ANWB* anb, int fence)
   if (W < 16 || H < 16 || W > 8192 || H > 8192)
   {
     ++g_stat_skip_dims;
-    return;
+    return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
   if (fmt != 0x11 && fmt != 0x22 && fmt != 0x23)
   {
     ++g_stat_skip_fmt;
-    return;
+    return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
   const void* handle = bi.handle;
@@ -1291,24 +1184,34 @@ static void overwrite_nv21(ANWB* anb, int fence)
     {
       LOGW(OBF("lock failed (%dx%d fmt=0x%x handle=%p)").c_str(), W, H, fmt, handle);
     }
-    return;
+    return cr::camhook::ReplacementOutcome::AttemptedFailed;
   }
 
+  bool replaced = false;
   if (view.y && view.vu)
   {
     int n = ++g_stat_blit_ok;
     if (n <= 3 || (n % 60) == 0)
     {
-      LOGI(OBF("blit#%d %dx%d via=%s y=%p vu=%p ys=%zu us=%zu order=%s (src %ux%u)").c_str(), n, W, H, view.lock_path == 0 ? OBF("AHB").c_str() : OBF("GBM").c_str(), view.y, view.vu, view.ystride, view.uvstride, view.uv_swapped ? OBF("NV12(U-first)").c_str() : OBF("NV21(V-first)").c_str(), g_shm.header->width, g_shm.header->height);
+      LOGI(OBF("blit#%d %dx%d via=%s y=%p vu=%p ys=%zu us=%zu order=%s (src %ux%u)").c_str(), n, W, H, view.lock_path == 0 ? OBF("AHB").c_str() : OBF("GBM").c_str(), view.y, view.vu, view.ystride, view.uvstride, view.uv_swapped ? OBF("NV12(U-first)").c_str() : OBF("NV21(V-first)").c_str(), __atomic_load_n(&g_shm.header->width, __ATOMIC_ACQUIRE), __atomic_load_n(&g_shm.header->height, __ATOMIC_ACQUIRE));
     }
 
     PinnedSlot source;
     if (!g_shm.pin_current(source))
     {
       unlock(anb, handle, ahb, view);
-      return;
+      return cr::camhook::ReplacementOutcome::AttemptedFailed;
     }
-    blit_adaptive(source.data, (int) g_shm.header->width, (int) g_shm.header->height, view.y, view.vu, W, H, (int) view.ystride, (int) view.uvstride, view.uv_swapped ? 1 : 0);
+    if (!frame_is_fresh(source))
+    {
+      ++g_stat_skip_stale;
+      unlock(anb, handle, ahb, view);
+      return cr::camhook::ReplacementOutcome::PassThrough;
+    }
+    blit_adaptive(source.data, (int) source.width, (int) source.height,
+                  view.y, view.vu, W, H, (int) view.ystride,
+                  (int) view.uvstride, view.uv_swapped ? 1 : 0);
+    replaced = true;
   }
   else
   {
@@ -1316,30 +1219,45 @@ static void overwrite_nv21(ANWB* anb, int fence)
   }
 
   unlock(anb, handle, ahb, view);
+  return replaced ? cr::camhook::ReplacementOutcome::Succeeded
+                  : cr::camhook::ReplacementOutcome::AttemptedFailed;
 }
 
-typedef void (*qbtc_t)(void* thiz, void* consumer, ANWB* anb, int fence, void* surface_ids);
+using qbtc_surfaces_t = std::int32_t (*)(void* thiz, void* consumer, ANWB* anb,
+                                        int fence, const std::vector<std::size_t>& surface_ids);
+using qbtc_legacy_t = std::int32_t (*)(void* thiz, void* consumer, ANWB* anb,
+                                      int fence);
 
-static qbtc_t g_orig_qbtc = nullptr;
+static qbtc_surfaces_t g_orig_qbtc_surfaces = nullptr;
+static qbtc_legacy_t g_orig_qbtc_legacy = nullptr;
+static cr::camhook::HookCounters g_hook_counters;
 
-static void proxy_qbtc(void* thiz, void* consumer, ANWB* anb, int fence, void* surface_ids)
+static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
 {
-  static std::atomic<int> call_count{0};
-  int n = ++call_count;
+  const std::uint64_t n = g_hook_counters.callback_seen.load(std::memory_order_relaxed);
   if (n <= 5 || (n % 60) == 0)
   {
     ANWBInfo bi{};
     const bool layout_ok = inspect_anwb(anb, bi);
-    LOGI(OBF("qbtc#%d anb=%p %dx%d stride=%d fmt=0x%x handle=%p").c_str(), n, anb, layout_ok ? bi.width : -1, layout_ok ? bi.height : -1, layout_ok ? bi.stride : -1, layout_ok ? bi.format : -1, layout_ok ? bi.handle : nullptr);
+    LOGI(OBF("qbtc#%llu anb=%p %dx%d stride=%d fmt=0x%x handle=%p").c_str(),
+         (unsigned long long) n, anb, layout_ok ? bi.width : -1,
+         layout_ok ? bi.height : -1, layout_ok ? bi.stride : -1,
+         layout_ok ? bi.format : -1, layout_ok ? bi.handle : nullptr);
   }
 
-  overwrite_nv21(anb, fence);
+  const auto outcome = overwrite_nv21(anb, fence);
 
   if ((n % 60) == 0)
   {
-    LOGI(OBF("stats: skip_channel=%d skip_noframe=%d skip_noshm=%d skip_fmt=%d skip_lock=%d blit_ok=%d blob_ok=%d blob_cache_hit=%d noanb=%d layout=%d nogbm=%d dims=%d hnd=%d novu=%d").c_str(),
+    LOGI(OBF("stats: callbacks=%llu attempted=%llu succeeded=%llu pass=%llu queue_failed=%llu skip_channel=%d skip_noframe=%d skip_stale=%d skip_noshm=%d skip_fmt=%d skip_lock=%d blit_ok=%d blob_ok=%d blob_cache_hit=%d noanb=%d layout=%d nogbm=%d dims=%d hnd=%d novu=%d").c_str(),
+         (unsigned long long) g_hook_counters.callback_seen.load(),
+         (unsigned long long) g_hook_counters.replacement_attempted.load(),
+         (unsigned long long) g_hook_counters.replacement_succeeded.load(),
+         (unsigned long long) g_hook_counters.pass_through.load(),
+         (unsigned long long) g_hook_counters.original_queue_failed.load(),
          g_stat_skip_channel.load(),
          g_stat_skip_noframe.load(),
+         g_stat_skip_stale.load(),
          g_stat_skip_noshm.load(),
          g_stat_skip_fmt.load(),
          g_stat_lock_fail.load(),
@@ -1353,29 +1271,30 @@ static void proxy_qbtc(void* thiz, void* consumer, ANWB* anb, int fence, void* s
          g_stat_skip_handle.load(),
          g_stat_no_vu.load());
   }
-
-  if (g_orig_qbtc)
-    g_orig_qbtc(thiz, consumer, anb, fence, surface_ids);
+  return outcome;
 }
 
-typedef uint64_t (*rbcl_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-
-static rbcl_t g_orig_rbcl = nullptr;
-
-static uint64_t proxy_rbcl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+static std::int32_t proxy_qbtc_surfaces(void* thiz, void* consumer, ANWB* anb,
+                                        int fence, const std::vector<std::size_t>& surface_ids)
 {
-  static std::atomic<int> call_count{0};
-  int n = ++call_count;
-  if (n <= 5 || (n % 60) == 0)
-    LOGI(OBF("rbcl#%d (fallback pass-through)").c_str(), n);
-  return g_orig_rbcl ? g_orig_rbcl(a0, a1, a2, a3, a4, a5, a6, a7) : 0;
+  return cr::camhook::dispatch_queue(
+      g_hook_counters, [=] { return replace_for_queue(anb, fence); },
+      g_orig_qbtc_surfaces, thiz, consumer, anb, fence, surface_ids);
+}
+
+static std::int32_t proxy_qbtc_legacy(void* thiz, void* consumer, ANWB* anb,
+                                      int fence)
+{
+  return cr::camhook::dispatch_queue(
+      g_hook_counters, [=] { return replace_for_queue(anb, fence); },
+      g_orig_qbtc_legacy, thiz, consumer, anb, fence);
 }
 
 static int try_hook_primary()
 {
   shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
 
-  auto try_one = [&](const char* sym) -> bool
+  auto try_one = [&](cr::camhook::TargetAbiDescriptor abi) -> bool
   {
     auto libcameraservice = OBF("libcameraservice.so");
     auto cameraserver = OBF("cameraserver");
@@ -1385,139 +1304,71 @@ static int try_hook_primary()
     };
     for (const char* lib : libs)
     {
-      void* stub = shadowhook_hook_sym_name(lib, sym, (void*) proxy_qbtc, (void**) &g_orig_qbtc);
+      void* proxy = abi.kind == cr::camhook::TargetAbiKind::QueueWithSurfaceIds
+                        ? reinterpret_cast<void*>(proxy_qbtc_surfaces)
+                        : reinterpret_cast<void*>(proxy_qbtc_legacy);
+      void* original = nullptr;
+      void* stub = shadowhook_hook_sym_name(lib, abi.symbol, proxy, &original);
       if (stub)
       {
+        if (!original)
+        {
+          LOGE(OBF("hook returned no original target; rolling back").c_str());
+          shadowhook_unhook(stub);
+          continue;
+        }
+        if (abi.kind == cr::camhook::TargetAbiKind::QueueWithSurfaceIds)
+          g_orig_qbtc_surfaces = reinterpret_cast<qbtc_surfaces_t>(original);
+        else
+          g_orig_qbtc_legacy = reinterpret_cast<qbtc_legacy_t>(original);
         g_hook_stub = stub;
-        LOGI(OBF("hook installed on queueBufferToConsumer (lib=%s sym=%s)").c_str(), lib, sym);
+        LOGI(OBF("hook installed on queueBufferToConsumer (lib=%s sym=%s abi=%s)").c_str(),
+             lib, abi.symbol,
+             abi.kind == cr::camhook::TargetAbiKind::QueueWithSurfaceIds
+                 ? OBF("surface_ids").c_str()
+                 : OBF("legacy").c_str());
         return true;
       }
     }
-    LOGW(OBF("qbtc try %.40s… → %s").c_str(), sym, shadowhook_to_errmsg(shadowhook_get_errno()));
+    LOGW(OBF("qbtc try %.40s… → %s").c_str(), abi.symbol,
+         shadowhook_to_errmsg(shadowhook_get_errno()));
     return false;
   };
-  auto try_prefix = [&]() -> bool
-  {
-    auto try_prefix_in = [&](const char* lib) -> bool
-    {
-      char matched[512] = {};
-      char source[16] = {};
-      void* addr = find_sym_by_prefix(lib, OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumer").c_str(), matched, sizeof(matched));
-      strncpy(source, OBF("dynsym").c_str(), sizeof(source) - 1);
-      if (!addr)
-      {
-        addr = find_file_sym_by_prefix(lib, OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumer").c_str(), matched, sizeof(matched));
-        strncpy(source, OBF("symtab").c_str(), sizeof(source) - 1);
-      }
-      if (!addr)
-        return false;
-
-      void* stub = shadowhook_hook_sym_addr(addr, (void*) proxy_qbtc, (void**) &g_orig_qbtc);
-      if (!stub)
-      {
-        LOGW(OBF("qbtc prefix %s/%s matched %.80s at %p but hook failed: %s").c_str(), lib, source, matched, addr, shadowhook_to_errmsg(shadowhook_get_errno()));
-        return false;
-      }
-      g_hook_stub = stub;
-      LOGI(OBF("hook installed on queueBufferToConsumer (lib=%s %s prefix sym=%s addr=%p)").c_str(), lib, source, matched, addr);
-      return true;
-    };
-
-    if (try_prefix_in(OBF("libcameraservice.so").c_str()))
-      return true;
-    if (try_prefix_in(OBF("cameraserver").c_str()))
-      return true;
-    return false;
-  };
-
-  if (try_one(OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferiRKNSt3__16vectorImNS8_"
-                  "9allocatorImEEEE")
-                  .c_str()))
+  if (try_one({OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferiRKNSt3__16vectorImNS8_"
+                       "9allocatorImEEEE")
+                       .c_str(),
+               cr::camhook::TargetAbiKind::QueueWithSurfaceIds}))
     return 0;
 
-  if (try_one(OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferiRKNSt3__16vectorImNS5_"
-                  "9allocatorImEEEE")
-                  .c_str()))
+  if (try_one({OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferiRKNSt3__16vectorImNS5_"
+                       "9allocatorImEEEE")
+                       .c_str(),
+               cr::camhook::TargetAbiKind::QueueWithSurfaceIds}))
     return 0;
 
-  if (try_one(OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferiRKNSt3__16vectorImNS6_"
-                  "9allocatorImEEEE")
-                  .c_str()))
+  if (try_one({OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferiRKNSt3__16vectorImNS6_"
+                       "9allocatorImEEEE")
+                       .c_str(),
+               cr::camhook::TargetAbiKind::QueueWithSurfaceIds}))
     return 0;
 
-  if (try_one(OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferiRKNSt3__16vectorImNS7_"
-                  "9allocatorImEEEE")
-                  .c_str()))
+  if (try_one({OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferiRKNSt3__16vectorImNS7_"
+                       "9allocatorImEEEE")
+                       .c_str(),
+               cr::camhook::TargetAbiKind::QueueWithSurfaceIds}))
     return 0;
 
-  if (try_one(OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferi").c_str()))
+  if (try_one({OBF("_ZN7android7camera319Camera3OutputStream21queueBufferToConsumerERNS_2spI13ANativeWindowEEP19ANativeWindowBufferi").c_str(),
+               cr::camhook::TargetAbiKind::QueueLegacy}))
     return 0;
 
-  if (try_prefix())
-    return 0;
-
+  // ReCam's central ABI lesson is intentionally applied here: a symbol prefix
+  // is not a calling convention. Only exact, reviewed mangled signatures may
+  // enter proxy_qbtc. Unknown firmware fails closed instead of guessing a C++
+  // parameter layout and crashing cameraserver.
   return -1;
 }
 
-[[maybe_unused]] static int try_hook_fallback()
-{
-  shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
-
-  auto try_one = [&](const char* sym) -> bool
-  {
-    auto libcameraservice = OBF("libcameraservice.so");
-    auto cameraserver = OBF("cameraserver");
-    const char* libs[] = {
-        libcameraservice.c_str(),
-        cameraserver.c_str(),
-    };
-    for (const char* lib : libs)
-    {
-      void* stub = shadowhook_hook_sym_name(lib, sym, (void*) proxy_rbcl, (void**) &g_orig_rbcl);
-      if (stub)
-      {
-        g_hook_stub = stub;
-        LOGI(OBF("hook installed on returnBufferCheckedLocked fallback (lib=%s)").c_str(), lib);
-        return true;
-      }
-    }
-    return false;
-  };
-
-  auto try_prefix = [&]() -> bool
-  {
-    auto try_prefix_in = [&](const char* lib) -> bool
-    {
-      char matched[512] = {};
-      void* addr = find_file_sym_by_prefix(lib, OBF("_ZN7android7camera319Camera3OutputStream25returnBufferCheckedLocked").c_str(), matched, sizeof(matched));
-      if (!addr)
-        return false;
-
-      void* stub = shadowhook_hook_sym_addr(addr, (void*) proxy_rbcl, (void**) &g_orig_rbcl);
-      if (!stub)
-        return false;
-      g_hook_stub = stub;
-      LOGI(OBF("hook installed on returnBufferCheckedLocked fallback (lib=%s sym=%s addr=%p)").c_str(), lib, matched, addr);
-      return true;
-    };
-    if (try_prefix_in(OBF("libcameraservice.so").c_str()))
-      return true;
-    if (try_prefix_in(OBF("cameraserver").c_str()))
-      return true;
-    return false;
-  };
-
-  if (try_one(OBF("_ZN7android7camera319Camera3OutputStream25returnBufferCheckedLockedERKNS0_20camera_stream_bufferElbiRKNSt3__16vectorImNS8_9allocatorImEEEEPN"
-                  "S_2spINS_5FenceEEE")
-                  .c_str()))
-    return 0;
-
-  if (try_prefix())
-    return 0;
-
-  LOGE(OBF("hook fallback: %s").c_str(), shadowhook_to_errmsg(shadowhook_get_errno()));
-  return -1;
-}
 extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_shutdown();
 
 extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_init(const char* feed_url)
@@ -1541,10 +1392,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
   }
   else
   {
-    LOGE(OBF("primary queueBufferToConsumer hook failed; diagnostic fallback is not production success").c_str());
-#if defined(CR_CAMHOOK_DIAGNOSTIC_FALLBACK)
-    (void) try_hook_fallback();
-#endif
+    LOGE(OBF("reviewed queueBufferToConsumer ABI not found; refusing unsafe fallback").c_str());
   }
 
   if (hook_rc == 0)

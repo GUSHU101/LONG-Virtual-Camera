@@ -1,7 +1,7 @@
 /*
  * Назначение файла:
  *   Windows TCP client для adb-forward tunnels к cr_feed_proc. Отправляет
- *   CRTP raw NV21, CRH2 H.264 chunks и CRAU PCM stream.
+ *   CRH2 H.264 chunks and CRAU PCM stream.
  *
  * ABI/совместимость:
  *   Wire headers не меняются. Video shared-memory ABI v2 на телефоне имеет
@@ -12,6 +12,8 @@
  *   Это транспортный слой, он не масштабирует и не ресемплит. Исправление
  *   oversized stream делается выше по pipeline.
  */
+
+#define NOMINMAX
 
 #include "transport/TcpFeedClient.h"
 #include "secure_channel/LocalTicketAuth.h"
@@ -27,11 +29,11 @@
 // `#pragma comment(lib,...)` directive).
 
 #include <algorithm>
-#include <atomic>
 #include <array>
 #include <chrono>
 #include <climits>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -49,19 +51,16 @@ namespace cr::transport
 namespace
 {
 
-// Winsock is refcounted — first WSAStartup/last WSACleanup. We track with an
-// atomic so the first TcpFeedClient constructor triggers it and it sticks
-// around for the app lifetime (Windows cleans up on process exit anyway).
-std::atomic<bool> g_wsa_inited{false};
-
-void ensure_wsa()
+// Function-local initialization is thread-safe and does not expose a transient
+// "initialized" flag before WSAStartup has actually completed.
+bool ensure_wsa() noexcept
 {
-  bool expected = false;
-  if (g_wsa_inited.compare_exchange_strong(expected, true))
+  static const int result = []() noexcept
   {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-  }
+    WSADATA wsa{};
+    return WSAStartup(MAKEWORD(2, 2), &wsa);
+  }();
+  return result == 0;
 }
 
 inline SOCKET as_sock(std::uintptr_t h) noexcept
@@ -128,6 +127,8 @@ bool make_dev_ticket(
     const std::array<std::uint8_t, 24>& phone_nonce,
     std::vector<std::uint8_t>& ticket_bytes) noexcept
 {
+  try
+  {
   cr::secure_channel::v2::Ticket ticket{};
   ticket.stream = stream_kind;
   ticket.issued_at_ms = unix_ms();
@@ -143,6 +144,12 @@ bool make_dev_ticket(
       ticket, {shared.data(), shared.size()}));
   crypto_wipe(shared.data(), shared.size());
   return signed_ok && static_cast<bool>(cr::secure_channel::v2::encode_ticket(ticket, ticket_bytes));
+  }
+  catch (const std::bad_alloc&)
+  {
+    ticket_bytes.clear();
+    return false;
+  }
 }
 
 } // namespace
@@ -159,7 +166,10 @@ bool TcpFeedClient::is_open() const noexcept
 
 bool TcpFeedClient::open(int port, cr::secure_channel::v2::StreamKind stream_kind)
 {
-  ensure_wsa();
+  try
+  {
+  if (!ensure_wsa())
+    return false;
   close();
   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (s == INVALID_SOCKET)
@@ -179,6 +189,17 @@ bool TcpFeedClient::open(int port, cr::secure_channel::v2::StreamKind stream_kin
   // temporary backlog.
   int snd_buf = 512 * 1024;
   setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd_buf), sizeof(snd_buf));
+  DWORD io_timeout_ms = 5000;
+  if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&io_timeout_ms),
+                 sizeof(io_timeout_ms)) != 0 ||
+      setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+                 reinterpret_cast<const char*>(&io_timeout_ms),
+                 sizeof(io_timeout_ms)) != 0)
+  {
+    closesocket(s);
+    return false;
+  }
 
   sockaddr_in addr = {};
   addr.sin_family = AF_INET;
@@ -282,8 +303,22 @@ bool TcpFeedClient::open(int port, cr::secure_channel::v2::StreamKind stream_kin
     close();
     return false;
   }
+  DWORD blocking_receive = 0;
+  if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&blocking_receive),
+                 sizeof(blocking_receive)) != 0)
+  {
+    close();
+    return false;
+  }
   cr::log::info("tcp", "secure channel established to 127.0.0.1:" + std::to_string(port));
   return true;
+  }
+  catch (const std::bad_alloc&)
+  {
+    close();
+    return false;
+  }
 }
 
 void TcpFeedClient::close()
@@ -355,28 +390,6 @@ bool TcpFeedClient::flush_pcm_blocks_()
   return true;
 }
 
-bool TcpFeedClient::send_header(int width, int height, int fps)
-{
-  if (!is_open())
-    return false;
-  if (!video_shape_supported(width, height, "CRTP"))
-    return false;
-  std::uint32_t hdr[4] = {
-      kMagic,
-      (std::uint32_t) width,
-      (std::uint32_t) height,
-      (std::uint32_t) fps,
-  };
-  return send_application_(hdr, sizeof(hdr));
-}
-
-bool TcpFeedClient::send_frame(const void* data, std::size_t bytes)
-{
-  if (!is_open())
-    return false;
-  return send_application_(data, bytes);
-}
-
 // --- H.264 protocol -----------------------------------------------------
 
 bool TcpFeedClient::send_h264_header(int width, int height, int fps)
@@ -396,7 +409,7 @@ bool TcpFeedClient::send_h264_header(int width, int height, int fps)
 
 bool TcpFeedClient::send_h264_chunk(const void* data, std::size_t bytes, int64_t pts_us, bool is_keyframe)
 {
-  if (!is_open() || !data)
+  if (!is_open() || !data || bytes > UINT32_MAX)
     return false;
 
   // Prefix: [u32 len][u32 flags][i64 pts_us].
@@ -421,13 +434,14 @@ bool TcpFeedClient::send_pcm_header(uint32_t sample_rate, uint16_t channels, uin
   if (!is_open())
     return false;
   // Same 12-byte header tcp_pcm_feed.cpp parses on the phone.
-  struct __attribute__((packed)) WireHdr
+  struct WireHdr
   {
     std::uint32_t magic;
     std::uint32_t sample_rate;
     std::uint16_t channels;
     std::uint16_t bps;
   } hdr = {kMagicPcm, sample_rate, channels, bytes_per_sample};
+  static_assert(sizeof(WireHdr) == 12, "PCM wire header ABI changed");
   pcm_pending_.clear();
   pcm_offset_ = 0;
   return send_application_(&hdr, sizeof(hdr));
@@ -438,7 +452,15 @@ bool TcpFeedClient::send_pcm(const void* data, std::size_t bytes)
   if (!data || bytes == 0)
     return false;
   const auto* p = static_cast<const std::uint8_t*>(data);
-  pcm_pending_.insert(pcm_pending_.end(), p, p + bytes);
+  try
+  {
+    pcm_pending_.insert(pcm_pending_.end(), p, p + bytes);
+  }
+  catch (const std::bad_alloc&)
+  {
+    close();
+    return false;
+  }
   return flush_pcm_blocks_();
 }
 

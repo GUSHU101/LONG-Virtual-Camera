@@ -1,0 +1,44 @@
+name: ReCam donor regression
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'desktop/**'
+      - 'tools/**'
+      - '.github/workflows/recam-donor-regression.yml'
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: 27.3.13750724
+
+jobs:
+  donor-android-and-python:
+    # This is a source-donor compatibility gate, not a second LONG Virtual
+    # Camera release. Product artifacts are built only by quality.yml's
+    # unified Android -> Windows chain.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: Validate donor Python sources
+        run: |
+          python -m compileall -q desktop tools
+          python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Install pinned NDK
+        run: |
+          if [ ! -x "$ANDROID_HOME/ndk/$NDK_VERSION/ndk-build" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION"
+          fi
+      - name: Compile donor Android architectures
+        run: |
+          "$ANDROID_HOME/ndk/$NDK_VERSION/ndk-build" \
+            NDK_PROJECT_PATH=android \
+            NDK_APPLICATION_MK=android/jni/Application.mk \
+            -j4

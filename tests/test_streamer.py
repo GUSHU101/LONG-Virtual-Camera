@@ -1,4 +1,5 @@
 import sys
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -6,7 +7,37 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "desktop"))
 
-from recam_ui.streamer import redact_command, rtmp_input  # noqa: E402
+from recam_ui.streamer import Streamer, StreamerError, redact_command, rtmp_input  # noqa: E402
+
+
+class _HungProcess:
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        raise subprocess.TimeoutExpired("ffmpeg", timeout)
+
+
+class _DrainThread:
+    def __init__(self, alive=True):
+        self.alive = alive
+        self.joined = False
+
+    def join(self, timeout=None):
+        self.joined = True
+
+    def is_alive(self):
+        return self.alive
 
 
 class StreamerSafetyTests(unittest.TestCase):
@@ -35,6 +66,22 @@ class StreamerSafetyTests(unittest.TestCase):
     def test_local_paths_and_regular_flags_remain_diagnostic(self):
         argv = ["ffmpeg", "-re", "-i", "C:/media/demo clip.mp4"]
         self.assertEqual(argv, redact_command(argv))
+
+    def test_stop_clears_owned_process_after_timeout(self):
+        streamer = Streamer(ffmpeg="ffmpeg")
+        proc = _HungProcess()
+        drain = _DrainThread()
+        streamer._proc = proc
+        streamer._drain_thread = drain
+
+        with self.assertRaisesRegex(StreamerError, "did not stop"):
+            streamer.stop()
+
+        self.assertTrue(proc.terminated)
+        self.assertTrue(proc.killed)
+        self.assertTrue(drain.joined)
+        self.assertIsNone(streamer._proc)
+        self.assertIsNone(streamer._drain_thread)
 
 
 if __name__ == "__main__":

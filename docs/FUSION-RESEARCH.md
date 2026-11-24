@@ -1,102 +1,78 @@
 # Fusion research record
 
-## Scope and provenance
+## Baselines and design choice
 
-The fusion started from full source snapshots of:
+- ReCam: `44f99681079c04e3b3e6d3a74fef96f03b480348`.
+- CamReplace: `8456a5d8041f4c81a26b5c19fa0d6409f57db048`.
 
-- ReCam `44f99681079c04e3b3e6d3a74fef96f03b480348`;
-- CamReplace `8456a5d8041f4c81a26b5c19fa0d6409f57db048`.
+The detailed inventory and review method are in
+[UPSTREAM-CODE-AUDIT.md](UPSTREAM-CODE-AUDIT.md). The result is not a wrapper
+that launches either repository. CamReplace's Windows/OBS/device pipeline is the
+native product skeleton; ReCam's source adapters, frame ownership model, geometry
+validation, fail-closed hook policy and lifecycle ideas were brought into that
+same process. The old stable/enhanced selector and `--engine` option were removed.
 
-Repository-owned C/C++, Python, build scripts, workflow files and public
-documentation were read. Vendored dependencies were inspected at their build,
-API and privilege boundaries rather than independently re-auditing every
-upstream implementation. Both projects are now present as maintained source,
-not merely used as design references.
+## Integrated decisions
 
-## Why the product retains two engines
-
-The implementations hook different private Android surfaces and have different
-host assumptions. Combining their payloads into one process would increase ABI
-and rollback risk without providing a user benefit. The new product therefore
-uses one launcher, one policy set and one release identity while retaining two
-selectable engines:
-
-- the ReCam-derived stable engine provides a conservative cross-platform video
-  path, strong symbol/prologue validation and multi-geometry frame lanes;
-- the CamReplace-derived enhanced engine provides the Windows OBS experience,
-  optional virtual microphone and JPEG still replacement.
-
-This is deliberate component-level fusion: fixes and invariants are shared,
-while incompatible hook mechanisms remain isolated behind an engine boundary.
-
-## Cross-project findings and implemented repairs
-
-| Area | Finding | Fusion repair |
+| Area | Upstream evidence | Fused implementation |
 |---|---|---|
-| Camera fences | CPU access could start before HAL completion; ReCam discarded an unlock fence | Incoming fences are consumed by AHB/GBM locks; linear unlock is synchronous |
-| Native buffer conversion | CamReplace cast a private window buffer pointer to AHB | Resolve and use `ANativeWindowBuffer_getHardwareBuffer`; unsupported paths pass through |
-| Frame ownership | CamReplace triple buffer could overwrite an active reader | Protocol v2 adds atomic reader pins and an exclusive writer token |
-| JPEG source | Encoding read an unpinned changing slot | The source remains pinned for the complete encode/cache operation |
-| Audio privacy | Short reads/format probing could leave bytes from the real mic | Once virtual mic is active, clear the full client buffer before any delivery; underrun is silence |
-| Audio consent | Audio pass-through contract was unclear | Explicit independent OFF/ON switch; OFF is default and does not arm/inject audio |
-| SELinux | CamReplace invoked global `setenforce 0` | Keep enforcing; calculate/apply scoped allow rules and verify them |
-| Runtime files | `/data/cr` files were world writable | Per-service ownership, directory `0711`, channels/markers `0600`, photo input `0400` |
-| Readiness | Host could manufacture a successful ready marker | Only the injected target service may write its pre-created marker |
-| Injection return | A null fault address could be mistaken for a successful remote call | Only the designated PC return trap is accepted |
-| Private ABI | Prefix matches could select an unknown C++ signature | Unknown signature families fail closed; stable engine also checks live prologue bytes |
-| Hook shutdown | Mappings could be freed while an in-flight trampoline still referenced them | Disable substitution but retain the tiny mapping until the owning service exits |
-| Lanczos math | Q15 unity `32768` overflowed `int16_t` | Store weights in `int32_t` |
-| Dimensions | Enhanced feed mishandled portrait limits | Independently bound width/height and require even NV21 geometry |
-| Desktop cleanup | Window close did less cleanup than Stop | Shared fail-safe shutdown tries streamer, feeder, payload and ADB forwarding |
-| Exposure/logging | RTMP could bind all interfaces and logs contained secrets | Loopback-only listeners and credential/header/token redaction |
-| Local ticket | Development tickets used an all-zero proof and had no maximum accepted duration | Authenticate the canonical ticket with the ephemeral X25519 shared secret; enforce a one-hour lifetime plus clock/expiry checks |
-| Async lifecycle | Detached Start/Stop workers could interleave device, forwarding and OBS state | Serialize complete lifecycle transactions and make every failed start roll back phone and host stages |
-| Multi-device | One global deploy flag and no host-session owner leaked state across serials | Track prepared artifacts per serial, bind the host pipeline to one owning serial and lock device switching while active |
-| UI callbacks | Old worker callbacks could overwrite the state of a newer user action | Atomic mode flags plus per-mode operation generations reject stale completions |
+| Desktop input | ReCam supports generated/file/camera/RTMP sources | Native `DesktopSource` adapters publish all inputs into one loopback RTMP session |
+| Product transport | CamReplace has H.264, raw and experimental receivers | One release H.264 lane; raw/direct/threaded retained only as diagnostic build sources |
+| Frame ownership | ReCam has per-slot reader/writer state; CamReplace reset states on reconnect | Three-slot reader pins, writer claims, OS writer lease, reader-preserving reconnect and release-last publication |
+| Camera hook | ReCam validates inline-hook targets; CamReplace hooks Camera3 output | Exact reviewed symbols only, `status_t` ABI, original exactly once, unknown ABI pass-through |
+| Codec output | CamReplace decoded using buffer capacity and guessed flexible YUV | Use codec `offset/size`; publish only proven planar/semiplanar layouts |
+| Still photo | CamReplace encodes the current slot | Slot and generation remain pinned across encode; cache key includes generation/sequence/geometry |
+| Microphone consent | CamReplace supplied PCM replacement | Explicit default-OFF lease; no audioserver injection from camera/photo starts |
+| Microphone privacy | Partial virtual delivery could retain HAL bytes | Active hook clears the whole buffer; failure is silence |
+| Resampling | Per-callback fixed-point phase restarted | Per-consumer exact rational phase with one-hour drift regression |
+| RTMP/AVCC | Minimal parser assumed 4-byte NAL lengths | Pointer-width sockets, bounded buffering/AMF, extended timestamps and config-driven 1/2/4-byte lengths |
+| Async operations | UI operations used detached threads | Owned serial executor, joined shutdown, session-scoped cleanup |
+| UI feedback | Each sound used an unowned detached worker | One bounded sound queue with explicit stop/join |
+| Device state | A global prepared flag could cross phones | Per-serial preparation plus explicit active/touched serial registry |
+| Device deployment | Service refresh could happen before validation, cameraserver could restart twice and crash recovery lost ownership | Validate first; one refresh/injection transaction, reconcile cleanup with live service maps and restore displaced camera clients |
+| Security | CamReplace secure channel lacked a meaningful local ticket proof | Ephemeral X25519-derived proof, expiry, stream binding, replay and allocation failure handling |
+| Privilege | Broad SELinux/runtime permissions were possible | Enforcing mode retained; scoped live rules and service-specific ownership |
+| Host privilege | Windows host requested administrator elevation | Run as the invoking user; keep root explicit and device-side only |
+| Child processes | ADB inherited broad handles and retained unbounded output | Explicit inherited-handle list, bounded capture/lines, exception-isolated callbacks and cancellable reader |
+| Tool discovery | Default Windows executable lookup could include current directory | Accept explicit, bundled or absolute PATH FFmpeg only |
+| Packaging | Missing resources became zero-byte placeholders and replacement was non-transactional | Release configure failure, SHA-256 manifest and private atomic verified extraction |
+| JPEG/BLOB | BLOB capacity was calculated as a 2-D image | Enforce height 1 and width-as-bytes before JPEG/trailer writes; release failed mapper locks cleanly |
 
-## Virtual microphone state machine
+## One session, composable features
+
+Camera, photo and microphone are not alternative modes. Camera and photo both
+hold the same video pipeline; microphone holds an independent audio pipeline.
+The controller reference behavior is:
 
 ```text
-OFF (default)
-  phone microphone is untouched
-  no PCM feeder
-  no audioserver injection
-        │ explicit Enable
-        ▼
-ARMING ── failure ──► OFF
-        │ ready marker + PCM channel READY
-        ▼
-ON
-  OBS PCM replaces the complete output buffer
-  missing/short/unknown-format input => silence
-        │ explicit Disable
-        ▼
-OFF
-  stop feeder + clear shared magic
-  loaded hook falls through to the phone microphone
+first feature ON  -> create source/session
+camera or photo   -> acquire/reuse video feeder + forward
+microphone ON     -> separately arm audioserver + PCM feeder
+one feature OFF   -> release only its lease
+last feature OFF  -> stop source/session
 ```
 
-Camera and photo modes never transition the microphone state.
+Rollback checks the leases that existed before a start. A failed photo start,
+for example, cannot disarm a camera session that was already active.
 
-## Remaining engineering limits
+## Rejected approaches
 
-- Both engines depend on private Android camera-service behavior; compatibility
-  is firmware/SoC-specific and unsupported layouts pass through.
-- Enhanced mode is presently arm64 Android plus a Windows x64 host.
-- The enhanced local secure-channel ticket is authenticated with a keyed proof
-  derived from both ephemeral X25519 keys, replacing the historical all-zero
-  signature. It protects handshake integrity and key possession over USB/loopback,
-  but it is deliberately not persistent remote identity authentication.
-- Retaining an enhanced hook mapping until service exit is an intentional safety
-  tradeoff. A service restart/reboot is the complete unload mechanism.
-- Physical-device regression is still required for each Android build family,
-  gralloc layout, camera output format and audio HAL format.
+- two user-selectable engines or a silent fallback runtime;
+- symbol prefix matching or arbitrary private-method signature guesses;
+- treating an arbitrary null ptrace fault as a valid remote return;
+- grayscale synthesis for an unknown YUV layout;
+- resetting all slot reader counts on producer reconnect;
+- detached deployment workers;
+- wiping every authorized USB device on exit;
+- distributable builds with empty embedded binaries;
+- camera startup implicitly enabling microphone replacement.
 
-## Release gates
+## Remaining limits
 
-A release is acceptable only when Python tests, both ring model tests, the
-authenticated-channel handshake/replay/tamper tests, both NDK builds and source
-safety guards pass. Device validation should cover start/stop, service death,
-USB disconnect, device switching, repeated rapid Start/Stop, video underrun,
-audio underrun, audio opt-in/out, portrait/landscape, preview/record/JPEG, and
-recovery after reboot.
+Android camera/audio service internals remain private and firmware-specific.
+The exact symbol list cannot promise support for a future vendor build; failure
+is intentionally pass-through. The supported complete host is Windows x64 and
+the Android payload is ARM64. The local ticket is not persistent device
+identity. CI has no physical phone, so vendor gralloc layouts, repeated service
+restart behavior and actual Audio HAL cadence require the device matrix described
+in [ARCHITECTURE.md](ARCHITECTURE.md).

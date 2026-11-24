@@ -72,8 +72,11 @@ public:
   // --- blocking forms (internal / tests) ----------------------------------
   // These block the calling thread while adb runs; intended for the worker,
   // not the UI. Most callers should prefer run() (async).
-  AdbResult run_sync(const std::vector<std::string>& args, int timeout_ms = 0);
-  AdbResult run_sync_to(const std::string& serial, const std::vector<std::string>& args);
+  // All one-shot commands are bounded. A wedged USB transport must not hold
+  // the global camera lifecycle lock or application shutdown indefinitely.
+  AdbResult run_sync(const std::vector<std::string>& args, int timeout_ms = 30000);
+  AdbResult run_sync_to(const std::string& serial, const std::vector<std::string>& args,
+                        int timeout_ms = 30000);
 
   // --- async form — the normal path ---------------------------------------
   // `on_done` is invoked on the worker thread; marshal to UI yourself.
@@ -108,10 +111,7 @@ public:
   static std::vector<std::string> su_shell(std::string cmd);
 
   // Default args to spawn adb.exe (handy if a sub-system needs raw argv).
-  const std::filesystem::path& adb_path() const noexcept
-  {
-    return adb_path_;
-  }
+  std::filesystem::path adb_path() const;
 
 private:
   AdbClient();
@@ -126,7 +126,9 @@ private:
   };
   void worker_loop();
   void submit(Task t);
+  std::filesystem::path copy_adb_path_() const;
 
+  mutable std::mutex path_mu_;
   std::filesystem::path adb_path_;
   std::thread worker_;
   std::mutex mu_;

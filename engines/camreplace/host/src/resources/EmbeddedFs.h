@@ -6,8 +6,9 @@
 //   %LOCALAPPDATA%\LONG-Virtual-Camera\bin\adb.exe
 //   %LOCALAPPDATA%\LONG-Virtual-Camera\bin\cr_injector
 //   %LOCALAPPDATA%\LONG-Virtual-Camera\bin\libcr_hooks.so
-// Extraction is a no-op if the on-disk file already matches the embedded
-// size — cheap to call every launch.
+// Extraction is a no-op only when the on-disk bytes match the embedded blob.
+// Updates use a unique, flushed sibling and atomic replacement inside a
+// per-user ACL-protected directory.
 
 #include <filesystem>
 #include <string>

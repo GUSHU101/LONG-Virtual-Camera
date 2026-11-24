@@ -31,6 +31,21 @@ namespace cr::source
 class AudioPump
 {
 public:
+  enum class Health : std::uint8_t
+  {
+    Off,
+    Waiting,
+    Ready,
+    Stalled,
+    Unsupported,
+  };
+
+  struct Status
+  {
+    Health health = Health::Off;
+    std::uint64_t bytes_sent = 0;
+  };
+
   struct Config
   {
     int adb_port = 8902; // matches tcp_pcm:listen:8902 on phone
@@ -44,6 +59,7 @@ public:
   {
     return running_.load();
   }
+  Status status() const noexcept;
 
   // Called once per session by RtmpServer when the AAC AudioSpecificConfig
   // arrives (FLV AAC packet type 0). Resets the decoder + sends the PCM
@@ -64,11 +80,13 @@ private:
   void teardown_decoder_();
   void teardown_resampler_();
   void process_(const uint8_t* aac, size_t len, int64_t pts_us);
+  bool ensure_transport_();
   bool send_pcm_header_();
   // Push raw PCM at decoder rate/channels through the resampler MFT,
   // when needed, then ship the output to the phone. Returns true on
   // any successful send.
   bool resample_and_send_(const uint8_t* pcm, size_t bytes);
+  void mark_pcm_sent_(std::size_t bytes) noexcept;
 
   Config cfg_{};
   std::string serial_;
@@ -88,6 +106,8 @@ private:
 
   std::atomic<bool> running_{false};
   std::atomic<uint64_t> bytes_sent_{0};
+  std::atomic<uint64_t> last_pcm_tick_ms_{0};
+  std::atomic<Health> health_{Health::Off};
 };
 
 } // namespace cr::source

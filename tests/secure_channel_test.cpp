@@ -98,7 +98,7 @@ int main()
   assert(!proof_status && proof_status.code == sc::Error::AuthenticationFailed);
 
   auto zero_proof = ticket;
-  std::fill(zero_proof.end() - 64, zero_proof.end(), 0);
+  std::fill(zero_proof.end() - 64, zero_proof.end(), std::uint8_t{0});
   v2::SecureSession rejected_zero;
   const auto zero_status = rejected_zero.initialize(
       v2::Role::Host, {host_private.data(), host_private.size()},

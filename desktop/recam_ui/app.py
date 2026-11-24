@@ -41,6 +41,8 @@ class Job(QObject):
 class Window(QMainWindow):
     _log_line = Signal(str)
     _cameras_found = Signal(list)
+    _devices_found = Signal(object, object)
+    _status_ready = Signal(str, object)
 
     def __init__(self, log_directory=None, log_error=None):
         super().__init__()
@@ -56,11 +58,19 @@ class Window(QMainWindow):
         self._label = ""
         self._prev = None                            # (now_ns, published) for the rate
         self._busy = False
+        self._runtime_serial = None
+        self._job_serial = None
+        self._status_polling = False
+        self._closing = False
 
         self._scanning = False
+        self._device_scanning = False
         self._log_line.connect(self._log)
         self._cameras_found.connect(self._on_cameras)
+        self._devices_found.connect(self._on_devices)
+        self._status_ready.connect(self._on_status)
         self._build()
+        self._set_enabled(True)
         if log_directory:
             self._log(f"Logs: {log_directory}")
         if log_error:
@@ -209,17 +219,43 @@ class Window(QMainWindow):
     # ---------------------------------------------------------------- devices
 
     def refresh_devices(self):
-        self.devices.clear()
-        try:
-            found = Device.list_devices()
-        except Exception as e:
-            self._log(f"adb: {e}")
+        if self._runtime_serial:
+            self._log("stop the active runtime before changing devices")
             return
+        if self._device_scanning:
+            return
+        keep = self.devices.currentText()
+        self._device_scanning = True
+        self._set_enabled(True)
+
+        def scan():
+            try:
+                self._devices_found.emit(Device.list_devices(), None)
+            except Exception as exc:
+                logging.getLogger("recam").exception("Device enumeration failed")
+                self._devices_found.emit(None, str(exc))
+
+        self._pending_device = keep
+        threading.Thread(target=scan, daemon=True).start()
+
+    def _on_devices(self, found, error):
+        self._device_scanning = False
+        if self._closing:
+            return
+        if error:
+            self._log(f"adb: {error}")
+            self._set_enabled(True)
+            return
+        keep = getattr(self, "_pending_device", "")
+        self.devices.clear()
         self.devices.addItems(found)
+        if keep in found:
+            self.devices.setCurrentText(keep)
         self._log(f"{len(found)} device(s)" if found else "no devices; is USB debugging on?")
+        self._set_enabled(True)
 
     def _dev(self, quiet=False):
-        serial = self.devices.currentText()
+        serial = self._runtime_serial or self.devices.currentText()
         if not serial:
             if not quiet:
                 self._log("no device selected")
@@ -233,15 +269,16 @@ class Window(QMainWindow):
 
     # ---------------------------------------------------------------- jobs
 
-    def _start_job(self, fn, label):
+    def _start_job(self, fn, label, serial=None):
         if self._busy:
             self._log("still busy")
-            return
+            return False
         self._busy = True
         self._set_enabled(False)
         self._log(f"{label}…")
 
         self._label = label
+        self._job_serial = serial
         self._thread = QThread(self)
         self._job = Job(fn)
         self._job.moveToThread(self._thread)
@@ -250,23 +287,36 @@ class Window(QMainWindow):
         # lambda would run on the worker and touch widgets from the wrong thread.
         self._job.done.connect(self._job_done)
         self._thread.start()
+        return True
 
     def _job_done(self, ok, msg):
+        label = self._label
+        job_serial = self._job_serial
         self._thread.quit()
         self._thread.wait()
         self._thread.deleteLater()
         self._thread = None
         self._job = None
+        self._job_serial = None
 
         self._busy = False
+        if label == "Stop" and ok and self._runtime_serial == job_serial:
+            self._runtime_serial = None
         self._set_enabled(True)
         for line in (msg or "").splitlines():
             self._log(line)
-        self._log(f"{self._label}: {'ok' if ok else 'FAILED'}")
+        self._log(f"{label}: {'ok' if ok else 'FAILED'}")
+        if label == "Start" and not ok:
+            self._log("device remains locked to this session; press Stop to retry full cleanup")
 
     def _set_enabled(self, on):
-        for w in (self.btn_start, self.btn_stop, self.btn_refresh):
-            w.setEnabled(on)
+        idle = on and not self._busy
+        active = self._runtime_serial is not None
+        ready = idle and not self._device_scanning
+        self.btn_start.setEnabled(ready and not active)
+        self.btn_stop.setEnabled(idle and active)
+        self.btn_refresh.setEnabled(ready and not active)
+        self.devices.setEnabled(ready and not active)
 
     # ---------------------------------------------------------------- actions
 
@@ -337,7 +387,10 @@ class Window(QMainWindow):
                 raise
             return "\n".join(out)
 
-        self._start_job(work, "Start")
+        self._runtime_serial = dev.serial
+        if not self._start_job(work, "Start", dev.serial):
+            self._runtime_serial = None
+            self._set_enabled(True)
 
     def stop(self):
         dev = self._dev()
@@ -349,18 +402,35 @@ class Window(QMainWindow):
             return "streamer, feeder and payload stopped; forward removed"
 
         self._prev = None
-        self._start_job(work, "Stop")
+        self._start_job(work, "Stop", dev.serial)
 
     # ---------------------------------------------------------------- polling
 
     def poll_status(self):
-        if self._busy:
+        if self._busy or self._status_polling or self._closing:
             return
         dev = self._dev(quiet=True)
         if dev is None:
             return
+        self._status_polling = True
 
-        st = dev.status()
+        def read_status():
+            try:
+                status = dev.status()
+            except Exception:
+                logging.getLogger("recam").exception("Status polling failed")
+                status = None
+            self._status_ready.emit(dev.serial, status)
+
+        threading.Thread(target=read_status, daemon=True).start()
+
+    def _on_status(self, serial, st):
+        self._status_polling = False
+        if self._closing:
+            return
+        expected = self._runtime_serial or self.devices.currentText()
+        if serial != expected:
+            return
         if st is None:
             self.lbl_payload.setText("no answer from recam status")
             return
@@ -416,6 +486,7 @@ class Window(QMainWindow):
             e.ignore()
             return
         self._poll.stop()
+        self._closing = True
         try:
             if self.device:
                 shutdown_runtime(self.streamer, self.device, STREAM_PORT)

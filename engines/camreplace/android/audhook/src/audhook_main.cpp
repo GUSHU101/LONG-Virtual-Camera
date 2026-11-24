@@ -1,6 +1,7 @@
 
 
 #include "../../feed/src/audio_shm.h"
+#include "media/PcmResampler.h"
 #include "shadowhook.h"
 
 #include <android/log.h>
@@ -14,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -47,32 +49,86 @@ struct ShmView
   const cr_audio_header* header = nullptr;
   const uint8_t* ring = nullptr;
   size_t size = 0;
-  size_t ring_bytes = 0;
   int fd = -1;
 };
 
 static std::atomic<bool> g_installed{false};
 static ShmView g_shm;
 static std::mutex g_shm_open_mu;
+static std::atomic<bool> g_shm_ready{false};
 
-static bool audio_header_sane(const cr_audio_header* h, size_t map_size)
+struct AudioHeaderSnapshot
 {
+  uint32_t version = 0;
+  uint32_t sample_rate = 0;
+  uint32_t channels = 0;
+  uint32_t bytes_per_sample = 0;
+  uint32_t ring_bytes = 0;
+  uint32_t generation = 0;
+  uint32_t channel_state = CR_CHANNEL_STATE_NONE;
+};
+
+static bool audio_header_snapshot(const cr_audio_header* h, size_t map_size,
+                                  AudioHeaderSnapshot& out)
+{
+  out = {};
   if (!h || map_size < sizeof(cr_audio_header))
     return false;
-  if (h->magic != CR_AUDIO_MAGIC)
-    return false;
-  if (h->bytes_per_sample != 2)
-    return false;
-  if (h->channels == 0 || h->channels > 2)
-    return false;
-  if (h->sample_rate < 8000 || h->sample_rate > 192000)
+  if (__atomic_load_n(&h->magic, __ATOMIC_ACQUIRE) != CR_AUDIO_MAGIC)
     return false;
 
-  const uint32_t ring = h->ring_bytes;
+  AudioHeaderSnapshot snap;
+  snap.version = __atomic_load_n(&h->version, __ATOMIC_ACQUIRE);
+  snap.sample_rate = __atomic_load_n(&h->sample_rate, __ATOMIC_ACQUIRE);
+  snap.channels = __atomic_load_n(&h->channels, __ATOMIC_ACQUIRE);
+  snap.bytes_per_sample =
+      __atomic_load_n(&h->bytes_per_sample, __ATOMIC_ACQUIRE);
+  snap.ring_bytes = __atomic_load_n(&h->ring_bytes, __ATOMIC_ACQUIRE);
+  snap.generation =
+      atomic_load_explicit(&h->generation, memory_order_acquire);
+  snap.channel_state =
+      atomic_load_explicit(&h->channel_state, memory_order_acquire);
+
+  if (snap.version != CR_AUDIO_VERSION || snap.bytes_per_sample != 2 ||
+      snap.generation == 0)
+    return false;
+  if (snap.channels == 0 || snap.channels > 2)
+    return false;
+  if (snap.sample_rate < 8000 || snap.sample_rate > 192000)
+    return false;
+
+  const uint32_t ring = snap.ring_bytes;
   if (ring < 1024 || (ring & 1u) != 0)
     return false;
   const uint64_t needed = (uint64_t) sizeof(cr_audio_header) + (uint64_t) ring;
-  return needed <= map_size;
+  if (needed > map_size)
+    return false;
+
+  // Producers revoke magic before rewriting metadata. Re-read every
+  // publication field so a callback can never combine two generations.
+  const bool stable =
+      __atomic_load_n(&h->magic, __ATOMIC_ACQUIRE) == CR_AUDIO_MAGIC &&
+      __atomic_load_n(&h->version, __ATOMIC_ACQUIRE) == snap.version &&
+      __atomic_load_n(&h->sample_rate, __ATOMIC_ACQUIRE) == snap.sample_rate &&
+      __atomic_load_n(&h->channels, __ATOMIC_ACQUIRE) == snap.channels &&
+      __atomic_load_n(&h->bytes_per_sample, __ATOMIC_ACQUIRE) ==
+          snap.bytes_per_sample &&
+      __atomic_load_n(&h->ring_bytes, __ATOMIC_ACQUIRE) == snap.ring_bytes &&
+      atomic_load_explicit(&h->generation, memory_order_acquire) ==
+          snap.generation;
+  if (!stable)
+    return false;
+  out = snap;
+  return true;
+}
+
+static bool same_audio_generation(const AudioHeaderSnapshot& a,
+                                  const AudioHeaderSnapshot& b)
+{
+  return a.version == b.version && a.sample_rate == b.sample_rate &&
+         a.channels == b.channels &&
+         a.bytes_per_sample == b.bytes_per_sample &&
+         a.ring_bytes == b.ring_bytes && a.generation == b.generation;
 }
 
 static std::vector<void*> g_hook_stubs;
@@ -98,7 +154,7 @@ struct ConsumerProbe
   int64_t first_ns = 0;
   int64_t last_ns = 0;
   int count = 0;
-  size_t period_bytes = 0;
+  uint64_t bytes_after_first = 0;
   ConsumerFormat fmt{0, 0, false};
 };
 
@@ -107,6 +163,7 @@ struct ConsumerState
   ConsumerProbe probe;
   bool prebuffer_ready = false;
   uint64_t consumer_pos = 0;
+  cr::media::PcmResampleClock resample_clock;
 };
 
 static std::mutex g_stream_mu;
@@ -157,37 +214,66 @@ static StdFmt snap_to_standard(uint32_t observed_byte_rate)
 
 static ConsumerFormat probe_observe_locked(void* thiz, size_t got, ConsumerProbe& p)
 {
-  if (p.period_bytes != 0 && p.period_bytes != got)
-  {
-    p = ConsumerProbe{};
-  }
-  p.period_bytes = got;
-
   const int64_t now = monotonic_ns_();
-  if (p.count == 0)
+  auto restart_window = [&]()
+  {
     p.first_ns = now;
+    p.last_ns = now;
+    p.count = 1;
+    p.bytes_after_first = 0;
+  };
+
+  if (p.count == 0)
+  {
+    restart_window();
+    return p.fmt;
+  }
+  // A long pause is a new timing window, but keep the last detected format
+  // until enough fresh callbacks prove a replacement. Variable block sizes
+  // are normal on some AIDL HALs and must not reset probing on every call.
+  if (now <= p.last_ns || now - p.last_ns > 500000000LL ||
+      p.bytes_after_first > UINT64_MAX - static_cast<uint64_t>(got))
+  {
+    restart_window();
+    return p.fmt;
+  }
   p.last_ns = now;
+  p.bytes_after_first += static_cast<uint64_t>(got);
   ++p.count;
 
-  if (!p.fmt.detected && p.count >= 3)
+  if (p.count >= 4)
   {
     const int64_t span = p.last_ns - p.first_ns;
     if (span > 0)
     {
-      const double avg_period_s = (double) span / 1.0e9 / (double) (p.count - 1);
-
-      if (avg_period_s > 0.001 && avg_period_s < 0.5)
+      const double window_s = static_cast<double>(span) / 1.0e9;
+      const double observed = static_cast<double>(p.bytes_after_first) /
+                              window_s;
+      if (window_s > 0.003 && window_s < 8.0 && observed > 0.0 &&
+          observed <= static_cast<double>(UINT32_MAX))
       {
-        const uint32_t br = (uint32_t) ((double) got / avg_period_s);
+        const uint32_t br = static_cast<uint32_t>(observed + 0.5);
         const StdFmt sf = snap_to_standard(br);
         if (sf.sr != 0 && sf.ch != 0)
         {
+          const bool changed = !p.fmt.detected || p.fmt.sample_rate != sf.sr ||
+                               p.fmt.channels != sf.ch;
           p.fmt = {sf.sr, sf.ch, true};
-          LOGI(OBF("audio detect: thiz=%p period=%zuB avg_t=%.2fms byte_rate=%u -> %u Hz / %u ch").c_str(), thiz, got, avg_period_s * 1000.0, br, sf.sr, sf.ch);
+          if (changed)
+          {
+            LOGI(OBF("audio detect: thiz=%p callbacks=%d bytes=%llu window=%.2fms byte_rate=%u -> %u Hz / %u ch").c_str(),
+                 thiz, p.count,
+                 (unsigned long long) p.bytes_after_first,
+                 window_s * 1000.0, br, sf.sr, sf.ch);
+          }
         }
       }
     }
   }
+  // Periodically start a fresh window so a reused stream object can adapt to
+  // a later sample-rate/channel change instead of averaging old history.
+  if (p.count >= 16)
+    restart_window();
   return p.fmt;
 }
 
@@ -206,36 +292,42 @@ static ConsumerState& stream_state_locked(void* key)
   return g_streams[key];
 }
 
-static size_t resample_pcm_s16(const uint8_t* ring, size_t ring_size, uint64_t src_pos_bytes, uint32_t src_sr, uint8_t src_ch, int16_t* dst, size_t dst_frames, uint32_t dst_sr, uint8_t dst_ch)
+static void resample_pcm_s16(const uint8_t* ring, size_t ring_size, uint64_t src_pos_bytes,
+                             uint32_t src_sr, uint8_t src_ch, uint8_t* dst,
+                             size_t dst_frames, uint32_t dst_sr, uint8_t dst_ch,
+                             uint64_t phase)
 {
-  if (src_sr == 0 || dst_sr == 0 || src_ch == 0 || dst_ch == 0)
-    return 0;
-
-  const uint64_t step_q16 = ((uint64_t) src_sr << 16) / (uint64_t) dst_sr;
-
   auto sample_at = [&](uint64_t frame_idx, uint8_t ch) -> int16_t
   {
     const uint64_t off = (src_pos_bytes + frame_idx * (uint64_t) src_ch * 2 + (uint64_t) ch * 2) % ring_size;
-    const uint8_t* p = ring + off;
-    return (int16_t) ((uint16_t) p[0] | ((uint16_t) p[1] << 8));
+    const uint8_t lo = ring[off];
+    const uint8_t hi = ring[(off + 1u) % ring_size];
+    return (int16_t) ((uint16_t) lo | ((uint16_t) hi << 8));
   };
 
-  uint64_t pos_q16 = 0;
+  auto store_s16le = [](uint8_t* out, int16_t sample)
+  {
+    const uint16_t bits = static_cast<uint16_t>(sample);
+    out[0] = static_cast<uint8_t>(bits & 0xffu);
+    out[1] = static_cast<uint8_t>(bits >> 8u);
+  };
+
   for (size_t df = 0; df < dst_frames; ++df)
   {
-    const uint64_t s_idx = pos_q16 >> 16;
-    const uint32_t frac = (uint32_t) (pos_q16 & 0xFFFF);
+    const uint64_t position = phase + (uint64_t) df * src_sr;
+    const uint64_t s_idx = position / dst_sr;
+    const uint64_t frac = position % dst_sr;
 
-    int32_t l = sample_at(s_idx, 0);
-    int32_t l1 = sample_at(s_idx + 1, 0);
-    l = l + (((l1 - l) * (int32_t) frac) >> 16);
+    int64_t l = sample_at(s_idx, 0);
+    const int64_t l1 = sample_at(s_idx + 1, 0);
+    l += ((l1 - l) * (int64_t) frac) / dst_sr;
 
-    int32_t r;
+    int64_t r;
     if (src_ch >= 2)
     {
-      int32_t r0 = sample_at(s_idx, 1);
-      int32_t r1 = sample_at(s_idx + 1, 1);
-      r = r0 + (((r1 - r0) * (int32_t) frac) >> 16);
+      const int64_t r0 = sample_at(s_idx, 1);
+      const int64_t r1 = sample_at(s_idx + 1, 1);
+      r = r0 + ((r1 - r0) * (int64_t) frac) / dst_sr;
     }
     else
     {
@@ -244,25 +336,21 @@ static size_t resample_pcm_s16(const uint8_t* ring, size_t ring_size, uint64_t s
 
     if (dst_ch == 1)
     {
-      dst[df] = (int16_t) l;
+      store_s16le(dst + df * 2u,
+                  static_cast<int16_t>(src_ch >= 2 ? (l + r) / 2 : l));
     }
     else
     {
-      dst[df * 2 + 0] = (int16_t) l;
-      dst[df * 2 + 1] = (int16_t) r;
+      store_s16le(dst + df * 4u, static_cast<int16_t>(l));
+      store_s16le(dst + df * 4u + 2u, static_cast<int16_t>(r));
     }
-
-    pos_q16 += step_q16;
   }
-
-  const uint64_t src_frames = (pos_q16 >> 16) + ((pos_q16 & 0xFFFF) ? 1 : 0);
-  return (size_t) (src_frames * (uint64_t) src_ch * 2);
 }
 
 static int open_shm()
 {
   std::lock_guard<std::mutex> guard(g_shm_open_mu);
-  if (g_shm.header)
+  if (g_shm_ready.load(std::memory_order_acquire))
     return 0;
   int fd = open(OBF("/data/cr/audio").c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0)
@@ -285,9 +373,10 @@ static int open_shm()
     return -1;
   }
   auto* h = (const cr_audio_header*) map;
-  if (!audio_header_sane(h, (size_t) st.st_size))
+  AudioHeaderSnapshot snap;
+  if (!audio_header_snapshot(h, (size_t) st.st_size, snap))
   {
-    LOGW(OBF("bad audio header: magic=0x%x sr=%u ch=%u bps=%u ring=%u").c_str(), h->magic, h->sample_rate, h->channels, h->bytes_per_sample, h->ring_bytes);
+    LOGW(OBF("bad or changing audio header").c_str());
     munmap(map, st.st_size);
     close(fd);
     return -1;
@@ -295,15 +384,16 @@ static int open_shm()
   g_shm.header = h;
   g_shm.ring = (const uint8_t*) map + sizeof(cr_audio_header);
   g_shm.size = (size_t) st.st_size;
-  g_shm.ring_bytes = h->ring_bytes;
   g_shm.fd = fd;
-  LOGI(OBF("shm mapped: sr=%u ch=%u ring=%u (file=%zu bytes)").c_str(), h->sample_rate, h->channels, h->ring_bytes, g_shm.size);
+  g_shm_ready.store(true, std::memory_order_release);
+  LOGI(OBF("shm mapped: sr=%u ch=%u ring=%u (file=%zu bytes)").c_str(),
+       snap.sample_rate, snap.channels, snap.ring_bytes, g_shm.size);
   return 0;
 }
 
 static void try_lazy_open()
 {
-  if (g_shm.header)
+  if (g_shm_ready.load(std::memory_order_acquire))
     return;
   static std::atomic<int> n{0};
   if ((n.fetch_add(1, std::memory_order_relaxed) % 30) == 0)
@@ -312,22 +402,30 @@ static void try_lazy_open()
   }
 }
 
-static bool deliver_pcm_locked(ConsumerState& state, uint8_t* dst, size_t bytes, ConsumerFormat target)
+static bool deliver_pcm_locked(ConsumerState& state, uint8_t* dst, size_t bytes,
+                               ConsumerFormat target,
+                               const AudioHeaderSnapshot& audio)
 {
   const auto* h = g_shm.header;
-  const uint32_t ring = (uint32_t) g_shm.ring_bytes;
+  const uint32_t ring = audio.ring_bytes;
   if (ring < 2u || (ring & 1u) != 0u)
     return false;
-  const uint32_t src_sr = h->sample_rate;
-  const uint8_t src_ch = (uint8_t) h->channels;
-  if (src_sr < 8000 || src_sr > 192000 || src_ch == 0 || src_ch > 2 || h->bytes_per_sample != 2)
+  const uint32_t src_sr = audio.sample_rate;
+  const uint8_t src_ch = static_cast<uint8_t>(audio.channels);
+  if (src_sr < 8000 || src_sr > 192000 || src_ch == 0 || src_ch > 2 ||
+      audio.bytes_per_sample != 2)
   {
     return false;
   }
+  const uint32_t write_sequence = cr_audio_write_sequence(h);
+  if ((write_sequence & 1u) != 0u)
+    return false;
 
-  const uint64_t prebuf = (src_sr && src_ch) ? ((uint64_t) src_sr * src_ch * h->bytes_per_sample) / 10 : 19200ull;
+  const uint64_t prebuf =
+      ((uint64_t) src_sr * src_ch * audio.bytes_per_sample) / 10;
 
-  const uint64_t wp = atomic_load(&h->write_pos);
+  const uint64_t wp =
+      atomic_load_explicit(&h->write_pos, memory_order_acquire);
 
   if (!state.prebuffer_ready)
   {
@@ -335,13 +433,15 @@ static bool deliver_pcm_locked(ConsumerState& state, uint8_t* dst, size_t bytes,
       return false;
     state.prebuffer_ready = true;
     state.consumer_pos = wp - prebuf;
+    state.resample_clock.reset();
   }
 
   uint64_t rp = state.consumer_pos;
 
-  if (rp + ring < wp)
+  if (rp > wp || wp - rp > ring)
   {
     rp = (wp > prebuf) ? (wp - prebuf) : 0;
+    state.resample_clock.reset();
     ++g_stat_underrun;
   }
 
@@ -352,13 +452,23 @@ static bool deliver_pcm_locked(ConsumerState& state, uint8_t* dst, size_t bytes,
 
   if (src_sr == target.sample_rate && src_ch == target.channels)
   {
+    state.resample_clock.reset();
     const uint64_t avail = wp - rp;
-    const size_t copy = (avail < bytes) ? (size_t) avail : bytes;
+    const size_t frame_bytes = static_cast<size_t>(src_ch) * 2u;
+    size_t copy = (avail < bytes) ? static_cast<size_t>(avail) : bytes;
+    copy -= copy % frame_bytes;
+    if (copy == 0)
+      return false;
     const size_t off1 = (size_t) (rp % ring);
     const size_t span1 = (off1 + copy <= ring) ? copy : (ring - off1);
     memcpy(dst, g_shm.ring + off1, span1);
     if (span1 < copy)
       memcpy(dst + span1, g_shm.ring, copy - span1);
+    if (!cr_audio_write_sequence_stable(h, write_sequence))
+    {
+      memset(dst, 0, bytes);
+      return false;
+    }
     state.consumer_pos = rp + copy;
     return true;
   }
@@ -370,37 +480,49 @@ static bool deliver_pcm_locked(ConsumerState& state, uint8_t* dst, size_t bytes,
   if (dst_frames == 0)
     return false;
 
-  const uint64_t src_frames_needed = ((uint64_t) dst_frames * src_sr + target.sample_rate - 1) / target.sample_rate + 1;
-  const uint64_t src_bytes_needed = src_frames_needed * (uint64_t) src_ch * 2;
+  cr::media::PcmResamplePlan plan{};
+  if (!state.resample_clock.plan(dst_frames, src_sr, target.sample_rate, plan))
+    return false;
+  if (plan.source_frames_required > UINT64_MAX / ((uint64_t) src_ch * 2u))
+    return false;
+  const uint64_t src_bytes_needed = plan.source_frames_required * (uint64_t) src_ch * 2u;
   const uint64_t avail = wp - rp;
   if (avail < src_bytes_needed)
   {
     return false;
   }
 
-  const size_t src_consumed = resample_pcm_s16(g_shm.ring, ring, rp, src_sr, src_ch, (int16_t*) dst, dst_frames, target.sample_rate, target.channels);
-
-  const size_t advance = (src_consumed > avail) ? (size_t) avail : src_consumed;
+  resample_pcm_s16(g_shm.ring, ring, rp, src_sr, src_ch, dst,
+                   dst_frames, target.sample_rate, target.channels,
+                   state.resample_clock.phase());
+  if (!cr_audio_write_sequence_stable(h, write_sequence))
+  {
+    memset(dst, 0, bytes);
+    return false;
+  }
+  const uint64_t advance = plan.source_frames_consumed * (uint64_t) src_ch * 2u;
   state.consumer_pos = rp + advance;
+  state.resample_clock.commit(plan);
   g_stat_resampled.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
 static void apply_substitute(void* thiz, uint8_t* buffer, size_t got, const char* path_tag)
 {
-  if (!g_shm.header)
+  if (!g_shm_ready.load(std::memory_order_acquire))
   {
     try_lazy_open();
-    if (!g_shm.header)
+    if (!g_shm_ready.load(std::memory_order_acquire))
       return;
   }
-  if (g_shm.header->magic != CR_AUDIO_MAGIC)
+  AudioHeaderSnapshot gate;
+  if (!audio_header_snapshot(g_shm.header, g_shm.size, gate))
   {
     g_last_seen_gen.store(0, std::memory_order_relaxed);
     stream_clear_all_();
     return;
   }
-  if (atomic_load(&g_shm.header->channel_state) != CR_CHANNEL_STATE_READY)
+  if (gate.channel_state != CR_CHANNEL_STATE_READY)
     return;
 
   // Virtual microphone is explicitly active. Clear the complete real-HAL
@@ -412,15 +534,14 @@ static void apply_substitute(void* thiz, uint8_t* buffer, size_t got, const char
   // From this point forward every failure is fail-closed to silence. A corrupt
   // or concurrently invalidated virtual header must not expose the real-HAL
   // bytes that were returned before this hook ran.
-  if (!audio_header_sane(g_shm.header, g_shm.size))
-    return;
-
-  const uint32_t cur_gen = atomic_load(&g_shm.header->generation);
+  const uint32_t cur_gen = gate.generation;
   const uint32_t prev_gen = g_last_seen_gen.exchange(cur_gen, std::memory_order_relaxed);
   if (prev_gen != 0 && prev_gen != cur_gen)
   {
     stream_clear_all_();
-    LOGI(OBF("format change detected: gen %u -> %u (sr=%u ch=%u bps=%u) - prebuffer + probes reset").c_str(), prev_gen, cur_gen, g_shm.header->sample_rate, g_shm.header->channels, g_shm.header->bytes_per_sample);
+    LOGI(OBF("format change detected: gen %u -> %u (sr=%u ch=%u bps=%u) - prebuffer + probes reset").c_str(),
+         prev_gen, cur_gen, gate.sample_rate, gate.channels,
+         gate.bytes_per_sample);
   }
 
   ConsumerFormat target{};
@@ -431,7 +552,21 @@ static void apply_substitute(void* thiz, uint8_t* buffer, size_t got, const char
     target = probe_observe_locked(thiz, got, state.probe);
     if (!target.detected)
       return;
-    replaced = deliver_pcm_locked(state, buffer, got, target);
+    AudioHeaderSnapshot current;
+    if (!audio_header_snapshot(g_shm.header, g_shm.size, current) ||
+        current.channel_state != CR_CHANNEL_STATE_READY ||
+        !same_audio_generation(gate, current))
+      return;
+    replaced = deliver_pcm_locked(state, buffer, got, target, current);
+
+    AudioHeaderSnapshot after;
+    if (!audio_header_snapshot(g_shm.header, g_shm.size, after) ||
+        after.channel_state != CR_CHANNEL_STATE_READY ||
+        !same_audio_generation(current, after))
+    {
+      memset(buffer, 0, got);
+      replaced = false;
+    }
   }
 
   uint64_t n = ++g_stat_calls;
@@ -439,7 +574,11 @@ static void apply_substitute(void* thiz, uint8_t* buffer, size_t got, const char
   if (n == 1)
   {
     LOGI(OBF("%s first hit: client_bytes=%zu replaced=%d target_sr=%u target_ch=%u producer_sr=%u producer_ch=%u %s").c_str(),
-         path_tag, got, (int) replaced, target.sample_rate, target.channels, g_shm.header->sample_rate, g_shm.header->channels, (target.sample_rate == g_shm.header->sample_rate && target.channels == g_shm.header->channels) ? OBF("(direct memcpy path)").c_str() : OBF("(resample+mux path)").c_str());
+         path_tag, got, (int) replaced, target.sample_rate, target.channels,
+         gate.sample_rate, gate.channels,
+         (target.sample_rate == gate.sample_rate && target.channels == gate.channels)
+             ? OBF("(direct memcpy path)").c_str()
+             : OBF("(resample+mux path)").c_str());
   }
   else if ((n % 250) == 0)
   {
@@ -454,11 +593,40 @@ static int32_t proxy_streamin_read(void* thiz, void* buffer, size_t bytes, size_
 
   if (rc != 0 || !read_out || !buffer)
     return rc;
+  // A HAL must never report more bytes than the caller supplied, but keep a
+  // corrupted/mismatched implementation from turning the privacy overwrite
+  // into an out-of-bounds write. Zero at most the declared destination.
   size_t got = *read_out;
+  if (got > bytes)
+    got = bytes;
   if (got == 0)
     return rc;
 
   apply_substitute(thiz, (uint8_t*) buffer, got, OBF("stream").c_str());
+  return rc;
+}
+
+// Some platform branches expose the same StreamIn wrapper with uint32_t
+// byte-count parameters (`j` in the C++ mangling) instead of size_t (`m`).
+// Keep a distinct proxy: reading a uint32_t* as size_t* on 64-bit Android
+// consumes eight bytes and crosses the caller's object boundary.
+static int32_t proxy_streamin_read_u32(void* thiz, void* buffer,
+                                       unsigned int bytes,
+                                       unsigned int* read_out)
+{
+  SHADOWHOOK_STACK_SCOPE();
+  int32_t rc = SHADOWHOOK_CALL_PREV(proxy_streamin_read_u32, thiz, buffer,
+                                    bytes, read_out);
+
+  if (rc != 0 || !read_out || !buffer)
+    return rc;
+  const size_t got = std::min(static_cast<size_t>(*read_out),
+                              static_cast<size_t>(bytes));
+  if (got == 0)
+    return rc;
+
+  apply_substitute(thiz, static_cast<uint8_t*>(buffer), got,
+                   OBF("stream-u32").c_str());
   return rc;
 }
 
@@ -521,7 +689,7 @@ static void* resolve_addr(const char* lib, const char* sym)
   return addr;
 }
 
-static int try_hook_streamin(const char* lib, const char* sym)
+static int try_hook_streamin(const char* lib, const char* sym, void* proxy)
 {
   void* addr = resolve_addr(lib, sym);
   if (!addr)
@@ -531,7 +699,7 @@ static int try_hook_streamin(const char* lib, const char* sym)
     return 0;
   }
 
-  void* stub = shadowhook_hook_sym_name(lib, sym, (void*) proxy_streamin_read, nullptr);
+  void* stub = shadowhook_hook_sym_name(lib, sym, proxy, nullptr);
   if (stub)
   {
     g_hook_stubs.push_back(stub);
@@ -566,7 +734,11 @@ static int try_hook()
 {
   shadowhook_init(SHADOWHOOK_MODE_SHARED, false);
 
-  auto pass_a_one = [&](const char* lib, const char* sym) { try_hook_streamin(lib, sym); };
+  auto pass_a_one = [&](const char* lib, const char* sym)
+  {
+    try_hook_streamin(lib, sym,
+                      reinterpret_cast<void*>(proxy_streamin_read));
+  };
 
   pass_a_one(OBF("libaudiohal@aidl.so").c_str(), OBF("_ZN7android15StreamInHalAidl4readEPvmPm").c_str());
 
@@ -589,18 +761,20 @@ static int try_hook()
   auto try_streamin_syms = [&](const char* p) -> bool
   {
     bool any = false;
-    auto try_one = [&](const char* sym)
+    auto try_one = [&](const char* sym, void* proxy)
     {
-      if (try_hook_streamin(p, sym) == 0)
+      if (try_hook_streamin(p, sym, proxy) == 0)
         any = true;
     };
-    try_one(OBF("_ZN7android15StreamInHalAidl4readEPvmPm").c_str());
-    try_one(OBF("_ZN7android15StreamInHalHidl4readEPvmPm").c_str());
-    try_one(OBF("_ZN7android16StreamInHalLocal4readEPvmPm").c_str());
+    void* wide = reinterpret_cast<void*>(proxy_streamin_read);
+    void* narrow = reinterpret_cast<void*>(proxy_streamin_read_u32);
+    try_one(OBF("_ZN7android15StreamInHalAidl4readEPvmPm").c_str(), wide);
+    try_one(OBF("_ZN7android15StreamInHalHidl4readEPvmPm").c_str(), wide);
+    try_one(OBF("_ZN7android16StreamInHalLocal4readEPvmPm").c_str(), wide);
 
-    try_one(OBF("_ZN7android15StreamInHalAidl4readEPvjPj").c_str());
-    try_one(OBF("_ZN7android15StreamInHalHidl4readEPvjPj").c_str());
-    try_one(OBF("_ZN7android16StreamInHalLocal4readEPvjPj").c_str());
+    try_one(OBF("_ZN7android15StreamInHalAidl4readEPvjPj").c_str(), narrow);
+    try_one(OBF("_ZN7android15StreamInHalHidl4readEPvjPj").c_str(), narrow);
+    try_one(OBF("_ZN7android16StreamInHalLocal4readEPvjPj").c_str(), narrow);
     return any;
   };
 

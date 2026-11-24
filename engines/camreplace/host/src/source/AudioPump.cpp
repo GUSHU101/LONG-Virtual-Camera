@@ -29,6 +29,20 @@ namespace cr::source
 namespace
 {
 
+class ComCallScope
+{
+public:
+  ComCallScope() noexcept : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+  ~ComCallScope() noexcept
+  {
+    if (result_ == S_OK || result_ == S_FALSE)
+      CoUninitialize();
+  }
+
+private:
+  HRESULT result_;
+};
+
 void emit(const cr::device::DeployCallback& cb, cr::device::DeployStatus::Kind k, std::string step, std::string detail = {})
 {
   if (cb)
@@ -65,7 +79,8 @@ ComPtr<IMFMediaType> make_pcm_type(uint32_t sr, uint32_t ch)
 
 bool AudioPump::start(std::string serial, const Config& cfg, cr::device::DeployCallback cb)
 {
-  if (running_.exchange(true))
+  std::lock_guard<std::mutex> lk(mu_);
+  if (running_.load())
     return false;
   serial_ = std::move(serial);
   cfg_ = cfg;
@@ -73,11 +88,12 @@ bool AudioPump::start(std::string serial, const Config& cfg, cr::device::DeployC
   csd_seen_ = false;
   tx_header_sent_ = false;
   bytes_sent_.store(0);
+  last_pcm_tick_ms_.store(0);
+  health_.store(Health::Off);
 
   if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE)))
   {
     emit(cb_, cr::device::DeployStatus::Kind::Err, "audio: MFStartup failed");
-    running_ = false;
     return false;
   }
   mf_init_ = true;
@@ -85,14 +101,16 @@ bool AudioPump::start(std::string serial, const Config& cfg, cr::device::DeployC
   // Connect to cr_feed_proc's tcp_pcm listener. Retry briefly because the
   // phone may still be coming up after start_software.
   bool connected = false;
-  for (int i = 0; i < 20; ++i)
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+  for (int i = 0; i < 20 && std::chrono::steady_clock::now() < deadline; ++i)
   {
     if (tx_.open(cfg_.adb_port, cr::secure_channel::v2::StreamKind::Audio))
     {
       connected = true;
       break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    if (std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
   }
   if (!connected)
   {
@@ -104,36 +122,66 @@ bool AudioPump::start(std::string serial, const Config& cfg, cr::device::DeployC
       MFShutdown();
       mf_init_ = false;
     }
-    running_ = false;
     return false;
   }
 
+  // Publish the running state only after every callback-visible field, Media
+  // Foundation and the secure tunnel are ready. RTMP callbacks arriving during
+  // startup observe false and drop input instead of racing partial state.
+  running_.store(true);
+  health_.store(Health::Waiting);
   emit(cb_, cr::device::DeployStatus::Kind::Ok, "audio: PCM tunnel ready (waits for OBS audio)");
   return true;
 }
 
 void AudioPump::stop()
 {
-  if (!running_.exchange(false))
-    return;
+  // stop() also runs during UI-thread shutdown. Initialise COM on that caller
+  // before releasing MFT interfaces created on the RTMP MTA worker.
+  ComCallScope com;
+  std::uint64_t sent = 0;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (!running_.exchange(false))
+      return;
     teardown_decoder_();
     teardown_resampler_();
+    tx_.close();
+    tx_header_sent_ = false;
+    if (mf_init_)
+    {
+      MFShutdown();
+      mf_init_ = false;
+    }
+    sent = bytes_sent_.load();
+    health_.store(Health::Off);
   }
-  tx_.close();
-  tx_header_sent_ = false;
-  if (mf_init_)
+  emit(cb_, cr::device::DeployStatus::Kind::Ok, "audio: stopped", "sent " + std::to_string(sent) + " PCM bytes");
+}
+
+AudioPump::Status AudioPump::status() const noexcept
+{
+  Status out{};
+  out.bytes_sent = bytes_sent_.load(std::memory_order_relaxed);
+  if (!running_.load(std::memory_order_acquire))
+    return out;
+  out.health = health_.load(std::memory_order_relaxed);
+  if (out.health == Health::Ready)
   {
-    MFShutdown();
-    mf_init_ = false;
+    const std::uint64_t last = last_pcm_tick_ms_.load(std::memory_order_relaxed);
+    const std::uint64_t now = ::GetTickCount64();
+    if (last != 0 && now > last && now - last > 3000u)
+      out.health = Health::Stalled;
   }
-  emit(cb_, cr::device::DeployStatus::Kind::Ok, "audio: stopped", "sent " + std::to_string(bytes_sent_.load()) + " PCM bytes");
+  return out;
 }
 
 bool AudioPump::ensure_decoder_(const uint8_t* csd, size_t csd_len)
 {
-  if (!csd || csd_len < 2)
+  // AudioSpecificConfig is only a few bytes for AAC-LC/HE-AAC. Bound the
+  // attribute before copying it into MF_MT_USER_DATA so a malformed RTMP
+  // sequence header cannot turn into an unbounded host allocation.
+  if (!csd || csd_len < 2 || csd_len > 64)
     return false;
 
   // Parse AudioSpecificConfig: object_type (5b), sr_idx (4b), channel_cfg (4b).
@@ -296,9 +344,15 @@ void AudioPump::on_aac_csd(const uint8_t* csd, size_t len)
   if (!running_.load())
     return;
   std::lock_guard<std::mutex> lk(mu_);
-  if (!ensure_decoder_(csd, len))
+  if (!running_.load())
     return;
+  if (!ensure_decoder_(csd, len))
+  {
+    health_.store(Health::Unsupported, std::memory_order_relaxed);
+    return;
+  }
   csd_seen_ = true;
+  health_.store(Health::Waiting, std::memory_order_relaxed);
 }
 
 void AudioPump::on_aac_frame(const uint8_t* aac, size_t len, int64_t pts_us)
@@ -306,13 +360,28 @@ void AudioPump::on_aac_frame(const uint8_t* aac, size_t len, int64_t pts_us)
   if (!running_.load() || !aac || !len)
     return;
   std::lock_guard<std::mutex> lk(mu_);
+  if (!running_.load())
+    return;
   if (!csd_seen_ || !dec_)
     return; // wait for CSD
   process_(aac, len, pts_us);
 }
 
+bool AudioPump::ensure_transport_()
+{
+  if (tx_.is_open())
+    return true;
+  if (!running_.load() || !tx_.open(cfg_.adb_port, cr::secure_channel::v2::StreamKind::Audio))
+    return false;
+  tx_header_sent_ = false;
+  cr::log::info("audio", "PCM tunnel reconnected");
+  return true;
+}
+
 bool AudioPump::send_pcm_header_()
 {
+  if (!ensure_transport_())
+    return false;
   if (tx_header_sent_)
     return true;
   if (out_sr_ <= 0 || out_ch_ <= 0)
@@ -328,19 +397,23 @@ bool AudioPump::send_pcm_header_()
 
 bool AudioPump::resample_and_send_(const uint8_t* pcm, size_t bytes)
 {
-  if (!pcm || bytes == 0)
+  if (!pcm || bytes == 0 || bytes > MAXDWORD)
     return false;
   if (!send_pcm_header_())
+  {
+    health_.store(Health::Stalled, std::memory_order_relaxed);
     return false;
+  }
 
   if (!rs_)
   {
     if (tx_.is_open() && tx_.send_pcm(pcm, bytes))
     {
-      bytes_sent_.fetch_add(bytes, std::memory_order_relaxed);
+      mark_pcm_sent_(bytes);
       return true;
     }
     cr::log::warn("audio", "send_pcm failed");
+    health_.store(Health::Stalled, std::memory_order_relaxed);
     return false;
   }
 
@@ -349,11 +422,15 @@ bool AudioPump::resample_and_send_(const uint8_t* pcm, size_t bytes)
     return false;
   BYTE* p = nullptr;
   DWORD ml = 0;
-  if (SUCCEEDED(in_buf->Lock(&p, &ml, nullptr)))
+  if (FAILED(in_buf->Lock(&p, &ml, nullptr)))
+    return false;
+  if (ml < bytes)
   {
-    std::memcpy(p, pcm, bytes);
     in_buf->Unlock();
+    return false;
   }
+  std::memcpy(p, pcm, bytes);
+  in_buf->Unlock();
   in_buf->SetCurrentLength((DWORD) bytes);
 
   ComPtr<IMFSample> in_smp;
@@ -415,12 +492,13 @@ bool AudioPump::resample_and_send_(const uint8_t* pcm, size_t bytes)
     {
       if (tx_.send_pcm(src, cl))
       {
-        bytes_sent_.fetch_add(cl, std::memory_order_relaxed);
+        mark_pcm_sent_(cl);
         any_sent = true;
       }
       else
       {
         cr::log::warn("audio", "send_pcm failed");
+        health_.store(Health::Stalled, std::memory_order_relaxed);
       }
     }
     mbuf->Unlock();
@@ -428,19 +506,32 @@ bool AudioPump::resample_and_send_(const uint8_t* pcm, size_t bytes)
   return any_sent;
 }
 
+void AudioPump::mark_pcm_sent_(std::size_t bytes) noexcept
+{
+  bytes_sent_.fetch_add(bytes, std::memory_order_relaxed);
+  last_pcm_tick_ms_.store(::GetTickCount64(), std::memory_order_relaxed);
+  health_.store(Health::Ready, std::memory_order_release);
+}
+
 void AudioPump::process_(const uint8_t* aac, size_t len, int64_t pts_us)
 {
+  if (len > MAXDWORD)
+    return;
   // Push AAC frame into the decoder.
   ComPtr<IMFMediaBuffer> in_buf;
   if (FAILED(MFCreateMemoryBuffer((DWORD) len, in_buf.GetAddressOf())))
     return;
   BYTE* p = nullptr;
   DWORD ml = 0;
-  if (SUCCEEDED(in_buf->Lock(&p, &ml, nullptr)))
+  if (FAILED(in_buf->Lock(&p, &ml, nullptr)))
+    return;
+  if (ml < len)
   {
-    std::memcpy(p, aac, len);
     in_buf->Unlock();
+    return;
   }
+  std::memcpy(p, aac, len);
+  in_buf->Unlock();
   in_buf->SetCurrentLength((DWORD) len);
 
   ComPtr<IMFSample> in_smp;

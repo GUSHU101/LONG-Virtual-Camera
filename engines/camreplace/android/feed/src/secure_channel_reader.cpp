@@ -4,9 +4,11 @@
 #include <array>
 #include <cstring>
 #include <ctime>
+#include <new>
 #include <fcntl.h>
 #include <android/log.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 extern "C"
@@ -96,12 +98,29 @@ std::uint64_t unix_ms() noexcept
     return 0;
   return static_cast<std::uint64_t>(ts.tv_sec) * 1000 + static_cast<std::uint64_t>(ts.tv_nsec / 1000000);
 }
+
+bool set_timeout(int fd, int option, long seconds) noexcept
+{
+  timeval timeout{};
+  timeout.tv_sec = seconds;
+  return ::setsockopt(fd, SOL_SOCKET, option, &timeout, sizeof(timeout)) == 0;
+}
 } // namespace
 
 bool SecureChannelReader::handshake(int socket_fd, cr::secure_channel::v2::StreamKind stream) noexcept
 {
+  try
+  {
   wipe();
   socket_fd_ = socket_fd;
+  // A peer that connects but never completes SCT2 must not monopolise the
+  // single accept loop forever.
+  if (!set_timeout(socket_fd_, SO_RCVTIMEO, 5) ||
+      !set_timeout(socket_fd_, SO_SNDTIMEO, 5))
+  {
+    wipe();
+    return false;
+  }
   std::array<std::uint8_t, 32> private_key{};
   std::array<std::uint8_t, 32> public_key{};
   std::array<std::uint8_t, 24> nonce{};
@@ -145,10 +164,24 @@ bool SecureChannelReader::handshake(int socket_fd, cr::secure_channel::v2::Strea
     wipe();
     return false;
   }
+  // Keep an application timeout as well. A paused publisher reconnects on its
+  // next media block; an abandoned authenticated socket cannot hold the only
+  // feed accept slot indefinitely.
+  if (!set_timeout(socket_fd_, SO_RCVTIMEO, 30))
+  {
+    wipe();
+    return false;
+  }
   return true;
+  }
+  catch (const std::bad_alloc&)
+  {
+    wipe();
+    return false;
+  }
 }
 
-bool SecureChannelReader::receive_record_(std::vector<std::uint8_t>& record) noexcept
+bool SecureChannelReader::receive_record_(std::vector<std::uint8_t>& record)
 {
   std::array<std::uint8_t, cr::secure_channel::v2::kRecordHeaderBytes> header{};
   if (socket_fd_ < 0 || !recv_all(socket_fd_, header.data(), header.size()))
@@ -163,6 +196,8 @@ bool SecureChannelReader::receive_record_(std::vector<std::uint8_t>& record) noe
 
 bool SecureChannelReader::read_exact(void* output, std::size_t bytes) noexcept
 {
+  try
+  {
   auto* out = static_cast<std::uint8_t*>(output);
   while (bytes)
   {
@@ -187,6 +222,12 @@ bool SecureChannelReader::read_exact(void* output, std::size_t bytes) noexcept
     bytes -= take;
   }
   return true;
+  }
+  catch (const std::bad_alloc&)
+  {
+    wipe();
+    return false;
+  }
 }
 
 void SecureChannelReader::wipe() noexcept

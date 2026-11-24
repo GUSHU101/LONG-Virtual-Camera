@@ -1,16 +1,7 @@
 #pragma once
 
-// TCP streaming client — sends NV21 frames from the PC to cr_feed_proc
-// running on the phone, via `adb forward tcp:PORT tcp:PORT`.
-// Wire format matches android/feed/src/tcp_feed.cpp:
-//   header:     uint32 'CRTP', uint32 width, uint32 height, uint32 fps
-//   per frame:  width*height*3/2 bytes of NV21
-// Typical usage:
-//   TcpFeedClient c;
-//   c.open(8901);
-//   c.send_header(1280, 720, 30);
-//   for each frame : c.send_frame(nv21.data(), nv21.size());
-//   c.close();
+// Authenticated TCP streaming client for the one H.264 video lane and the
+// explicit opt-in PCM audio lane, both carried through adb loopback forwards.
 
 #include <cstddef>
 #include <cstdint>
@@ -26,21 +17,13 @@ class TcpFeedClient
 public:
   // Magic constants matching the Android receivers; exposed so tests can
   // validate headers without peeking into the private cpp.
-  //   kMagic      — raw NV21 stream (tcp_feed.cpp)
   //   kMagicH264  — H.264 Annex-B stream (tcp_h264_feed.cpp)
-  static constexpr uint32_t kMagic = 0x50545243u;     // 'CRTP' LE
   static constexpr uint32_t kMagicH264 = 0x32484243u; // 'CRH2' LE
   static constexpr uint32_t kMagicPcm = 0x55415243u;  // 'CRAU' LE — PCM stream
 
   // Connect to 127.0.0.1:port. Assumes `adb forward tcp:port tcp:port`
   // has already been set up by the caller. Returns true on success.
   bool open(int port, cr::secure_channel::v2::StreamKind stream_kind);
-
-  // --- raw NV21 protocol ------------------------------------------------
-  // Send the NV21 stream header. Call exactly once after open().
-  bool send_header(int width, int height, int fps);
-  // Send one NV21 frame. `bytes` must equal width*height*3/2.
-  bool send_frame(const void* data, std::size_t bytes);
 
   // --- H.264 Annex-B protocol ------------------------------------------
   // Stream header (magic CRH2, width, height, fps). Once per session.
