@@ -194,6 +194,28 @@ class LsposedModuleContractTests(unittest.TestCase):
                         activity.index("startActivityForResult(intent, requestCode)"))
         self.assertIn("outState.putBoolean(PICKER_OPEN, documentPickerOpen)", activity)
 
+    def test_scope_health_requires_current_system_server(self) -> None:
+        activity = (MODULE / "java/com/gushu/longvc/MainActivity.java").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"system_server".equals(process)', activity)
+        self.assertIn('"android".equals(process) || "system".equals(process)', activity)
+        self.assertIn("target.getUid() != android.os.Process.SYSTEM_UID", activity)
+        self.assertIn("case UP_TO_DATE -> R.string.scope_running", activity)
+        self.assertIn("case STALE -> R.string.scope_stale", activity)
+        self.assertIn("framework_unbound, getPackageName()", activity)
+
+    def test_install_verifies_before_disarming_rollback(self) -> None:
+        installer = (MODULE / "java/com/gushu/longvc/PayloadInstaller.java").read_text(
+            encoding="utf-8"
+        )
+        commit = installer.split("private void commit(", 1)[1]
+        self.assertLess(commit.index("appendInstalledChecks(command, expected)"),
+                        commit.index("trap - EXIT HUP INT TERM; echo committed"))
+        self.assertNotIn('rm -rf \\"$backup\\"', commit)
+        cleanup = installer.split("private void discardStage(", 1)[1]
+        self.assertIn("catch (IOException cleanupFailure)", cleanup)
+
     def test_injector_discovers_services_by_executable(self) -> None:
         source = (ROOT / "engines/camreplace/android/injector/src/ptrace_arm64.cpp"
                   ).read_text(encoding="utf-8")

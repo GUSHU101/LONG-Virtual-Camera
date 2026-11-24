@@ -6,6 +6,7 @@ import java.util.Map;
 final class RuntimeState {
     final boolean root;
     final boolean installed;
+    final boolean controllerVerified;
     final String sourceMode;
     final String visualMode;
     final String audioMode;
@@ -34,6 +35,7 @@ final class RuntimeState {
         this.values = new LinkedHashMap<>(values);
         this.root = flag(values, "root");
         this.installed = flag(values, "installed");
+        this.controllerVerified = flag(values, "controller_verified");
         this.sourceMode = values.getOrDefault("source_mode", "unknown");
         this.visualMode = values.getOrDefault("visual_mode", "local");
         this.audioMode = values.getOrDefault("audio_mode", "local");

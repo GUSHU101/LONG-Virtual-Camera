@@ -5,7 +5,7 @@
     <string name="title">LONG Virtual Camera</string>
     <string name="subtitle">一个 system 作用域 · 一条全局原生替换链路</string>
     <string name="scope_title">LSPosed 系统层</string>
-    <string name="scope_hint">作用域只需勾选 system，不需要勾选任何单独 App。system 负责模块激活；所有 App 的相机调用统一由 cameraserver 原生链路处理。</string>
+    <string name="scope_hint">在管理器中按上方包名启用模块，作用域选择 system。模块加载状态与相机是否实际显示替换画面分别检查。</string>
     <string name="scope_button">仅申请 system 作用域</string>
     <string name="root_title">Root 控制平面</string>
     <string name="root_not_checked">Root：尚未检查</string>
@@ -14,6 +14,7 @@
     <string name="source_title">手机端媒体源</string>
     <string name="source_hint">本地文件和 OBS 都进入同一套原生解码、共享内存与系统服务 hook；它们只是输入来源，不是两套替换模式。</string>
     <string name="source_not_configured">尚未配置输入源</string>
+    <string name="source_controller_mismatch">当前 APK 与手机上的控制脚本不匹配，无法确认媒体来源。请在本版本点击“校验并安装载荷”。</string>
     <string name="source_independent_status">画面来源：%1$s\n麦克风替换来源：%2$s</string>
     <string name="select_video">选择本地视频</string>
     <string name="select_image">选择本地图片</string>
@@ -25,7 +26,7 @@
     <string name="configure_obs">启用 OBS / 重新生成密钥</string>
     <string name="copy_obs">复制 OBS 服务器与推流密钥</string>
     <string name="global_camera">全局摄像头替换</string>
-    <string name="global_camera_hint">开启后注入唯一 cameraserver 链路，系统 CameraService 的所有客户端共享替换结果。</string>
+    <string name="global_camera_hint">在受支持的 CameraService 输出缓冲区上处理画面。预览、录像和拍照可使用不同输出路径。</string>
     <string name="photo_replace">照片输出替换</string>
     <string name="photo_replace_hint">与全局相机共享同一个视频 feeder 和 hook，不启动第二套引擎。</string>
     <string name="microphone_replace">虚拟麦克风（可选）</string>
@@ -37,9 +38,20 @@
     <string name="source_notice">本项目运行时只有手机端 LSPosed 模块 APK。电脑端无需安装 LONG 客户端；使用直播时，OBS 直接向手机推送 RTMP。</string>
     <string name="authorized_notice">仅用于你拥有或明确获准测试的设备。系统服务注入存在固件兼容风险，请先备份并保留可恢复环境。</string>
     <string name="framework_checking">LSPosed：正在检查…</string>
-    <string name="framework_unbound">LSPosed：未绑定现代 API 服务；请启用模块并只勾选 system 后重启</string>
+    <string name="framework_unbound">当前包：%1$s\nLSPosed 尚未向这个包提供服务。请在管理器中核对包名、模块开关与 system 作用域。</string>
+    <string name="framework_detail">当前包：%1$s\n%2$s API %3$d · %4$s</string>
+    <string name="framework_target_detail">当前包：%1$s\n%2$s API %3$d · %4$s\n框架目标：%5$s · PID %6$d</string>
+    <string name="framework_query_failed">当前包：%1$s\n读取 LSPosed 状态失败：%2$s</string>
+    <string name="scope_no_capability">框架未报告 system 能力</string>
+    <string name="scope_not_granted">可申请 system 作用域</string>
+    <string name="scope_target_unknown">已勾选 system；当前 API 无法确认运行目标</string>
+    <string name="scope_waiting_system">已勾选 system；框架尚未报告 system_server 加载状态</string>
+    <string name="scope_running">system_server 已加载当前模块</string>
+    <string name="scope_stale">system_server 仍加载旧版模块；需重启后确认</string>
+    <string name="scope_reloading">system_server 正在更新模块</string>
+    <string name="scope_reload_failed">system_server 模块更新失败；请查看管理器日志</string>
     <string name="operation_failed">操作失败：%1$s</string>
     <string name="recovery_verified">紧急恢复已验证完成。\n%1$s</string>
-    <string name="scope_approved">system 作用域已批准：%1$s</string>
+    <string name="scope_approved">%1$s 的 system 作用域已批准。系统层进程的加载状态见上方。</string>
     <string name="scope_failed">system 作用域申请失败：%1$s</string>
 </resources>

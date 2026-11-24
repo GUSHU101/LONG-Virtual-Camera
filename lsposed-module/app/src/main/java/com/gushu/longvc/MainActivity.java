@@ -25,6 +25,7 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 
 import io.github.libxposed.service.XposedService;
+import io.github.libxposed.service.HookedTarget;
 
 public final class MainActivity extends Activity
         implements LongVcApplication.ServiceStateListener {
@@ -58,6 +59,7 @@ public final class MainActivity extends Activity
     private boolean busy;
     private boolean emergencyBusy;
     private boolean documentPickerOpen;
+    private boolean canRequestSystemScope;
     private boolean destroyed;
     private long operationGeneration;
     private RuntimeState lastState;
@@ -117,8 +119,10 @@ public final class MainActivity extends Activity
         installButton.setOnClickListener(view -> runOperation("正在校验并安装 ARM64 载荷…",
                 rootController::installAndReadStatus));
         stopButton.setOnClickListener(view -> runEmergencyStop());
-        refreshButton.setOnClickListener(view -> runOperation("正在读取运行状态…",
-                rootController::requestRootAndReadStatus));
+        refreshButton.setOnClickListener(view -> {
+            renderFramework();
+            runOperation("正在读取运行状态…", rootController::requestRootAndReadStatus);
+        });
         scopeButton.setOnClickListener(view -> requestSystemScope());
         selectVideoButton.setOnClickListener(view -> selectDocument("video/*", PICK_VIDEO));
         selectImageButton.setOnClickListener(view -> selectDocument("image/*", PICK_IMAGE));
@@ -290,16 +294,16 @@ public final class MainActivity extends Activity
 
     private void requestSystemScope() {
         XposedService service = xposedService;
-        if (service == null) {
-            Toast.makeText(this, "尚未连接现代 LSPosed 服务", Toast.LENGTH_LONG).show();
-            return;
-        }
-        service.requestScope(Collections.singletonList("system"),
+        if (service == null || !canRequestSystemScope) return;
+        try {
+            service.requestScope(Collections.singletonList("system"),
                 new XposedService.OnScopeEventListener() {
                     @Override
                     public void onScopeRequestApproved(java.util.List<String> approved) {
                         runOnUiThreadIfAlive(() -> {
-                            operationLog.setText(getString(R.string.scope_approved, approved));
+                            operationLog.setText(approved.contains("system")
+                                    ? getString(R.string.scope_approved, getPackageName())
+                                    : getString(R.string.scope_failed, approved));
                             renderFramework();
                         });
                     }
@@ -310,6 +314,10 @@ public final class MainActivity extends Activity
                                 getString(R.string.scope_failed, message)));
                     }
                 });
+        } catch (RuntimeException error) {
+            operationLog.setText(getString(R.string.scope_failed, safeMessage(error)));
+            renderFramework();
+        }
     }
 
     private void renderState(RuntimeState state) {
@@ -351,7 +359,7 @@ public final class MainActivity extends Activity
         // Emergency recovery remains actionable during a long media import.
         stopButton.setEnabled(!emergencyBusy && rootReady);
         refreshButton.setEnabled(!blocked);
-        scopeButton.setEnabled(!blocked && xposedService != null);
+        scopeButton.setEnabled(!blocked && canRequestSystemScope);
         selectVideoButton.setEnabled(!blocked && rootReady);
         selectImageButton.setEnabled(!blocked && rootReady);
         selectAudioButton.setEnabled(!blocked && rootReady);
@@ -364,6 +372,11 @@ public final class MainActivity extends Activity
     private void renderSource(RuntimeState state) {
         if (state == null || !state.root) {
             sourceStatus.setText(R.string.source_not_configured);
+            obsConfiguration.setText(R.string.obs_not_configured);
+            return;
+        }
+        if (!state.controllerVerified) {
+            sourceStatus.setText(R.string.source_controller_mismatch);
             obsConfiguration.setText(R.string.obs_not_configured);
             return;
         }
@@ -382,28 +395,62 @@ public final class MainActivity extends Activity
 
     private void renderFramework() {
         XposedService service = xposedService;
+        canRequestSystemScope = false;
         if (service == null) {
-            frameworkStatus.setText(R.string.framework_unbound);
+            frameworkStatus.setText(getString(R.string.framework_unbound, getPackageName()));
             renderControls();
             return;
         }
-        boolean systemScope = service.getScope().contains("system");
-        boolean running = false;
-        if (service.getApiVersion() >= 102) {
-            for (var target : service.getRunningTargets()) {
-                String process = target.getProcessName();
-                if ("system_server".equals(process) || "system".equals(process)
-                        || "android".equals(process)) {
-                    running = true;
-                    break;
+        try {
+            int api = service.getApiVersion();
+            boolean systemCap = (service.getFrameworkProperties() & XposedService.PROP_CAP_SYSTEM) != 0L;
+            boolean scoped = service.getScope().contains("system");
+            canRequestSystemScope = systemCap && !scoped;
+            int status = R.string.scope_no_capability;
+            HookedTarget systemTarget = null;
+            if (systemCap && !scoped) {
+                status = R.string.scope_not_granted;
+            } else if (systemCap) {
+                status = R.string.scope_target_unknown;
+                if (service.getApiVersion() >= 102) {
+                    status = R.string.scope_waiting_system;
+                    for (HookedTarget target : service.getRunningTargets()) {
+                        String process = target.getProcessName();
+                        if (target.getUid() != android.os.Process.SYSTEM_UID
+                                || target.getPid() <= 0) continue;
+                        if ("system_server".equals(process)) {
+                            systemTarget = target;
+                            break;
+                        }
+                        // Some frameworks expose the Android system package
+                        // or scope alias as the process name in this snapshot.
+                        if ("android".equals(process) || "system".equals(process)) {
+                            systemTarget = target;
+                        }
+                    }
+                    if (systemTarget != null) {
+                        status = switch (systemTarget.getState()) {
+                            case UP_TO_DATE -> R.string.scope_running;
+                            case STALE -> R.string.scope_stale;
+                            case RELOADING -> R.string.scope_reloading;
+                            case FAILED -> R.string.scope_reload_failed;
+                        };
+                        frameworkStatus.setText(getString(R.string.framework_target_detail,
+                                getPackageName(), service.getFrameworkName(), api,
+                                getString(status), systemTarget.getProcessName(),
+                                systemTarget.getPid()));
+                        renderControls();
+                        return;
+                    }
                 }
             }
+            frameworkStatus.setText(getString(R.string.framework_detail,
+                    getPackageName(), service.getFrameworkName(), api, getString(status)));
+        } catch (RuntimeException error) {
+            canRequestSystemScope = false;
+            frameworkStatus.setText(getString(R.string.framework_query_failed,
+                    getPackageName(), safeMessage(error)));
         }
-        boolean systemCap = (service.getFrameworkProperties() & XposedService.PROP_CAP_SYSTEM) != 0L;
-        frameworkStatus.setText(String.format(Locale.ROOT,
-                "LSPosed：%s API %d · system 能力：%s · system 作用域：%s · 系统层进程：%s",
-                service.getFrameworkName(), service.getApiVersion(), yesNo(systemCap),
-                yesNo(systemScope), yesNo(running)));
         renderControls();
     }
 
@@ -423,7 +470,7 @@ public final class MainActivity extends Activity
         if (!state.cameraHookReady) return "等待 cameraserver hook";
         if (!state.videoChannelReady) return state.visualUsesObs()
                 ? "等待 OBS H.264 视频帧" : "等待本地视频帧";
-        return "READY";
+        return "载荷已接入且有输入帧，实际画面需在相机中确认";
     }
 
     private static String microphoneState(RuntimeState state) {
@@ -519,10 +566,6 @@ public final class MainActivity extends Activity
         String message = error.getMessage();
         if (message == null || message.isBlank()) message = error.getClass().getSimpleName();
         return message.length() > 1600 ? message.substring(0, 1600) + "…" : message;
-    }
-
-    private static String yesNo(boolean value) {
-        return value ? "是" : "否";
     }
 
     @FunctionalInterface

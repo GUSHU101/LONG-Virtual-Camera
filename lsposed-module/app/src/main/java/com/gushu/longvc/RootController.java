@@ -108,7 +108,9 @@ final class RootController {
         RootShell.Result result = shell.execute(command, 15L);
         if (!result.ok()) return RuntimeState.noRoot(result.describe());
         boolean hashesCurrent = installer.isCurrent();
-        return RuntimeState.parse(result.output + "\ninstalled=" + (hashesCurrent ? "1" : "0"));
+        return RuntimeState.parse(result.output
+                + "\ninstalled=" + (hashesCurrent ? "1" : "0")
+                + "\ncontroller_verified=" + (scriptCurrent ? "1" : "0"));
     }
 
     private RuntimeState replaceSource(SourceMutation mutation)

@@ -3,6 +3,7 @@ package com.gushu.longvc;
 import android.content.Context;
 import android.content.res.AssetManager;
 import android.os.Build;
+import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -34,18 +35,18 @@ final class PayloadInstaller {
 
     boolean isCurrent() throws IOException, InterruptedException {
         Map<String, Entry> expected = readManifest();
-        StringBuilder command = new StringBuilder();
-        command.append("set -e; ");
+        StringBuilder command = new StringBuilder("set -e; ");
+        appendInstalledChecks(command, expected);
+        command.append("echo current");
+        RootShell.Result result = shell.execute(command.toString(), 15L);
+        return result.ok() && hasLine(result, "current");
+    }
+
+    private static void appendInstalledChecks(StringBuilder command,
+                                               Map<String, Entry> expected)
+            throws IOException {
         for (String name : FILES) {
-            Entry entry = requireEntry(expected, name);
-            String remote = REMOTE_ROOT + name;
-            command.append("[ -f '").append(remote).append("' ]; ")
-                    .append("[ \"$(wc -c < '").append(remote).append("' | tr -d ' ')\" = '")
-                    .append(entry.size).append("' ]; ")
-                    .append("h=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum '")
-                    .append(remote).append("'; else toybox sha256sum '").append(remote)
-                    .append("'; fi | awk '{print $1}'); ")
-                    .append("[ \"$h\" = '").append(entry.hash).append("' ]; ");
+            appendEntryCheck(command, REMOTE_ROOT + name, requireEntry(expected, name));
         }
         command.append("[ -x '").append(REMOTE_ROOT).append("cr_injector' ]; ")
                 .append("[ -x '").append(REMOTE_ROOT).append("cr_feed_proc' ]; ")
@@ -53,9 +54,17 @@ final class PayloadInstaller {
                 .append("[ -x '").append(REMOTE_SCRIPT).append("' ]; ")
                 .append("if [ \"$(getenforce 2>/dev/null)\" = Enforcing ]; then ")
                 .append("ls -Z '").append(REMOTE_ROOT).append("libcr_hooks.so' 2>/dev/null | ")
-                .append("grep -q 'u:object_r:system_file:s0'; fi; echo current");
-        RootShell.Result result = shell.execute(command.toString(), 15L);
-        return result.ok() && result.output.contains("current");
+                .append("grep -q 'u:object_r:system_file:s0'; fi; ");
+    }
+
+    private static void appendEntryCheck(StringBuilder command, String remote, Entry entry) {
+        command.append("[ -f '").append(remote).append("' ]; ")
+                .append("[ \"$(wc -c < '").append(remote).append("' | tr -d ' ')\" = '")
+                .append(entry.size).append("' ]; ")
+                .append("h=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum '")
+                .append(remote).append("'; else toybox sha256sum '").append(remote)
+                .append("'; fi | awk '{print $1}'); ")
+                .append("[ \"$h\" = '").append(entry.hash).append("' ]; ");
     }
 
     boolean isControlScriptCurrent() throws IOException, InterruptedException {
@@ -78,23 +87,26 @@ final class PayloadInstaller {
             if (!isRemoteEntryCurrent(staged, script, false)) {
                 throw new IOException("recovery control script failed device-side verification");
             }
-            String command = "set -e; backup='" + staged + ".backup'; "
+            StringBuilder command = new StringBuilder("set -e; backup='" + staged + ".backup'; "
                     + "had_old=0; if [ -e '" + REMOTE_SCRIPT + "' ]; then "
                     + "cp -p '" + REMOTE_SCRIPT + "' \"$backup\"; had_old=1; fi; "
                     + "rollback() { if [ \"$had_old\" = 1 ]; then cp -p \"$backup\" '"
                     + REMOTE_SCRIPT + "'; else rm -f '" + REMOTE_SCRIPT + "'; fi; }; "
-                    + "trap rollback EXIT; trap 'rollback; exit 1' HUP INT TERM; "
+                    + "trap rollback EXIT; trap 'exit 1' HUP INT TERM; "
                     + "mv -f '" + staged + "' '" + REMOTE_SCRIPT + "'; "
                     + "chown 0:0 '" + REMOTE_SCRIPT + "'; chmod 0755 '" + REMOTE_SCRIPT + "'; "
-                    + "trap - EXIT HUP INT TERM; rm -f \"$backup\"; echo control-ready";
-            RootShell.Result result = shell.execute(command, 15L);
+                    + "[ -x '" + REMOTE_SCRIPT + "' ]; ");
+            appendEntryCheck(command, REMOTE_SCRIPT, script);
+            command.append("trap - EXIT HUP INT TERM; echo control-ready");
+            RootShell.Result result = shell.execute(command.toString(), 15L);
             requireOk("repair recovery control script", result);
-            if (!result.output.contains("control-ready")
-                    || !isRemoteEntryCurrent(REMOTE_SCRIPT, script, true)) {
+            if (!hasLine(result, "control-ready")) {
                 throw new IOException("recovery control script failed post-commit verification");
             }
+            discardStage("rm -f '" + staged + ".backup'");
         } finally {
-            shell.execute("rm -f '" + staged + "' '" + staged + ".backup' 2>/dev/null; true", 10L);
+            // The backup could be the only intact old controller after a failed rollback.
+            discardStage("rm -f '" + staged + "'");
         }
     }
 
@@ -121,13 +133,12 @@ final class PayloadInstaller {
             commitStarted = true;
             commit(stage, expected);
             commitCompleted = true;
-            if (!isCurrent()) throw new IOException("installed payload failed post-commit hash verification");
         } finally {
             // A failed commit may have left its only recoverable backup under
             // the stage. Keep it for manual repair; pre-commit failures and a
             // fully verified commit are safe to clean automatically.
             if (!commitStarted || commitCompleted) {
-                shell.execute("rm -rf '" + stage + "' 2>/dev/null; true", 10L);
+                discardStage("rm -rf '" + stage + "'");
             }
         }
     }
@@ -145,14 +156,7 @@ final class PayloadInstaller {
             throws IOException, InterruptedException {
         StringBuilder command = new StringBuilder("set -e; ");
         for (String name : FILES) {
-            Entry entry = requireEntry(expected, name);
-            String remote = stage + "/" + name;
-            command.append("[ \"$(wc -c < '").append(remote).append("' | tr -d ' ')\" = '")
-                    .append(entry.size).append("' ]; ")
-                    .append("h=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum '")
-                    .append(remote).append("'; else toybox sha256sum '").append(remote)
-                    .append("'; fi | awk '{print $1}'); ")
-                    .append("[ \"$h\" = '").append(entry.hash).append("' ]; ");
+            appendEntryCheck(command, stage + "/" + name, requireEntry(expected, name));
         }
         command.append("echo verified");
         RootShell.Result result = shell.execute(command.toString(), 30L);
@@ -192,20 +196,32 @@ final class PayloadInstaller {
                 + "  chcon u:object_r:system_file:s0 '" + REMOTE_ROOT + "libcr_hooks.so' || "
                 + "    [ \"$(getenforce 2>/dev/null)\" != Enforcing ]; "
                 + "else [ \"$(getenforce 2>/dev/null)\" != Enforcing ]; fi; ");
-        for (String name : FILES) {
-            Entry entry = requireEntry(expected, name);
-            String remote = REMOTE_ROOT + name;
-            command.append("[ \"$(wc -c < '").append(remote)
-                    .append("' | tr -d ' ')\" = '").append(entry.size).append("' ]; ")
-                    .append("h=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum '")
-                    .append(remote).append("'; else toybox sha256sum '").append(remote)
-                    .append("'; fi | awk '{print $1}'); [ \"$h\" = '")
-                    .append(entry.hash).append("' ]; ");
-        }
-        command.append("trap - EXIT HUP INT TERM; rm -rf \"$backup\"; echo committed");
+        // Keep the rollback trap armed through the same checks used by isCurrent().
+        // The caller removes the stage and backup only after the shell confirms.
+        appendInstalledChecks(command, expected);
+        command.append("trap - EXIT HUP INT TERM; echo committed");
         RootShell.Result result = shell.execute(command.toString(), 30L);
         requireOk("commit payload; recovery stage=" + stage, result);
-        if (!result.output.contains("committed")) throw new IOException("payload commit did not finish");
+        if (!hasLine(result, "committed")) throw new IOException("payload commit did not finish");
+    }
+
+    private void discardStage(String command) {
+        if (Thread.currentThread().isInterrupted()) return;
+        try {
+            RootShell.Result result = shell.execute(command, 10L);
+            if (!result.ok()) Log.w("LongVcInstaller", "Payload cleanup did not complete");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (IOException cleanupFailure) {
+            Log.w("LongVcInstaller", "Payload cleanup could not start", cleanupFailure);
+        }
+    }
+
+    private static boolean hasLine(RootShell.Result result, String expected) {
+        for (String line : result.output.split("\\R")) {
+            if (expected.equals(line.trim())) return true;
+        }
+        return false;
     }
 
     private void quiesceRuntime(String stage) throws IOException, InterruptedException {
