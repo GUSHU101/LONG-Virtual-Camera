@@ -35,6 +35,10 @@ python tests/verify_apk.py lsposed-module/app/build/outputs/apk/debug/app-debug.
 
 Windows 开发机可用 `lsposed-module\gradlew.bat` 执行相同 Gradle 任务，输出仍然是 Android APK。正式发布要求配置项目的 Android 签名密钥。CI 的开发包使用独立的应用 ID。载荷清单会核验 APK 内的文件大小、SHA-256 与 ARM64 ELF 架构。
 
+在 GitHub Actions 手动运行 **Release APK** 时，保持 `publish` 关闭即可生成可安装的开发版 APK 和 SHA-256 校验文件，从该次运行的 Artifacts 下载。开发版使用 CI 调试签名，已有不同签名的同包名 APK 无法覆盖安装。
+
+勾选 `publish` 或推送版本标签会走正式发布。提前在仓库的 **Settings → Secrets and variables → Actions** 配置 `LONGVC_ANDROID_KEYSTORE_BASE64`、`LONGVC_ANDROID_KEYSTORE_PASSWORD`、`LONGVC_ANDROID_KEY_ALIAS`、`LONGVC_ANDROID_KEY_PASSWORD`。正式版更新必须继续使用同一签名密钥。
+
 当前测试覆盖桌面端移除、APK 契约、恢复故障注入和原生像素布局。设备上的相机、麦克风以及 OBS 全链路仍需在对应固件实测。
 
 [模块操作说明](docs/LSPOSED-ROOT-MODULE.md) · [架构](docs/ARCHITECTURE.md) · [上游代码审计](docs/UPSTREAM-CODE-AUDIT.md) · [许可证及来源](NOTICE)
