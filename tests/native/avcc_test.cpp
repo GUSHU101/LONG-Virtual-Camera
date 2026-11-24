@@ -14,6 +14,15 @@ static std::vector<std::uint8_t> config(std::uint8_t length_size_minus_one)
 
 int main()
 {
+  const std::vector<std::uint8_t> sps_1280x720{
+      0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50, 0x05,
+      0xbb, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00,
+      0x00, 0x03, 0x00, 0x20, 0xf1, 0x83, 0x19, 0x60};
+  const auto dimensions = cr::media::parse_h264_sps_dimensions(sps_1280x720);
+  assert(dimensions.width == 1280 && dimensions.height == 720);
+  const std::vector<std::uint8_t> truncated_sps{0x67, 0x64, 0x00, 0x1f};
+  assert(!cr::media::parse_h264_sps_dimensions(truncated_sps));
+
   for (const std::uint8_t minus_one : {std::uint8_t{0}, std::uint8_t{1}, std::uint8_t{3}})
   {
     AvcDecoderConfig parsed{};

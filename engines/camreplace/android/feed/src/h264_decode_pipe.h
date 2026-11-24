@@ -59,10 +59,14 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
 #include <string>
 #include <vector>
 
 #include "shm.h"
+#include "nv21_blit.h"
+#include "media_codec_runtime.h"
+#include "media/AdaptiveGeometry.h"
 #include "media/FrameLayout.h"
 #include "util/Obf.h"
 
@@ -72,6 +76,16 @@
 
 namespace cr_feed
 {
+
+inline bool fit_source_geometry(int source_width, int source_height,
+                                int& output_width, int& output_height)
+{
+  return cr::media::fit_even_frame(
+      source_width, source_height, static_cast<int>(CR_FEED_MAX_WIDTH),
+      static_cast<int>(CR_FEED_MAX_HEIGHT), CR_FEED_MAX_PIXELS, output_width,
+      output_height) &&
+      output_width >= 16 && output_height >= 16;
+}
 
 // /data/cr/feed writer. Identical to the inline ShmOut that lived in
 // tcp_h264_feed.cpp pre-extraction.
@@ -280,8 +294,15 @@ public:
 
   bool start(int ww, int hh)
   {
+    (void) ensure_media_codec_binder_pool();
     w = ww;
     h = hh;
+    if (!fit_source_geometry(w, h, output_w, output_h))
+    {
+      CR_FEED_LOGE(OBF("h264 pipe: rejected source geometry %dx%d").c_str(),
+                   w, h);
+      return false;
+    }
     dec = AMediaCodec_createDecoderByType(OBF("video/avc").c_str());
     if (dec)
       chosen_name = OBF("video/avc/byType").c_str();
@@ -318,7 +339,11 @@ public:
     AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, OBF("video/avc").c_str());
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, w);
     AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, h);
-    AMediaFormat_setInt32(fmt, OBF("max-input-size").c_str(), 1 << 20);
+    const int64_t suggested_input =
+        std::clamp<int64_t>(static_cast<int64_t>(w) * h / 2,
+                            1 << 20, 8 << 20);
+    AMediaFormat_setInt32(fmt, OBF("max-input-size").c_str(),
+                          static_cast<int32_t>(suggested_input));
     media_status_t cs = AMediaCodec_configure(dec, fmt, nullptr, nullptr, 0);
     AMediaFormat_delete(fmt);
     if (cs != AMEDIA_OK)
@@ -336,9 +361,10 @@ public:
       dec = nullptr;
       return false;
     }
-    CR_FEED_LOGI(OBF("h264 pipe: started %dx%d (%s)").c_str(), w, h, chosen_name.c_str());
+    CR_FEED_LOGI(OBF("h264 pipe: started source=%dx%d shared=%dx%d (%s)").c_str(),
+                 w, h, output_w, output_h, chosen_name.c_str());
 
-    if (!shm.init(w, h))
+    if (!shm.init(output_w, output_h))
     {
       AMediaCodec_stop(dec);
       AMediaCodec_delete(dec);
@@ -346,6 +372,9 @@ public:
       return false;
     }
     nv21.assign((size_t) w * h * 3 / 2, 0);
+    if (output_w != w || output_h != h)
+      scaled_nv21.assign(static_cast<size_t>(output_w) * output_h * 3 / 2,
+                         0);
     return true;
   }
 
@@ -358,6 +387,10 @@ public:
       dec = nullptr;
     }
     shm.shutdown();
+    nv21.clear();
+    scaled_nv21.clear();
+    output_w = 0;
+    output_h = 0;
   }
 
   const char* codec_name() const noexcept
@@ -517,7 +550,17 @@ public:
         }
         if (converted)
         {
-          shm.publish_nv21(nv21.data());
+          const uint8_t* published = nv21.data();
+          if (!scaled_nv21.empty())
+          {
+            uint8_t* scaled_y = scaled_nv21.data();
+            uint8_t* scaled_vu = scaled_y +
+                static_cast<size_t>(output_w) * output_h;
+            cr_nv21_blit(nv21.data(), w, h, scaled_y, scaled_vu,
+                         output_w, output_h, output_w, output_w, 0);
+            published = scaled_nv21.data();
+          }
+          shm.publish_nv21(published);
           ++out_count;
           if (out_count <= 3 || (out_count % 120) == 0)
           {
@@ -543,6 +586,7 @@ private:
   std::string chosen_name;
 
   int w = 0, h = 0;
+  int output_w = 0, output_h = 0;
   int32_t color_format = 21; // NV12 default
   int32_t y_stride = 0;
   int32_t slice_height = 0;
@@ -550,6 +594,7 @@ private:
 
   ShmOut shm;
   std::vector<uint8_t> nv21;
+  std::vector<uint8_t> scaled_nv21;
   uint64_t in_count = 0;
   uint64_t out_count = 0;
   uint64_t output_layout_warns = 0;

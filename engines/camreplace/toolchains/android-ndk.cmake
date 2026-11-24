@@ -6,7 +6,7 @@
 # repeat them.
 #
 # Requirements fixed here:
-#   - NDK r29 at the known path on this machine
+#   - pinned release/CI NDK 27.3.13750724 (override remains explicit)
 #   - API level 21 (Android 5.0+) — lowest we care about
 #   - arm64-v8a only (modern devices)
 #   - c++_static STL (fully self-contained .so, no libc++_shared.so alongside)
@@ -15,14 +15,14 @@ if(NOT DEFINED ANDROID_NDK_ROOT)
     if(NOT "$ENV{ANDROID_NDK_ROOT}" STREQUAL "")
         set(ANDROID_NDK_ROOT "$ENV{ANDROID_NDK_ROOT}" CACHE PATH "Android NDK root")
     else()
-        set(ANDROID_NDK_ROOT "$ENV{LOCALAPPDATA}/Android/Sdk/ndk/29.0.14033849" CACHE PATH "Android NDK root")
+        set(ANDROID_NDK_ROOT "$ENV{LOCALAPPDATA}/Android/Sdk/ndk/27.3.13750724" CACHE PATH "Android NDK root")
     endif()
 endif()
 
 if(NOT EXISTS "${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake")
     message(FATAL_ERROR
         "NDK not found at ${ANDROID_NDK_ROOT}. "
-        "Set ANDROID_NDK_ROOT cache var to the r29 install path.")
+        "Set ANDROID_NDK_ROOT to Android NDK 27.3.13750724 (r27d).")
 endif()
 
 set(ANDROID_ABI          "arm64-v8a"      CACHE STRING "")

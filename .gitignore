@@ -1,14 +1,8 @@
-# ndk-build output
-android/libs/
-android/obj/
-
-# staged into a release by tools/package.py
-desktop/recam_ui/payload/
-
-# PyInstaller
+# Native/Gradle build output
 build/
 dist/
-*.spec
+lsposed-module/app/build/
+lsposed-module/build/
 
 # release artifacts; they live on the GitHub release page
 release/
@@ -22,6 +16,8 @@ release/
 __pycache__/
 *.pyc
 *.pyo
+*.obj
+*.pdb
 
 *.log
 logs/
@@ -29,5 +25,7 @@ logs/
 *.i64
 .idea/
 .vscode/
+.gradle/
+local.properties
 .DS_Store
 Thumbs.db

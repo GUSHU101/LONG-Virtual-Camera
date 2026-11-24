@@ -26,6 +26,7 @@
 // underruns.
 
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C"
@@ -65,6 +66,9 @@ extern "C"
     // even after write_pos and the complete PCM chunk are published.
     uint32_t reserved[5]; // pad to 64 bytes
   } cr_audio_header;
+
+  _Static_assert(offsetof(cr_audio_header, channel_state) == 36,
+                 "controller readiness probe depends on channel_state offset");
 
   _Static_assert(sizeof(cr_audio_header) == 64, "cr_audio_header must stay 64 bytes");
 

@@ -1,6 +1,6 @@
 # Android-side native components for Camera Replace.
 #
-# Built with Android NDK r29 clang, targeting arm64-v8a, API 21+.
+# Built with pinned Android NDK 27.3.13750724, targeting arm64-v8a, API 21+.
 
 # Android Studio/SDK still distributes CMake 3.22 broadly. This project uses
 # no newer language feature, so keep clean-checkout payload builds reproducible
@@ -101,7 +101,7 @@ target_compile_options(cr_secure_channel PRIVATE -fexceptions)
 # variants remain buildable for compatibility/regression work, but are not a
 # second product engine or user-selectable runtime.
 option(CR_FEED_ENABLE_RTMP_DIRECT
-       "Build the legacy direct phone-side RTMP listener" OFF)
+       "Build the phone-side authenticated OBS RTMP listener" ON)
 option(CR_FEED_USE_THREADED
        "Use the upstream experimental threaded tcp_h264 receiver" OFF)
 
@@ -115,7 +115,9 @@ if(CR_FEED_ENABLE_RTMP_DIRECT)
 endif()
 
 add_library(cr_feed STATIC
+    camhook/src/nv21_blit.c
     feed/src/feed_main.cpp
+    feed/src/local_media_feed.cpp
     feed/src/secure_channel_reader.cpp
     ${_cr_feed_tcp_h264_src}
     feed/src/tcp_nv21_feed.cpp
@@ -124,7 +126,7 @@ add_library(cr_feed STATIC
 )
 target_include_directories(cr_feed PUBLIC feed/include)
 target_include_directories(cr_feed PRIVATE
-    ${CMAKE_SOURCE_DIR}/../host/src
+    ${CMAKE_SOURCE_DIR}/camhook/src
     ${CMAKE_SOURCE_DIR}/../common)
 target_link_libraries(cr_feed PRIVATE cr_secure_channel log android mediandk)
 set_target_properties(cr_feed PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -146,7 +148,7 @@ add_executable(cr_feed_proc
     feed/src/cr_feed_proc.cpp
 )
 target_include_directories(cr_feed_proc PRIVATE
-    ${CMAKE_SOURCE_DIR}/../host/src
+    ${CMAKE_SOURCE_DIR}/../common
     security
     feed/include)
 cr_apply_defaults(cr_feed_proc)
@@ -162,7 +164,7 @@ add_executable(cr_injector
 )
 target_include_directories(cr_injector PRIVATE
     injector/src
-    ${CMAKE_SOURCE_DIR}/../host/src
+    ${CMAKE_SOURCE_DIR}/../common
     security
     feed/include)
 cr_apply_defaults(cr_injector)
@@ -185,7 +187,6 @@ add_library(cr_hooks SHARED
 target_include_directories(cr_hooks PRIVATE
     ${CMAKE_SOURCE_DIR}/../common
     ${CMAKE_SOURCE_DIR}/../third_party/shadowhook/shadowhook/src/main/cpp/include
-    ${CMAKE_SOURCE_DIR}/../host/src
     ${CMAKE_SOURCE_DIR}/security
     feed/include
     feed/src)

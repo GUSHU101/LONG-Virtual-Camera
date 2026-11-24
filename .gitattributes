@@ -1,0 +1,10 @@
+# Device shell scripts and Gradle's Unix launcher must remain LF-only even
+# when contributors build from Windows with core.autocrlf=true.
+lsposed-module/gradlew text eol=lf
+lsposed-module/**/*.sh text eol=lf
+lsposed-module/**/*.gradle text eol=lf
+lsposed-module/**/META-INF/xposed/* text eol=lf
+.github/workflows/*.yml text eol=lf
+
+lsposed-module/**/*.bat text eol=crlf
+lsposed-module/**/*.jar binary

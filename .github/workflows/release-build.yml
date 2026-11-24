@@ -1,4 +1,4 @@
-name: Release build
+name: Release APK
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       version:
         description: Release version (vMAJOR.MINOR.PATCH)
         required: true
-        default: v0.3.0
+        default: v2.0.0
         type: string
       publish:
         description: Create or update the GitHub release
@@ -22,8 +22,6 @@ permissions:
 
 env:
   CAMREPLACE_NDK_VERSION: 27.3.13750724
-  LLVM_MINGW_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20261117/llvm-mingw-20261117-msvcrt-x86_64.zip
-  LLVM_MINGW_SHA256: 17db10bd2c0bcbf55e5e4382475190165d0fc90dfe52ca165a51f1dfb1ca19c8
 
 jobs:
   validate:
@@ -49,146 +47,100 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install pinned NDK
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install pinned Android toolchain
         run: |
           set -euo pipefail
-          if [ ! -x "$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION/ndk-build" ]; then
-            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$CAMREPLACE_NDK_VERSION"
-          fi
-      - name: Build unified ARM64 payload
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;$CAMREPLACE_NDK_VERSION" \
+            "platforms;android-37.0" "build-tools;37.0.0"
+      - name: Build phone-native ARM64 payload
         run: |
           set -euo pipefail
-          cmake -S engines/camreplace/android -B build/camreplace-android -G "Unix Makefiles" \
+          cmake -S engines/camreplace/android -B build/camreplace-android \
+            -G "Unix Makefiles" \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/android-ndk.cmake" \
             -DANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION" \
+            -DCR_FEED_ENABLE_RTMP_DIRECT=ON \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build/camreplace-android --parallel 4
           for file in cr_injector cr_feed_proc libcr_hooks.so; do
             test -s "build/camreplace-android/out/$file"
           done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-android-payload
-          path: build/camreplace-android/out/
-          if-no-files-found: error
-          retention-days: 7
-
-  windows:
-    needs: [validate, android]
-    runs-on: windows-2022
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-android-payload
-          path: build/camreplace-android/out
-      - name: Install and verify pinned LLVM-MinGW
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          $archive = Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip'
-          $extract = Join-Path $env:RUNNER_TEMP 'llvm-mingw'
-          Invoke-WebRequest -Uri $env:LLVM_MINGW_URL -OutFile $archive
-          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          if ($actual -ne $env:LLVM_MINGW_SHA256) {
-            throw "LLVM-MinGW checksum mismatch: $actual"
-          }
-          Expand-Archive -LiteralPath $archive -DestinationPath $extract
-          $compiler = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'x86_64-w64-mingw32-clang++.exe' |
-            Select-Object -First 1
-          if (-not $compiler) { throw 'LLVM-MinGW compiler was not found' }
-          $root = $compiler.Directory.Parent.FullName
-          $runtime = Get-ChildItem -LiteralPath $root -Recurse -Filter 'libwinpthread-1.dll' |
-            Where-Object { $_.FullName -match 'x86_64' } |
-            Select-Object -First 1
-          if (-not $runtime) { throw 'x86_64 libwinpthread-1.dll was not found' }
-          "LLVM_MINGW_ROOT=$root" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          "MINGW_RUNTIME_DIR=$($runtime.Directory.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Configure and build unified host
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          cmake -S engines/camreplace/host -B build/camreplace-host -G Ninja `
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/llvm-mingw.cmake" `
-            -DLLVM_MINGW_ROOT="$env:LLVM_MINGW_ROOT" `
-            -DMINGW_RUNTIME_DIR="$env:MINGW_RUNTIME_DIR" `
-            -DANDROID_OUT_DIR="$PWD/build/camreplace-android/out" `
-            -DADB_SRC_DIR="$env:ANDROID_HOME/platform-tools" `
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/camreplace-host --target CameraReplace --parallel 4
-          $exe = 'build/camreplace-host/bin/LONG-Virtual-Camera.exe'
-          if (-not (Test-Path -LiteralPath $exe)) { throw "Missing output: $exe" }
-          $imports = & "$env:LLVM_MINGW_ROOT/bin/llvm-objdump.exe" -p $exe
-          if ($imports -match '(?i)DLL Name:\s*lib(win)?pthread') {
-            throw 'Release executable imports libwinpthread and is not standalone'
-          }
-      - name: Write manifest and package
-        shell: pwsh
+      - name: Build signed LSPosed APK
         env:
+          ANDROID_OUT_DIR: ${{ github.workspace }}/build/camreplace-android/out
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          SIGNING_STORE_BASE64: ${{ secrets.LONGVC_ANDROID_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.LONGVC_ANDROID_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEY_PASSWORD }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $files = [ordered]@{
-            'LONG-Virtual-Camera.exe' = 'build/camreplace-host/bin/LONG-Virtual-Camera.exe'
-            'adb.exe' = "$env:ANDROID_HOME/platform-tools/adb.exe"
-            'AdbWinApi.dll' = "$env:ANDROID_HOME/platform-tools/AdbWinApi.dll"
-            'AdbWinUsbApi.dll' = "$env:ANDROID_HOME/platform-tools/AdbWinUsbApi.dll"
-            'libwinpthread-1.dll' = "$env:MINGW_RUNTIME_DIR/libwinpthread-1.dll"
-            'cr_injector' = 'build/camreplace-android/out/cr_injector'
-            'cr_feed_proc' = 'build/camreplace-android/out/cr_feed_proc'
-            'libcr_hooks.so' = 'build/camreplace-android/out/libcr_hooks.so'
+          set -euo pipefail
+          export LONGVC_VERSION_NAME="${RELEASE_VERSION#v}"
+          if [[ "$RELEASE_VERSION" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            major=$((10#${BASH_REMATCH[1]}))
+            minor=$((10#${BASH_REMATCH[2]}))
+            patch=$((10#${BASH_REMATCH[3]}))
+          else
+            exit 1
+          fi
+          if (( major > 2100 || minor > 999 || patch > 999 )); then
+            echo 'Android version components exceed versionCode limits' >&2
+            exit 1
+          fi
+          export LONGVC_VERSION_CODE=$((major * 1000000 + minor * 1000 + patch))
+          if (( LONGVC_VERSION_CODE < 1 || LONGVC_VERSION_CODE > 2100000000 )); then
+            echo "Android versionCode is out of range: $LONGVC_VERSION_CODE" >&2
+            exit 1
+          fi
+          test -n "${SIGNING_STORE_BASE64:-}" || {
+            echo 'Production signing secret LONGVC_ANDROID_KEYSTORE_BASE64 is required.' >&2
+            exit 1
           }
-          $hashes = [ordered]@{}
-          foreach ($entry in $files.GetEnumerator()) {
-            if (-not (Test-Path -LiteralPath $entry.Value)) { throw "Missing manifest input: $($entry.Value)" }
-            $item = Get-Item -LiteralPath $entry.Value
-            if ($item.Length -le 0) { throw "Empty manifest input: $($entry.Value)" }
-            $hashes[$entry.Key] = [ordered]@{
-              size = $item.Length
-              sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            }
-          }
-          $manifest = [ordered]@{
-            schema = 1
-            product = 'LONG Virtual Camera'
-            version = $env:RELEASE_VERSION
-            commit = $env:GITHUB_SHA
-            ndk = $env:CAMREPLACE_NDK_VERSION
-            llvm_mingw_url = $env:LLVM_MINGW_URL
-            llvm_mingw_sha256 = $env:LLVM_MINGW_SHA256
-            files = $hashes
-          }
-          $bin = 'build/camreplace-host/bin'
-          $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$bin/build-manifest.json" -Encoding utf8
-          $stage = Join-Path $env:RUNNER_TEMP "LONG-Virtual-Camera-$env:RELEASE_VERSION-windows-x64"
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item -LiteralPath "$bin/LONG-Virtual-Camera.exe", "$bin/build-manifest.json", 'LICENSE', 'NOTICE' -Destination $stage
-          $archive = "dist/LONG-Virtual-Camera-$env:RELEASE_VERSION-windows-x64.zip"
-          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
-          Compress-Archive -LiteralPath $stage -DestinationPath $archive -CompressionLevel Optimal
-          $name = Split-Path -Leaf $archive
-          $sha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$sha *$name" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
-          Copy-Item -LiteralPath "$bin/build-manifest.json" -Destination 'dist/build-manifest.json'
+          test -n "${SIGNING_STORE_PASSWORD:-}"
+          test -n "${SIGNING_KEY_ALIAS:-}"
+          test -n "${SIGNING_KEY_PASSWORD:-}"
+          export LONGVC_SIGNING_STORE_FILE="$RUNNER_TEMP/longvc-release.keystore"
+          export LONGVC_SIGNING_STORE_PASSWORD="$SIGNING_STORE_PASSWORD"
+          export LONGVC_SIGNING_KEY_ALIAS="$SIGNING_KEY_ALIAS"
+          export LONGVC_SIGNING_KEY_PASSWORD="$SIGNING_KEY_PASSWORD"
+          printf '%s' "$SIGNING_STORE_BASE64" | base64 --decode > "$LONGVC_SIGNING_STORE_FILE"
+          chmod 0600 "$LONGVC_SIGNING_STORE_FILE"
+          chmod +x lsposed-module/gradlew
+          lsposed-module/gradlew --no-daemon -p lsposed-module \
+            :app:assembleRelease :app:lintRelease
+          source_apk=lsposed-module/app/build/outputs/apk/release/app-release.apk
+          test -s "$source_apk"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose "$source_apk"
+          python3 tests/verify_apk.py "$source_apk"
+          test "$(unzip -p "$source_apk" META-INF/xposed/scope.list | tr -d '\r\n')" = system
+          mkdir -p dist
+          apk="dist/LONG-Virtual-Camera-${RELEASE_VERSION}-LSPosed-arm64.apk"
+          cp "$source_apk" "$apk"
+          sha256sum "$apk" | sed 's#  dist/#  #' > "$apk.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: LONG-Virtual-Camera-${{ needs.validate.outputs.version }}-windows-x64
-          path: dist/
+          name: LONG-Virtual-Camera-${{ needs.validate.outputs.version }}-LSPosed-arm64
+          path: |
+            dist/*.apk
+            dist/*.apk.sha256
           if-no-files-found: error
           retention-days: 30
 
   publish:
     if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish)
-    needs: [validate, windows]
+    needs: [validate, android]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: LONG-Virtual-Camera-${{ needs.validate.outputs.version }}-windows-x64
+          name: LONG-Virtual-Camera-${{ needs.validate.outputs.version }}-LSPosed-arm64
           path: dist
       - name: Create or update GitHub release
         env:

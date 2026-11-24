@@ -1,9 +1,5 @@
 CameraReplace includes third-party source code under its original licenses.
 
-Dear ImGui
-License: MIT
-License text: imgui/LICENSE.txt
-
 ShadowHook
 Copyright (c) ByteDance
 License: MIT

@@ -1148,6 +1148,9 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
+  if (access("/data/cr/video_mode", R_OK) != 0)
+    return cr::camhook::ReplacementOutcome::PassThrough;
+
   if (!ahb_planes_ready() && !gbm_ready())
   {
     ++g_stat_skip_nogbm;
@@ -1373,6 +1376,12 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_sh
 
 extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_init(const char* feed_url)
 {
+  const char* process = getprogname();
+  if (!process || strcmp(process, "cameraserver") != 0)
+  {
+    LOGE("Refusing camera hooks outside cameraserver");
+    return -1;
+  }
   if (g_installed.exchange(true))
   {
     LOGI(OBF("already installed").c_str());
@@ -1404,9 +1413,15 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
     {
       char buf[32];
       int n = snprintf(buf, sizeof(buf), "%ld\n", (long) getpid());
-      if (n > 0)
-        (void) write(fd, buf, (size_t) n);
+      const bool written = n > 0 && n < static_cast<int>(sizeof(buf)) &&
+                           write(fd, buf, static_cast<size_t>(n)) == n;
       close(fd);
+      if (!written)
+      {
+        LOGE("Cannot write camera readiness marker");
+        cr_camhook_shutdown();
+        return -1;
+      }
     }
     else
     {

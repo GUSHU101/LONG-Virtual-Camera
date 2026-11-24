@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="navy">#101827</color>
+    <color name="surface">#F6F8FC</color>
+    <color name="surface_card">#FFFFFFFF</color>
+    <color name="ink">#152033</color>
+    <color name="ink_muted">#5E6B7D</color>
+    <color name="accent">#006D77</color>
+    <color name="accent_dark">#00555D</color>
+    <color name="warning">#A44800</color>
+    <color name="divider">#DDE3EC</color>
+</resources>

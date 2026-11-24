@@ -247,7 +247,10 @@ static void scale_plane_lanczos(const uint8_t* src, int src_w, int src_h, int sr
 // over a 2D domain we de-interleave V and U into two stack scratch
 // planes, scale each independently, then re-interleave on write.
 // `dst_swap` selects destination order — see nv21_blit.h.
-static void scale_vu_lanczos(const uint8_t* src, int src_w_pairs, int src_h, uint8_t* dst, int dst_w_pairs, int dst_h, int dst_stride_bytes, int dst_swap)
+static void scale_vu_lanczos(const uint8_t* src, int src_w_pairs, int src_h,
+                             int src_stride_bytes, uint8_t* dst,
+                             int dst_w_pairs, int dst_h,
+                             int dst_stride_bytes, int dst_swap)
 {
   if (dst_w_pairs <= 0 || dst_w_pairs > CR_BLIT_MAX_DST_W)
     return;
@@ -272,7 +275,7 @@ static void scale_vu_lanczos(const uint8_t* src, int src_w_pairs, int src_h, uin
   // De-interleave source: NV21 = (V,U) pairs.
   for (int y = 0; y < src_h; ++y)
   {
-    const uint8_t* srow = src + (size_t) y * src_w_pairs * 2;
+    const uint8_t* srow = src + (size_t) y * src_stride_bytes;
     uint8_t* vrow = sV + (size_t) y * src_w_pairs;
     uint8_t* urow = sU + (size_t) y * src_w_pairs;
     for (int x = 0; x < src_w_pairs; ++x)
@@ -310,25 +313,51 @@ static void scale_vu_lanczos(const uint8_t* src, int src_w_pairs, int src_h, uin
 
 void cr_nv21_blit_lanczos(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped)
 {
+  if (!src || !dst_y || !dst_vu || src_w > 8192 || src_h > 8192 ||
+      dst_w > 8192 || dst_h > 8192 || dst_y_stride < dst_w ||
+      dst_uv_stride < dst_w ||
+      (uint64_t) src_w * (uint64_t) src_h > 32ull * 1024ull * 1024ull ||
+      (uint64_t) dst_w * (uint64_t) dst_h > 32ull * 1024ull * 1024ull)
+    return;
+  cr_nv21_crop_rect crop;
+  if (!cr_nv21_center_crop(src_w, src_h, dst_w, dst_h, &crop))
+    return;
+
   // Same equal-resolution fast path as cr_nv21_blit — Lanczos and
   // bilinear both reduce to memcpy when no scaling is needed.
-  if (src_w == dst_w && src_h == dst_h && !dst_uv_swapped)
+  if (crop.width == dst_w && crop.height == dst_h)
   {
     for (int y = 0; y < dst_h; ++y)
     {
-      memcpy(dst_y + (size_t) y * dst_y_stride, src + (size_t) y * src_w, (size_t) src_w);
+      memcpy(dst_y + (size_t) y * dst_y_stride,
+             src + (size_t) (crop.y + y) * src_w + crop.x,
+             (size_t) dst_w);
     }
-    const uint8_t* src_vu = src + (size_t) src_w * src_h;
-    const int vu_row_bytes = src_w;
+    const uint8_t* src_vu = src + (size_t) src_w * src_h +
+                            (size_t) (crop.y / 2) * src_w + crop.x;
     for (int y = 0; y < dst_h / 2; ++y)
     {
-      memcpy(dst_vu + (size_t) y * dst_uv_stride, src_vu + (size_t) y * vu_row_bytes, (size_t) vu_row_bytes);
+      const uint8_t* source_row = src_vu + (size_t) y * src_w;
+      uint8_t* destination_row = dst_vu + (size_t) y * dst_uv_stride;
+      if (!dst_uv_swapped)
+        memcpy(destination_row, source_row, (size_t) dst_w);
+      else
+        for (int x = 0; x < dst_w; x += 2)
+        {
+          destination_row[x] = source_row[x + 1];
+          destination_row[x + 1] = source_row[x];
+        }
     }
     return;
   }
 
-  scale_plane_lanczos(src, src_w, src_h, src_w, dst_y, dst_w, dst_h, dst_y_stride);
+  const uint8_t* src_y = src + (size_t) crop.y * src_w + crop.x;
+  scale_plane_lanczos(src_y, crop.width, crop.height, src_w,
+                      dst_y, dst_w, dst_h, dst_y_stride);
 
-  const uint8_t* src_vu = src + (size_t) src_w * src_h;
-  scale_vu_lanczos(src_vu, src_w / 2, src_h / 2, dst_vu, dst_w / 2, dst_h / 2, dst_uv_stride, dst_uv_swapped);
+  const uint8_t* src_vu = src + (size_t) src_w * src_h +
+                          (size_t) (crop.y / 2) * src_w + crop.x;
+  scale_vu_lanczos(src_vu, crop.width / 2, crop.height / 2, src_w,
+                   dst_vu, dst_w / 2, dst_h / 2, dst_uv_stride,
+                   dst_uv_swapped);
 }

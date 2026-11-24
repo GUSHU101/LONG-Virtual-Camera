@@ -8,24 +8,15 @@ ReCam - https://github.com/aimardcr/ReCam
 CamReplace - https://github.com/pIat0n/CamReplace
   Imported from commit 8456a5d8041f4c81a26b5c19fa0d6409f57db048.
   Original license: GNU GPL v3.0 only.
-  The complete imported and modified source is in engines/camreplace/.
+  Retained and modified Android source is in engines/camreplace/.
   Full text: LICENSES/CamReplace-GPL-3.0.txt
 
 Because this combined work incorporates GPL-3.0-only source, LONG Virtual
 Camera as a whole is distributed under GNU GPL v3.0. The MIT notices for the
 ReCam-derived portions remain in force and are preserved above.
 
-ReCam-derived compatibility sources:
-
-AndKittyInjector - https://github.com/MJx0/AndKittyInjector
-  Copyright (c) 2023 MJ. MIT License.
-  Vendored at commit 6d55e9fb168722bfe176b3f9dc4c5843676ab557 with one local
-  patch; see android/patches/0001-canUseMemfd-real-args.patch.
-  Full text: android/third_party/AndKittyInjector/LICENSE
-
-XZ Embedded - https://github.com/tukaani-project/xz-embedded
-  Copyright (C) The XZ Embedded authors and contributors. Public domain.
-  Full text: android/third_party/xz-embedded/COPYING
+ReCam-derived components include H.264 SPS geometry, aspect-preserving
+resolution adaptation and MediaCodec file playback.
 
 Native-core third-party attributions are listed in
 engines/camreplace/THIRD_PARTY_NOTICES.txt and in license files stored beside

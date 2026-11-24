@@ -1,0 +1,176 @@
+import java.security.MessageDigest
+
+plugins {
+    id "com.android.application"
+}
+
+def defaultPayloadDir = new File(rootProject.projectDir, "../build/camreplace-android/out").absolutePath
+def payloadDir = providers.gradleProperty("longvc.androidOutDir")
+        .orElse(providers.environmentVariable("ANDROID_OUT_DIR"))
+        .getOrElse(defaultPayloadDir)
+def payloadFiles = ["cr_injector", "cr_feed_proc", "libcr_hooks.so"]
+def moduleVersionName = providers.environmentVariable("LONGVC_VERSION_NAME").getOrElse("2.0.0")
+def moduleVersionCode = providers.environmentVariable("LONGVC_VERSION_CODE")
+        .map { Integer.parseInt(it) }
+        .getOrElse(2)
+if (moduleVersionCode <= 0 || moduleVersionCode > 2_100_000_000) {
+    throw new GradleException("LONGVC_VERSION_CODE must be in Android's 1..2100000000 range")
+}
+def signingStorePath = providers.environmentVariable("LONGVC_SIGNING_STORE_FILE").orNull
+def signingStorePassword = providers.environmentVariable("LONGVC_SIGNING_STORE_PASSWORD").orNull
+def signingKeyAlias = providers.environmentVariable("LONGVC_SIGNING_KEY_ALIAS").orNull
+def signingKeyPassword = providers.environmentVariable("LONGVC_SIGNING_KEY_PASSWORD").orNull
+def controlScript = layout.projectDirectory.file("src/main/payload/longvc-control.sh")
+def generatedAssetsDir = layout.buildDirectory.dir("generated/payloadAssets").get().asFile
+
+tasks.register("preparePayload") {
+    inputs.files(payloadFiles.collect { new File(payloadDir, it) })
+    inputs.file(controlScript)
+    outputs.dir(generatedAssetsDir)
+
+    doLast {
+        File outputRoot = generatedAssetsDir
+        delete(outputRoot)
+        File outputDir = new File(outputRoot, "payload/arm64-v8a")
+        if (!outputDir.mkdirs() && !outputDir.isDirectory()) {
+            throw new GradleException("Cannot create generated payload directory: ${outputDir}")
+        }
+
+        List<File> staged = []
+        payloadFiles.each { name ->
+            File source = new File(payloadDir, name)
+            if (!source.isFile() || source.length() == 0L) {
+                throw new GradleException("Missing or empty ARM64 payload: ${source}. Build engines/camreplace/android first or set -Plongvc.androidOutDir=...")
+            }
+            byte[] elf = new byte[20]
+            source.withInputStream { input ->
+                if (input.read(elf) != elf.length) {
+                    throw new GradleException("Truncated ELF payload: ${source}")
+                }
+            }
+            int machine = (elf[18] & 0xff) | ((elf[19] & 0xff) << 8)
+            if ((elf[0] & 0xff) != 0x7f || (elf[1] & 0xff) != 0x45 ||
+                    (elf[2] & 0xff) != 0x4c || (elf[3] & 0xff) != 0x46 ||
+                    (elf[4] & 0xff) != 2 || (elf[5] & 0xff) != 1 || machine != 0xb7) {
+                throw new GradleException("Payload is not little-endian ELF64 AArch64: ${source}")
+            }
+            File target = new File(outputDir, name)
+            target.bytes = source.bytes
+            staged.add(target)
+        }
+
+        File scriptSource = controlScript.asFile
+        if (!scriptSource.isFile() || scriptSource.length() == 0L) {
+            throw new GradleException("Missing root control script: ${scriptSource}")
+        }
+        File scriptTarget = new File(outputDir, "longvc-control.sh")
+        scriptTarget.bytes = scriptSource.bytes
+        staged.add(scriptTarget)
+
+        File manifest = new File(outputDir, "payload.sha256")
+        manifest.withWriter("UTF-8") { writer ->
+            staged.each { file ->
+                MessageDigest digest = MessageDigest.getInstance("SHA-256")
+                file.withInputStream { input ->
+                    byte[] buffer = new byte[64 * 1024]
+                    int read
+                    while ((read = input.read(buffer)) >= 0) {
+                        if (read > 0) digest.update(buffer, 0, read)
+                    }
+                }
+                String hash = digest.digest().collect { String.format("%02x", it & 0xff) }.join()
+                writer.write("${hash}  ${file.length()}  ${file.name}\n")
+            }
+        }
+    }
+}
+
+android {
+    namespace = "com.gushu.longvc"
+    compileSdk = 37
+    buildToolsVersion = "37.0.0"
+
+    defaultConfig {
+        applicationId = "com.gushu.longvc"
+        minSdk = 27
+        targetSdk = 37
+        versionCode = moduleVersionCode
+        versionName = moduleVersionName
+    }
+
+    signingConfigs {
+        if (signingStorePath != null) {
+            if ([signingStorePassword, signingKeyAlias, signingKeyPassword].any { it == null }) {
+                throw new GradleException("All LONGVC_SIGNING_* values are required when LONGVC_SIGNING_STORE_FILE is set")
+            }
+            production {
+                storeFile = file(signingStorePath)
+                storePassword = signingStorePassword
+                keyAlias = signingKeyAlias
+                keyPassword = signingKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
+        release {
+            minifyEnabled = true
+            shrinkResources = true
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            // Never disguise a development key as a production release.
+            // Without explicit credentials Gradle emits an unsigned APK;
+            // release publishing requires the production config below.
+            if (signingStorePath != null) {
+                signingConfig = signingConfigs.production
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    sourceSets {
+        main {
+            assets.srcDir(generatedAssetsDir)
+        }
+    }
+
+    packaging {
+        resources {
+            merges += ["META-INF/xposed/*"]
+            excludes += [
+                    "META-INF/AL2.0",
+                    "META-INF/LGPL2.1",
+                    "META-INF/LICENSE*",
+                    "META-INF/NOTICE*"
+            ]
+        }
+    }
+
+    lint {
+        abortOnError = true
+        checkReleaseBuilds = true
+        warningsAsErrors = true
+        // Gradle 9.5.1 is deliberately aligned with the upstream libxposed
+        // API 102 example; do not turn a newer-wrapper notification into a
+        // release failure while the official template remains pinned here.
+        disable "OldTargetApi", "AndroidGradlePluginVersion"
+    }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(tasks.named("preparePayload"))
+}
+
+dependencies {
+    implementation "androidx.exifinterface:exifinterface:1.4.2"
+    compileOnly "androidx.annotation:annotation-jvm:1.8.1"
+    compileOnly "io.github.libxposed:api:102.0.0"
+    implementation "io.github.libxposed:service:102.0.0"
+}

@@ -1,5 +1,17 @@
 # Upstream code audit and fusion map
 
+This is the historical audit of the two pinned donors and the first fusion.
+The current release build contains only the Android APK and its phone-native
+payload. The original Windows host and the standalone ReCam tree are
+available in Git history. See [current architecture](ARCHITECTURE.md).
+
+Both upstreams replace frames inside `cameraserver`. ReCam uses the
+`Camera3OutputStream::returnBufferCheckedLocked` path. CamReplace uses
+`Camera3OutputStream::queueBufferToConsumer` as its primary path. The APK
+uses the latter with exact reviewed signatures and carries over ReCam's
+geometry and frame-lifetime checks. Its LSPosed entry runs in the separate
+`system_server` process.
+
 ## Reproducible baselines
 
 This review used clean clones whose HEAD values were verified before comparison:
@@ -139,6 +151,25 @@ The following were concrete code defects, not cosmetic differences:
   files while an older library remained mapped. Cleanup now reconciles ownership
   with the actual camera/audio service maps, restarts only services where the hook
   is present, waits for respawn and relaunches camera clients it displaced.
+- The desktop and Android companion initially had equivalent but separate root
+  command paths. Both now embed one fixed-action controller; desktop low-level
+  commands are recovery-only. Camera/photo leases preserve their shared feeder
+  and ADB forward independently, while microphone remains a separate opt-in.
+- Root action locking could become permanently wedged after `SIGKILL` or reboot.
+  Lock recovery now validates the recorded PID and `/proc/<pid>/cmdline`, then
+  renames a confirmed stale directory before deleting it so it cannot erase a
+  newly acquired lock.
+- A live feeder whose TCP listener had failed was repeatedly reused, and lease
+  creation failures could leave a hook/feeder half active. Stale feeders are now
+  replaced; every camera/photo arm rolls back its new video state, while every
+  microphone arm failure also unloads the audio hook.
+- Windows deployment deleted committed phone binaries before a replacement was
+  complete. It now hashes extracted resources, stages them under a private path,
+  verifies device-side SHA-256/size, commits with backups, re-verifies final
+  names under an active rollback trap, and only then discards the old set.
+- Activity recreation could create a second Root executor while installation was
+  still running. A process-owned serial queue now spans Activity instances, and
+  stale UI callbacks are discarded after destruction.
 
 ## What “one tool” means
 

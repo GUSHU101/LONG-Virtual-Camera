@@ -4,11 +4,10 @@
 //   each NAL into a 16-byte-prefixed TCP frame → cr_feed_proc on phone
 //   reads frames → MediaCodec.
 //   The PC-side parser was an extra place latency (and bugs) could land.
-//   This file moves the RTMP listener onto the phone itself: OBS pushes
-//   straight to 127.0.0.1:1935, adb forward bridges the PC's loopback to
-//   the phone's loopback, and we feed Annex-B NALs directly into the
-//   shared H.264 decode pipe. One TCP connection less, one binary parser
-//   less.
+//   This file moves the RTMP listener onto the phone itself. OBS can publish
+//   over an authorized LAN or through a standard adb forward; no LONG VC
+//   desktop companion is required. A per-configuration stream key is mandatory
+//   before any media message is accepted.
 // Wire compatibility:
 //   We accept the same simple RTMP 1.0 handshake + chunk-stream + AMF0
 //   command set the host-side server already supported:
@@ -16,10 +15,8 @@
 //   And the same FLV-tag types:
 //     0x09 video  (AVC sequence header + coded frames)
 //     0x12 data   (onMetaData / @setDataFrame for resolution/fps hint)
-//   Audio (0x08) is intentionally ignored — the audio side-channel still
-//   uses tcp_pcm via cr_feed_run_tcp_pcm. AAC support could be added by
-//   forwarding tags into a phone-side AAC decoder, but that's out of
-//   scope for the sprint that's just removing the PC parser.
+//   Audio tags (AAC) are decoded into the same opt-in microphone shared
+//   memory used by the local-media source.
 // Code lineage:
 //   This is a near-line-for-line port of host/src/source/RtmpServer.cpp.
 //   Original PC source is preserved verbatim under
@@ -47,10 +44,12 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "util/Obf.h"
 
@@ -69,6 +68,19 @@ constexpr size_t kMaxBufferedRtmpBytes = 24u * 1024u * 1024u;
 constexpr size_t kMaxChunkStreams = 64u;
 constexpr uint32_t kMaxInboundChunkBytes = 1024u * 1024u;
 constexpr unsigned kMaxAmfDepth = 16u;
+constexpr size_t kMaxPreAuthBytes = 1024u * 1024u;
+constexpr auto kPublishAuthDeadline = std::chrono::seconds(12);
+
+bool constant_time_equal(std::string_view left, std::string_view right)
+{
+  if (left.size() != right.size())
+    return false;
+  unsigned difference = 0;
+  for (size_t i = 0; i < left.size(); ++i)
+    difference |= static_cast<unsigned char>(left[i]) ^
+                  static_cast<unsigned char>(right[i]);
+  return difference == 0;
+}
 
 bool recv_all(int s, void* out, size_t n)
 {
@@ -322,7 +334,8 @@ void build_rtmp_message(std::vector<uint8_t>& out, uint8_t cs_id, uint32_t times
 }
 
 // Per-connection RTMP session: handshake → chunks → FLV → push into pipe.
-bool serve_client(int client)
+bool serve_client(int client, const std::string& expected_stream_key,
+                  bool enable_video, bool enable_audio)
 {
   int no_delay = 1;
   setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
@@ -395,12 +408,17 @@ bool serve_client(int client)
   // PC AudioPump in direct-RTMP mode.
   cr_feed::AacDecodePipe audio_pipe;
   bool audio_pipe_started = false;
+  bool publisher_authorized = false;
+  size_t pre_auth_bytes = 0;
+  const auto auth_deadline =
+      std::chrono::steady_clock::now() + kPublishAuthDeadline;
 
   auto try_start_pipe = [&]()
   {
-    if (stream_w < 16 || stream_w > (int) CR_FEED_MAX_WIDTH ||
-        stream_h < 16 || stream_h > (int) CR_FEED_MAX_HEIGHT ||
-        (stream_w & 1) != 0 || (stream_h & 1) != 0)
+    int fitted_width = 0;
+    int fitted_height = 0;
+    if (!cr_feed::fit_source_geometry(stream_w, stream_h, fitted_width,
+                                      fitted_height))
       return false;
     if (pipe_started && pipe_w == stream_w && pipe_h == stream_h)
       return true;
@@ -417,7 +435,8 @@ bool serve_client(int client)
       LOGE(OBF("rtmp: H264DecodePipe.start(%dx%d) failed").c_str(), stream_w, stream_h);
       return false;
     }
-    LOGI(OBF("rtmp: pipe started %dx%d (decoder=%s)").c_str(), stream_w, stream_h, pipe.codec_name());
+    LOGI(OBF("rtmp: pipe started source=%dx%d shared=%dx%d (decoder=%s)").c_str(),
+         stream_w, stream_h, fitted_width, fitted_height, pipe.codec_name());
     pipe_started = true;
     pipe_w = stream_w;
     pipe_h = stream_h;
@@ -601,6 +620,16 @@ bool serve_client(int client)
       if (!recv_all(client, buf.data() + old_size, take))
         goto done;
     }
+    if (!publisher_authorized)
+    {
+      pre_auth_bytes += take;
+      if (pre_auth_bytes > kMaxPreAuthBytes ||
+          std::chrono::steady_clock::now() > auth_deadline)
+      {
+        LOGW(OBF("rtmp: publisher authentication deadline exceeded").c_str());
+        return false;
+      }
+    }
 
     if (buf.size() < last.length)
       continue;
@@ -696,6 +725,18 @@ bool serve_client(int client)
         }
         else if (cmd == OBF("publish").c_str())
         {
+          // publish(null, streamName, "live"). The server is reachable on
+          // the LAN, so accepting an arbitrary stream name would let another
+          // local-network peer replace camera frames. Authenticate before
+          // acknowledging publish or consuming any media.
+          std::string stream_name;
+          if (!r.skip_value() || !r.read_string(stream_name) ||
+              !constant_time_equal(stream_name, expected_stream_key))
+          {
+            LOGW(OBF("rtmp: rejected publisher with invalid stream key").c_str());
+            return false;
+          }
+          publisher_authorized = true;
           std::vector<uint8_t> resp;
           amf_put_string(resp, OBF("onStatus").c_str());
           amf_put_number(resp, 0.0);
@@ -719,6 +760,8 @@ bool serve_client(int client)
       case 0x12:
       case 0x0f:
       { // AMF data (onMetaData)
+        if (!publisher_authorized)
+          break;
         const uint8_t* p0 = body.data();
         const uint8_t* pe = body.data() + body.size();
         if (type == 0x0f && p0 < pe)
@@ -769,11 +812,9 @@ bool serve_client(int client)
                   break;
                 if (!std::isfinite(d))
                   continue;
-                if (key == OBF("width").c_str() && d >= 16.0 &&
-                    d <= CR_FEED_MAX_WIDTH)
+                if (key == OBF("width").c_str() && d >= 16.0 && d <= 8192.0)
                   stream_w = static_cast<int>(d);
-                else if (key == OBF("height").c_str() && d >= 16.0 &&
-                         d <= CR_FEED_MAX_HEIGHT)
+                else if (key == OBF("height").c_str() && d >= 16.0 && d <= 8192.0)
                   stream_h = static_cast<int>(d);
                 else if ((key == OBF("framerate").c_str() || key == "fps") &&
                          d >= 1.0 && d <= 240.0)
@@ -787,7 +828,7 @@ bool serve_client(int client)
             }
             break;
           }
-          if (stream_w > 0 && stream_h > 0)
+          if (enable_video && stream_w > 0 && stream_h > 0)
           {
             LOGI(OBF("rtmp meta: %dx%d @%d fps").c_str(), stream_w, stream_h, stream_fps_hint);
             try_start_pipe();
@@ -798,6 +839,8 @@ bool serve_client(int client)
 
       case 0x08:
       { // audio (FLV)
+        if (!publisher_authorized || !enable_audio)
+          break;
         if (body.size() < 2)
           break;
         const uint8_t flv0 = body[0];
@@ -824,6 +867,8 @@ bool serve_client(int client)
 
       case 0x09:
       { // video (H.264 / AVC)
+        if (!publisher_authorized || !enable_video)
+          break;
         if (body.size() < 5)
           break;
         uint8_t frame_type = (body[0] >> 4) & 0x0f;
@@ -852,10 +897,16 @@ bool serve_client(int client)
           sps_pps_annexb = std::move(config.parameter_sets_annexb);
           avcc_nalu_length_size = config.nalu_length_size;
           seen_video_keyframe = false;
-          // Some encoders publish the AVC sequence header BEFORE
-          // onMetaData. If we still don't know the resolution,
-          // we can't start the pipe yet — defer until the first
-          // keyframe path with a meta-derived resolution.
+          // ReCam's SPS-derived geometry removes the fragile dependency on
+          // onMetaData ordering. SPS is authoritative when it is parseable;
+          // metadata remains a compatibility fallback for unusual profiles.
+          if (config.width != 0 && config.height != 0)
+          {
+            stream_w = static_cast<int>(config.width);
+            stream_h = static_cast<int>(config.height);
+          }
+          if (stream_w > 0 && stream_h > 0)
+            try_start_pipe();
           if (pipe_started && !sps_pps_annexb.empty())
           {
             pipe.push(sps_pps_annexb.data(), sps_pps_annexb.size(), pts_us);
@@ -917,10 +968,20 @@ done:
 
 } // namespace
 
-extern "C" int cr_feed_run_rtmp(int port);
+extern "C" int cr_feed_run_rtmp(int port, const char* stream_key,
+                                int allow_lan, int enable_video,
+                                int enable_audio);
 
-int cr_feed_run_rtmp(int port)
+int cr_feed_run_rtmp(int port, const char* stream_key, int allow_lan,
+                     int enable_video, int enable_audio)
 {
+  if (!stream_key || strlen(stream_key) < 24 || strlen(stream_key) > 96 ||
+      (!enable_video && !enable_audio))
+  {
+    LOGE(OBF("rtmp: invalid stream-key policy").c_str());
+    return -1;
+  }
+  const std::string expected_stream_key(stream_key);
   int srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (srv < 0)
   {
@@ -933,7 +994,9 @@ int cr_feed_run_rtmp(int port)
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t) port);
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  // Loopback/USB is the default. Listening on the LAN is possible only after
+  // an explicit UI opt-in and still requires the random stream key.
+  addr.sin_addr.s_addr = htonl(allow_lan ? INADDR_ANY : INADDR_LOOPBACK);
 
   if (bind(srv, (sockaddr*) &addr, sizeof(addr)) != 0)
   {
@@ -947,7 +1010,9 @@ int cr_feed_run_rtmp(int port)
     close(srv);
     return -1;
   }
-  LOGI(OBF("rtmp listener on 127.0.0.1:%d").c_str(), port);
+  LOGI(OBF("rtmp listener on %s:%d (authenticated, video=%d audio=%d)").c_str(),
+       allow_lan ? OBF("0.0.0.0").c_str() : OBF("127.0.0.1").c_str(),
+       port, enable_video, enable_audio);
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
@@ -962,7 +1027,8 @@ int cr_feed_run_rtmp(int port)
       break;
     }
     LOGI(OBF("rtmp: publisher connected").c_str());
-    serve_client(client);
+    serve_client(client, expected_stream_key, enable_video != 0,
+                 enable_audio != 0);
     close(client);
     LOGI(OBF("rtmp: publisher gone").c_str());
   }

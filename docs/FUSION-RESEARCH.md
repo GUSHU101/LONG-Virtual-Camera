@@ -1,5 +1,8 @@
 # Fusion research record
 
+This record describes the historical Windows-first fusion. The current
+APK-only runtime is documented in [Architecture](ARCHITECTURE.md).
+
 ## Baselines and design choice
 
 - ReCam: `44f99681079c04e3b3e6d3a74fef96f03b480348`.
@@ -35,7 +38,8 @@ same process. The old stable/enhanced selector and `--engine` option were remove
 | Host privilege | Windows host requested administrator elevation | Run as the invoking user; keep root explicit and device-side only |
 | Child processes | ADB inherited broad handles and retained unbounded output | Explicit inherited-handle list, bounded capture/lines, exception-isolated callbacks and cancellable reader |
 | Tool discovery | Default Windows executable lookup could include current directory | Accept explicit, bundled or absolute PATH FFmpeg only |
-| Packaging | Missing resources became zero-byte placeholders and replacement was non-transactional | Release configure failure, SHA-256 manifest and private atomic verified extraction |
+| Packaging | Missing resources became zero-byte placeholders and replacement was non-transactional | Release configure failure, SHA-256 manifest, private atomic host extraction, and staged/verified/rollback-capable phone installation from both desktop and APK |
+| LSPosed/root control | Neither donor provided one modern system-scope companion shared with the fused host | API 102 module + UI, fixed `system` scope, one embedded controller, native cameraserver global path, default-OFF audioserver path and authenticated readiness reporting |
 | JPEG/BLOB | BLOB capacity was calculated as a 2-D image | Enforce height 1 and width-as-bytes before JPEG/trailer writes; release failed mapper locks cleanly |
 
 ## One session, composable features

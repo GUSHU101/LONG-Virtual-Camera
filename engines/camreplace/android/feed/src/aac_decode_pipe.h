@@ -17,6 +17,7 @@
 //   the phone — there's no PC-side decode any more. So we decode here.
 
 #include "audio_shm.h"
+#include "media_codec_runtime.h"
 
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
@@ -108,6 +109,8 @@ public:
   {
     if (!csd || len < 2 || len > 64)
       return false;
+
+    (void) ensure_media_codec_binder_pool();
 
     // Parse AudioSpecificConfig: object_type (5b), sr_idx (4b),
     // channel_cfg (4b). Same lookup table the PC AudioPump uses.

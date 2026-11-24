@@ -1,0 +1,286 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@color/navy"
+            android:orientation="vertical"
+            android:paddingStart="24dp"
+            android:paddingTop="28dp"
+            android:paddingEnd="24dp"
+            android:paddingBottom="24dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/title"
+                android:textColor="#FFFFFFFF"
+                android:textSize="25sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="5dp"
+                android:text="@string/subtitle"
+                android:textColor="#FFB6C3D4"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="28dp">
+
+            <LinearLayout style="@style/Card" android:orientation="vertical">
+                <TextView style="@style/SectionTitle" android:text="@string/scope_title" />
+                <TextView
+                    android:id="@+id/framework_status"
+                    style="@style/BodyText"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/framework_checking" />
+                <TextView
+                    style="@style/BodyText"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/scope_hint" />
+                <Button
+                    android:id="@+id/scope_button"
+                    style="@style/SecondaryButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="@string/scope_button" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/Card" android:orientation="vertical">
+                <TextView style="@style/SectionTitle" android:text="@string/source_title" />
+                <TextView
+                    style="@style/BodyText"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/source_hint" />
+                <TextView
+                    android:id="@+id/source_status"
+                    style="@style/BodyText"
+                    android:layout_marginTop="10dp"
+                    android:text="@string/source_not_configured"
+                    android:textColor="@color/ink" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:baselineAligned="false"
+                    android:orientation="horizontal">
+                    <Button
+                        android:id="@+id/select_video_button"
+                        style="@style/SecondaryButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/select_video" />
+                    <Space android:layout_width="8dp" android:layout_height="1dp" />
+                    <Button
+                        android:id="@+id/select_image_button"
+                        style="@style/SecondaryButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/select_image" />
+                </LinearLayout>
+                <Button
+                    android:id="@+id/select_audio_button"
+                    style="@style/SecondaryButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/select_audio" />
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginTop="16dp"
+                    android:layout_marginBottom="12dp"
+                    android:background="@color/divider" />
+
+                <TextView style="@style/SectionTitle" android:text="@string/obs_title" />
+                <TextView
+                    style="@style/BodyText"
+                    android:layout_marginTop="5dp"
+                    android:text="@string/obs_hint" />
+                <Switch
+                    android:id="@+id/obs_lan_switch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:minHeight="48dp"
+                    android:text="@string/obs_lan_opt_in"
+                    android:textColor="@color/ink" />
+                <TextView
+                    android:id="@+id/obs_configuration"
+                    style="@style/BodyText"
+                    android:layout_marginTop="10dp"
+                    android:background="@drawable/status_background"
+                    android:text="@string/obs_not_configured"
+                    android:textIsSelectable="true" />
+                <Button
+                    android:id="@+id/configure_obs_button"
+                    style="@style/PrimaryButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="@string/configure_obs" />
+                <Button
+                    android:id="@+id/copy_obs_button"
+                    style="@style/SecondaryButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/copy_obs" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/Card" android:orientation="vertical">
+                <TextView style="@style/SectionTitle" android:text="@string/root_title" />
+                <TextView
+                    android:id="@+id/root_status"
+                    style="@style/BodyText"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/root_not_checked" />
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:baselineAligned="false"
+                    android:orientation="horizontal">
+                    <Button
+                        android:id="@+id/root_button"
+                        style="@style/PrimaryButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/root_button" />
+                    <Space android:layout_width="8dp" android:layout_height="1dp" />
+                    <Button
+                        android:id="@+id/install_button"
+                        style="@style/SecondaryButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/install_button" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <LinearLayout style="@style/Card" android:orientation="vertical">
+                <Switch
+                    android:id="@+id/camera_switch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="48dp"
+                    android:text="@string/global_camera"
+                    android:textColor="@color/ink"
+                    android:textSize="17sp"
+                    android:textStyle="bold" />
+                <TextView
+                    style="@style/BodyText"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/global_camera_hint" />
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginTop="16dp"
+                    android:layout_marginBottom="12dp"
+                    android:background="@color/divider" />
+
+                <Switch
+                    android:id="@+id/photo_switch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="48dp"
+                    android:text="@string/photo_replace"
+                    android:textColor="@color/ink"
+                    android:textSize="17sp"
+                    android:textStyle="bold" />
+                <TextView
+                    style="@style/BodyText"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/photo_replace_hint" />
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginTop="16dp"
+                    android:layout_marginBottom="12dp"
+                    android:background="@color/divider" />
+
+                <Switch
+                    android:id="@+id/mic_switch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="48dp"
+                    android:text="@string/microphone_replace"
+                    android:textColor="@color/ink"
+                    android:textSize="17sp"
+                    android:textStyle="bold" />
+                <TextView
+                    style="@style/BodyText"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/microphone_replace_hint" />
+            </LinearLayout>
+
+            <LinearLayout style="@style/Card" android:orientation="vertical">
+                <TextView style="@style/SectionTitle" android:text="@string/status_title" />
+                <TextView
+                    android:id="@+id/operation_log"
+                    style="@style/BodyText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:background="@drawable/status_background"
+                    android:minHeight="96dp"
+                    android:text="@string/initial_log"
+                    android:textIsSelectable="true" />
+                <Button
+                    android:id="@+id/refresh_button"
+                    style="@style/SecondaryButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="@string/refresh" />
+                <Button
+                    android:id="@+id/stop_button"
+                    style="@style/PrimaryButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:backgroundTint="@color/warning"
+                    android:text="@string/stop_all" />
+            </LinearLayout>
+
+            <TextView
+                style="@style/BodyText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="@string/source_notice" />
+            <TextView
+                style="@style/BodyText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/authorized_notice"
+                android:textColor="@color/warning" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

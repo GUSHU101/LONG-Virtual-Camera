@@ -17,6 +17,20 @@ extern "C"
 {
 #endif
 
+  typedef struct cr_nv21_crop_rect
+  {
+    int x;
+    int y;
+    int width;
+    int height;
+  } cr_nv21_crop_rect;
+
+  // Aspect-preserving crop used for every camera output geometry. This is
+  // deliberately public so the geometry contract can be host-unit-tested.
+  // Coordinates and dimensions are even to stay aligned to 4:2:0 chroma.
+  int cr_nv21_center_crop(int src_w, int src_h, int dst_w, int dst_h,
+                          cr_nv21_crop_rect* out);
+
   // Source: contiguous Y plane at src + then interleaved VU at src + src_w*src_h
   // (i.e. NV21: V byte first in each chroma pair).
   // Destination: Y plane + VU/UV plane. The Y plane uses dst_y_stride between
