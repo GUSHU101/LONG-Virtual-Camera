@@ -62,8 +62,13 @@ camera_dump=$'Active Camera Clients:\n[\n(Camera ID: 0, Client Package Name: com
   INJECTOR=true
   HOOK=$fixture/libcr_hooks.so
   CAM_READY=$fixture/camhook.ready
-  pidof() { return 1; }
   wait_service() { return 0; }
+  mapped_hook_pid() {
+    [ -n "$mapped_pid" ] || return 1
+    printf '%s\n' "$mapped_pid"
+  }
+  kill() { killed_pid=$2; }
+  sleep() { :; }
   prepare_camera_ready() { return 0; }
   remember_and_close_camera() { activation=loading; }
   restore_camera() { activation=reopened; }
@@ -74,11 +79,13 @@ camera_dump=$'Active Camera Clients:\n[\n(Camera ID: 0, Client Package Name: com
       *) return 1 ;;
     esac
   }
-  activation=off reopened_pid=42
+  activation=off reopened_pid=42 mapped_pid= killed_pid=
   ensure_camera_hook || exit 1
-  activation=off reopened_pid=43
+  [[ -z $killed_pid ]]
+  activation=off reopened_pid=43 mapped_pid=40
   if ensure_camera_hook; then exit 1; fi
-  activation=off reopened_pid=
+  [[ $killed_pid == 40 ]]
+  activation=off reopened_pid= mapped_pid=
   if ensure_camera_hook; then exit 1; fi
 )
 

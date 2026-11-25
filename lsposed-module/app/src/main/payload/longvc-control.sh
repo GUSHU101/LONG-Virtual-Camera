@@ -398,7 +398,10 @@ ensure_camera_hook() {
   hook_pid cameraserver "$CAM_READY" >/dev/null 2>&1 && return 0
 
   remember_and_close_camera
-  camera_previous=$(pidof -s cameraserver 2>/dev/null)
+  # Keep a healthy stock service running. A restart is only needed if
+  # an earlier payload is still mapped but failed readiness.
+  camera_previous=$(mapped_hook_pid cameraserver 2>/dev/null) ||
+    camera_previous=
   if [ -n "$camera_previous" ]; then
     kill -TERM "$camera_previous" 2>/dev/null || { restore_camera; return 1; }
   fi
@@ -420,6 +423,7 @@ ensure_camera_hook() {
   [ "$inject_rc" -eq 0 ] || return "$inject_rc"
   # The service can exit as its clients reconnect. Check the same live
   # process before a caller installs its lease flag and reports success.
+  sleep 1
   [ -n "$installed_camera_pid" ] &&
     [ "$(hook_pid cameraserver "$CAM_READY" 2>/dev/null)" = "$installed_camera_pid" ]
 }
