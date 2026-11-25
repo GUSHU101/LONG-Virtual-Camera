@@ -102,10 +102,25 @@ public final class RootLifecycleTest {
         }
     }
 
+    private static void checksCameraOutputStats() throws Exception {
+        String raw = snapshot("ok").replace("camera_hook_ready=0", "camera_hook_ready=1");
+        check(!RuntimeState.parseController(raw, true, true).hasCameraOutputStats(),
+                "a mapped hook alone cannot verify writes");
+        String counters = "camera_written_yuv=59\ncamera_written_jpeg=0\n"
+                + "camera_raw_ten=60\ncamera_unsupported=60\n";
+        RuntimeState state = RuntimeState.parseController(raw + counters, true, true);
+        check(state.hasCameraOutputStats() && state.cameraWrittenYuv == 59
+                && state.cameraWrittenJpeg == 0 && state.cameraRawTen == 60,
+                "mixed YUV and RAW streams must remain distinguishable");
+        check(!RuntimeState.parseController(raw + counters.replace("=60\n", "=-1\n"),
+                true, true).hasCameraOutputStats(), "invalid counters must be absent");
+    }
+
     public static void main(String[] args) throws Exception {
         cancelsQueuedWork();
         interruptsRunningWork();
         verifiesRecoveryResult();
+        checksCameraOutputStats();
         System.out.println("Root lifecycle checks passed");
     }
 }

@@ -27,6 +27,10 @@ final class RuntimeState {
     final boolean audioHookReady;
     final boolean videoChannelReady;
     final boolean audioChannelReady;
+    final long cameraWrittenYuv;
+    final long cameraWrittenJpeg;
+    final long cameraRawTen;
+    final long cameraUnsupported;
     final String abi;
     final String selinux;
     final String raw;
@@ -56,6 +60,10 @@ final class RuntimeState {
         this.audioHookReady = flag(values, "audio_hook_ready");
         this.videoChannelReady = flag(values, "video_channel_ready");
         this.audioChannelReady = flag(values, "audio_channel_ready");
+        this.cameraWrittenYuv = counter(values, "camera_written_yuv");
+        this.cameraWrittenJpeg = counter(values, "camera_written_jpeg");
+        this.cameraRawTen = counter(values, "camera_raw_ten");
+        this.cameraUnsupported = counter(values, "camera_unsupported");
         this.abi = values.getOrDefault("abi", "unknown");
         this.selinux = values.getOrDefault("selinux", "unknown");
         this.raw = raw;
@@ -106,6 +114,11 @@ final class RuntimeState {
         return photoEnabled && videoFeederReady && cameraHookReady && videoChannelReady;
     }
 
+    boolean hasCameraOutputStats() {
+        return cameraHookReady && cameraWrittenYuv >= 0 && cameraWrittenJpeg >= 0
+                && cameraRawTen >= 0 && cameraUnsupported >= cameraRawTen;
+    }
+
     boolean micHealthy() {
         return micEnabled && audioFeederReady && audioHookReady && audioChannelReady;
     }
@@ -136,5 +149,11 @@ final class RuntimeState {
 
     private static boolean flag(Map<String, String> values, String key) {
         return "1".equals(values.get(key));
+    }
+
+    private static long counter(Map<String, String> values, String key) {
+        String value = values.get(key);
+        if (value == null || !value.matches("[0-9]{1,10}")) return -1L;
+        return Long.parseLong(value);
     }
 }

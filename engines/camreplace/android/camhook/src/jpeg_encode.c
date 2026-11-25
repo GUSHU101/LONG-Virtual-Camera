@@ -8,11 +8,8 @@
 //   1. Allocate w*h*3 byte RGB scratch on heap (~6 MB at 1080p, ~36 MB
 //      at 4K — fine inside cameraserver, freed immediately).
 //   2. NV21 → RGB888 conversion (BT.601 limited-range Y'CbCr math).
-//   3. stbi_write_jpg_to_func writes JPEG bytes via callback directly
-//      into the destination buffer (the BLOB camera buffer), tracking
-//      offset and refusing to overflow.
-// Returns 0 on success, negative on failure. *out_written gets the
-// JPEG payload size on success (trailer written separately by caller).
+//   3. Encode into a bounded scratch buffer. The camera buffer remains
+//      untouched until the caller has a complete JPEG.
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STBI_WRITE_NO_STDIO
@@ -29,22 +26,36 @@
 struct EncodeCtx
 {
   uint8_t* dst;
-  size_t cap;
+  size_t allocated;
+  size_t limit;
   size_t off;
-  int overflow;
+  int error;
 };
 
 static void write_cb(void* user, void* data, int size)
 {
   struct EncodeCtx* ctx = (struct EncodeCtx*) user;
-  if (ctx->overflow)
+  if (ctx->error || size <= 0)
     return;
-  if ((size_t) size <= 0)
-    return;
-  if (ctx->off + (size_t) size > ctx->cap)
+  if ((size_t) size > ctx->limit - ctx->off)
   {
-    ctx->overflow = 1;
+    ctx->error = -3;
     return;
+  }
+  const size_t needed = ctx->off + (size_t) size;
+  if (needed > ctx->allocated)
+  {
+    size_t capacity = ctx->allocated ? ctx->allocated : 1024;
+    while (capacity < needed)
+      capacity = capacity > ctx->limit / 2 ? ctx->limit : capacity * 2;
+    uint8_t* grown = (uint8_t*) realloc(ctx->dst, capacity);
+    if (!grown)
+    {
+      ctx->error = -2;
+      return;
+    }
+    ctx->dst = grown;
+    ctx->allocated = capacity;
   }
   memcpy(ctx->dst + ctx->off, data, (size_t) size);
   ctx->off += (size_t) size;
@@ -88,30 +99,79 @@ static void nv21_to_rgb24(const uint8_t* nv21, int sw, int sh, uint8_t* rgb)
   }
 }
 
-int cr_nv21_to_jpeg(const uint8_t* nv21, int sw, int sh, uint8_t* dst, size_t dst_cap, int quality, size_t* out_written)
+int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int sw, int sh,
+                    size_t dst_cap, int quality, uint8_t** out, size_t* out_written)
 {
-  if (!nv21 || sw < 8 || sh < 8 || !dst || dst_cap < 1024)
+  if (out)
+    *out = NULL;
+  if (out_written)
+    *out_written = 0;
+  if (!out || !out_written || !nv21 || sw < 8 || sh < 8 || sw > 8192 ||
+      sh > 8192 || (sw & 1) || (sh & 1) || dst_cap < 1024)
+    return -1;
+  const size_t pixels = (size_t) sw * sh;
+  if (pixels + pixels / 2 > src_size)
     return -1;
   if (quality < 1 || quality > 100)
     quality = 85;
 
-  uint8_t* rgb = (uint8_t*) malloc((size_t) sw * sh * 3);
+  uint8_t* rgb = (uint8_t*) malloc(pixels * 3);
   if (!rgb)
     return -2;
   nv21_to_rgb24(nv21, sw, sh, rgb);
 
-  struct EncodeCtx ctx;
-  ctx.dst = dst;
-  ctx.cap = dst_cap;
-  ctx.off = 0;
-  ctx.overflow = 0;
+  struct EncodeCtx ctx = {0};
+  ctx.limit = dst_cap;
 
   int ok = stbi_write_jpg_to_func(write_cb, &ctx, sw, sh, 3, rgb, quality);
   free(rgb);
 
-  if (!ok || ctx.overflow || ctx.off == 0)
-    return -3;
-  if (out_written)
-    *out_written = ctx.off;
+  if (!ok || ctx.error || ctx.off == 0)
+  {
+    free(ctx.dst);
+    return ctx.error ? ctx.error : -3;
+  }
+  *out = ctx.dst;
+  *out_written = ctx.off;
+  return 0;
+}
+
+struct CameraJpegTrailer
+{
+  uint16_t id;
+  uint16_t padding;
+  uint32_t size;
+};
+
+_Static_assert(sizeof(struct CameraJpegTrailer) == CR_CAMERA_JPEG_TRAILER_BYTES,
+               "Camera3 JPEG trailer size");
+_Static_assert(offsetof(struct CameraJpegTrailer, size) == 4,
+               "Camera3 JPEG trailer size offset");
+
+static int has_jpeg_markers(const uint8_t* data, size_t size)
+{
+  return size >= 4 && data[0] == 0xff && data[1] == 0xd8 &&
+         data[size - 2] == 0xff && data[size - 1] == 0xd9;
+}
+
+int cr_replace_camera_jpeg(uint8_t* dst, size_t dst_size,
+                           const uint8_t* jpeg, size_t jpeg_size)
+{
+  const uint16_t jpeg_id = 0x00ff;
+  struct CameraJpegTrailer previous;
+  if (!dst || !jpeg || dst_size < sizeof(previous) ||
+      jpeg_size > dst_size - sizeof(previous) || jpeg_size > UINT32_MAX ||
+      !has_jpeg_markers(jpeg, jpeg_size))
+    return -1;
+
+  const size_t capacity = dst_size - sizeof(previous);
+  memcpy(&previous, dst + capacity, sizeof(previous));
+  if (previous.id != jpeg_id || previous.size > capacity ||
+      previous.size < 2 || dst[0] != 0xff || dst[1] != 0xd8)
+    return -1;
+
+  const struct CameraJpegTrailer replacement = {jpeg_id, 0, (uint32_t) jpeg_size};
+  memcpy(dst, jpeg, jpeg_size);
+  memcpy(dst + capacity, &replacement, sizeof(replacement));
   return 0;
 }

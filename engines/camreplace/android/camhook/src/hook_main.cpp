@@ -22,6 +22,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <vector>
@@ -330,14 +332,6 @@ static bool refresh_photo_mode_()
   }
   return on;
 }
-
-struct CR_Camera3JpegBlob
-{
-  uint16_t blob_id;
-  uint32_t jpeg_size;
-};
-static_assert(sizeof(CR_Camera3JpegBlob) == 8, "trailer must be 8 bytes (uint16 + 2 pad + uint32)" /*OBF_SKIP*/);
-static constexpr uint16_t CR_CAMERA3_JPEG_BLOB_ID = 0x00FF;
 
 static void resolve_photo_mode()
 {
@@ -664,6 +658,7 @@ static std::atomic<int> g_stat_skip_nogbm{0};
 static std::atomic<int> g_stat_skip_noanb{0};
 static std::atomic<int> g_stat_skip_dims{0};
 static std::atomic<int> g_stat_skip_fmt{0};
+static std::atomic<int> g_stat_skip_raw10{0};
 static std::atomic<int> g_stat_skip_handle{0};
 static std::atomic<int> g_stat_lock_fail{0};
 static std::atomic<int> g_stat_no_vu{0};
@@ -784,6 +779,8 @@ static bool lock_via_ahb(const void* anb, int W, int H, int fence,
       p1.pixelStride != 2 || p2.pixelStride != 2 ||
       p0.rowStride < static_cast<uint32_t>(W) ||
       p1.rowStride < static_cast<uint32_t>(W) ||
+      p0.rowStride > std::numeric_limits<int>::max() ||
+      p1.rowStride > std::numeric_limits<int>::max() ||
       p2.rowStride != p1.rowStride || chroma_delta != 1u)
   {
     g_ahb_unlock(ahb, nullptr);
@@ -824,7 +821,9 @@ static bool lock_via_gbm(const void* anb, const void* handle, int W, int H,
   const uintptr_t chroma_delta = cb > cr ? cb - cr : cr - cb;
   if (yc.y && yc.cb && yc.cr && yc.chroma_step == 2 &&
       yc.ystride >= static_cast<size_t>(W) &&
-      yc.cstride >= static_cast<size_t>(W) && chroma_delta == 1u)
+      yc.cstride >= static_cast<size_t>(W) &&
+      yc.ystride <= std::numeric_limits<int>::max() &&
+      yc.cstride <= std::numeric_limits<int>::max() && chroma_delta == 1u)
   {
     view.y = static_cast<uint8_t*>(yc.y);
     view.ystride = yc.ystride;
@@ -850,17 +849,11 @@ static bool lock_via_gbm(const void* anb, const void* handle, int W, int H,
   return true;
 }
 
-static void unlock(const void* anb, const void* handle, void* ahb, const LockedView& view)
+static bool unlock(const void* handle, void* ahb, const LockedView& view)
 {
   if (view.lock_path == 0 && ahb && g_ahb_unlock)
-  {
-    g_ahb_unlock(ahb, nullptr);
-  }
-  else if (view.lock_path == 1)
-  {
-    gbm_call_unlock(handle);
-  }
-  (void) anb;
+    return g_ahb_unlock(ahb, nullptr) == 0;
+  return view.lock_path == 1 && gbm_call_unlock(handle) == 0;
 }
 
 static std::atomic<int> g_stat_blob_lock_fail{0};
@@ -868,12 +861,18 @@ static std::atomic<int> g_stat_blob_too_big{0};
 static std::atomic<int> g_stat_blob_ok{0};
 static std::atomic<int> g_stat_blob_cache_hit{0};
 
+struct EncodedJpeg
+{
+  std::shared_ptr<const uint8_t> data;
+  size_t size = 0;
+  uint32_t generation = 0;
+  uint64_t frame = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
 static std::mutex g_jpeg_cache_mutex;
-static std::vector<uint8_t> g_jpeg_cache;
-static uint32_t g_jpeg_cache_generation = 0;
-static uint64_t g_jpeg_cache_frame = 0;
-static int g_jpeg_cache_src_w = 0;
-static int g_jpeg_cache_src_h = 0;
+static EncodedJpeg g_jpeg_cache;
 
 static bool lock_blob(const void* anb, const void* handle, int W, int H, int fence,
                       void*& out_vaddr, void*& out_ahb_handle, int& out_lock_path)
@@ -952,13 +951,13 @@ struct BlobLockGuard
   BlobLockGuard(const BlobLockGuard&) = delete;
   BlobLockGuard& operator=(const BlobLockGuard&) = delete;
 
-  void unlock() noexcept
+  bool unlock() noexcept
   {
-    if (path == 0 && ahb && g_ahb_unlock)
-      g_ahb_unlock(ahb, nullptr);
-    else if (path == 1 && handle)
-      gbm_call_unlock(handle);
+    const int previous = path;
     path = -1;
+    if (previous == 0 && ahb && g_ahb_unlock)
+      return g_ahb_unlock(ahb, nullptr) == 0;
+    return previous == 1 && handle && gbm_call_unlock(handle) == 0;
   }
 };
 
@@ -995,13 +994,45 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   if (H != 1)
     return false;
   const size_t buf_capacity = (size_t) W;
-  const size_t trailer_size = sizeof(CR_Camera3JpegBlob);
+  const size_t trailer_size = CR_CAMERA_JPEG_TRAILER_BYTES;
   if (buf_capacity < trailer_size + 1024)
     return false;
   const size_t encode_cap = buf_capacity - trailer_size;
 
   const void* handle = anb->handle;
   if (!handle)
+    return false;
+
+  EncodedJpeg jpeg;
+  {
+    std::lock_guard<std::mutex> guard(g_jpeg_cache_mutex);
+    if (g_jpeg_cache.data && g_jpeg_cache.generation == source.generation &&
+        g_jpeg_cache.frame == cur_frame && g_jpeg_cache.width == source.width &&
+        g_jpeg_cache.height == source.height)
+      jpeg = g_jpeg_cache;
+  }
+  const bool cache_hit = static_cast<bool>(jpeg.data);
+  if (!cache_hit)
+  {
+    uint8_t* encoded = nullptr;
+    const int result = cr_nv21_to_jpeg(source.data, source.slot_size, src_w, src_h,
+                                      encode_cap, 85, &encoded, &jpeg.size);
+    if (result != 0)
+    {
+      const int n = ++g_stat_blob_too_big;
+      if (n <= 5 || (n % 60) == 0)
+        LOGW(OBF("blob: JPEG preparation failed rc=%d cap=%zu").c_str(), result, encode_cap);
+      return false;
+    }
+    jpeg.data = std::shared_ptr<const uint8_t>(encoded, std::free);
+    jpeg.generation = source.generation;
+    jpeg.frame = cur_frame;
+    jpeg.width = source.width;
+    jpeg.height = source.height;
+    std::lock_guard<std::mutex> guard(g_jpeg_cache_mutex);
+    g_jpeg_cache = jpeg;
+  }
+  if (jpeg.size > encode_cap)
     return false;
 
   void* vaddr = nullptr;
@@ -1017,63 +1048,21 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     return false;
   }
   BlobLockGuard blob_lock(handle, ahb_handle, lock_path);
+  if (access("/data/cr/photo_mode", R_OK) != 0 ||
+      atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
+          CR_CHANNEL_STATE_READY ||
+      cr_replace_camera_jpeg(static_cast<uint8_t*>(vaddr), buf_capacity,
+                             jpeg.data.get(), jpeg.size) != 0)
+    return false;
+  if (!blob_lock.unlock())
+    return false;
 
-  bool cache_hit = false;
-  size_t jpeg_bytes = 0;
-  bool need_encode = true;
-  {
-    std::lock_guard<std::mutex> g(g_jpeg_cache_mutex);
-
-    const bool cache_valid = !g_jpeg_cache.empty() &&
-                             g_jpeg_cache.size() <= encode_cap &&
-                             g_jpeg_cache_generation == source.generation &&
-                             g_jpeg_cache_src_w == src_w &&
-                             g_jpeg_cache_src_h == src_h;
-
-    const bool same_frame = cache_valid && g_jpeg_cache_frame == cur_frame;
-    if (same_frame)
-    {
-      jpeg_bytes = g_jpeg_cache.size();
-      memcpy(vaddr, g_jpeg_cache.data(), jpeg_bytes);
-      cache_hit = true;
-      ++g_stat_blob_cache_hit;
-      need_encode = false;
-    }
-  }
-
-  if (need_encode)
-  {
-    int rc = cr_nv21_to_jpeg(source.data, src_w, src_h, (uint8_t*) vaddr, encode_cap, 85, &jpeg_bytes);
-    if (rc != 0 || jpeg_bytes == 0)
-    {
-      int n = ++g_stat_blob_too_big;
-      if (n <= 5 || (n % 60) == 0)
-      {
-        LOGW(OBF("blob: nv21->jpeg failed rc=%d jpeg=%zu cap=%zu (src %dx%d -> buf %dx%d)").c_str(), rc, jpeg_bytes, encode_cap, src_w, src_h, W, H);
-      }
-      blob_lock.unlock();
-      return false;
-    }
-
-    std::lock_guard<std::mutex> g(g_jpeg_cache_mutex);
-    g_jpeg_cache.assign((const uint8_t*) vaddr, (const uint8_t*) vaddr + jpeg_bytes);
-    g_jpeg_cache_generation = source.generation;
-    g_jpeg_cache_frame = cur_frame;
-    g_jpeg_cache_src_w = src_w;
-    g_jpeg_cache_src_h = src_h;
-  }
-
-  CR_Camera3JpegBlob trailer;
-  trailer.blob_id = CR_CAMERA3_JPEG_BLOB_ID;
-  trailer.jpeg_size = (uint32_t) jpeg_bytes;
-  memcpy((uint8_t*) vaddr + buf_capacity - trailer_size, &trailer, sizeof(trailer));
-
-  blob_lock.unlock();
-
+  if (cache_hit)
+    ++g_stat_blob_cache_hit;
   int n = ++g_stat_blob_ok;
   if (n <= 5 || (n % 30) == 0)
   {
-    LOGI(OBF("blob#%d substituted: %zu JPEG bytes (src %dx%d -> buf %dx%d) via=%s %s").c_str(), n, jpeg_bytes, src_w, src_h, W, H, lock_path == 0 ? OBF("AHB").c_str() : OBF("GBM").c_str(), cache_hit ? OBF("(cache hit)").c_str() : OBF("(re-encoded)").c_str());
+    LOGI(OBF("blob#%d substituted: %zu JPEG bytes (src %dx%d -> buf %dx%d) via=%s %s").c_str(), n, jpeg.size, src_w, src_h, W, H, lock_path == 0 ? OBF("AHB").c_str() : OBF("GBM").c_str(), cache_hit ? OBF("(cache hit)").c_str() : OBF("(re-encoded)").c_str());
   }
   return true;
 }
@@ -1148,9 +1137,16 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
+  if (fmt != 0x11 && fmt != 0x22 && fmt != 0x23)
+  {
+    ++g_stat_skip_fmt;
+    if (fmt == 0x25)
+      ++g_stat_skip_raw10;
+    return cr::camhook::ReplacementOutcome::PassThrough;
+  }
+
   if (access("/data/cr/video_mode", R_OK) != 0)
     return cr::camhook::ReplacementOutcome::PassThrough;
-
   if (!ahb_planes_ready() && !gbm_ready())
   {
     ++g_stat_skip_nogbm;
@@ -1159,15 +1155,10 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
 
   const int W = bi.width;
   const int H = bi.height;
-  if (W < 16 || H < 16 || W > 8192 || H > 8192)
+  if (W < 16 || H < 16 || W > 8192 || H > 8192 || (W & 1) || (H & 1) ||
+      static_cast<int64_t>(W) * H > 32LL * 1024 * 1024)
   {
     ++g_stat_skip_dims;
-    return cr::camhook::ReplacementOutcome::PassThrough;
-  }
-
-  if (fmt != 0x11 && fmt != 0x22 && fmt != 0x23)
-  {
-    ++g_stat_skip_fmt;
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
@@ -1193,22 +1184,25 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
   bool replaced = false;
   if (view.y && view.vu)
   {
-    int n = ++g_stat_blit_ok;
-    if (n <= 3 || (n % 60) == 0)
-    {
-      LOGI(OBF("blit#%d %dx%d via=%s y=%p vu=%p ys=%zu us=%zu order=%s (src %ux%u)").c_str(), n, W, H, view.lock_path == 0 ? OBF("AHB").c_str() : OBF("GBM").c_str(), view.y, view.vu, view.ystride, view.uvstride, view.uv_swapped ? OBF("NV12(U-first)").c_str() : OBF("NV21(V-first)").c_str(), __atomic_load_n(&g_shm.header->width, __ATOMIC_ACQUIRE), __atomic_load_n(&g_shm.header->height, __ATOMIC_ACQUIRE));
-    }
-
     PinnedSlot source;
     if (!g_shm.pin_current(source))
     {
-      unlock(anb, handle, ahb, view);
+      unlock(handle, ahb, view);
       return cr::camhook::ReplacementOutcome::AttemptedFailed;
     }
     if (!frame_is_fresh(source))
     {
       ++g_stat_skip_stale;
-      unlock(anb, handle, ahb, view);
+      unlock(handle, ahb, view);
+      return cr::camhook::ReplacementOutcome::PassThrough;
+    }
+    cr_nv21_crop_rect crop;
+    if (!cr_nv21_center_crop(source.width, source.height, W, H, &crop) ||
+        access("/data/cr/video_mode", R_OK) != 0 ||
+        atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
+            CR_CHANNEL_STATE_READY)
+    {
+      unlock(handle, ahb, view);
       return cr::camhook::ReplacementOutcome::PassThrough;
     }
     blit_adaptive(source.data, (int) source.width, (int) source.height,
@@ -1221,7 +1215,9 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
     ++g_stat_no_vu;
   }
 
-  unlock(anb, handle, ahb, view);
+  replaced = unlock(handle, ahb, view) && replaced;
+  if (replaced)
+    ++g_stat_blit_ok;
   return replaced ? cr::camhook::ReplacementOutcome::Succeeded
                   : cr::camhook::ReplacementOutcome::AttemptedFailed;
 }
@@ -1249,6 +1245,11 @@ static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
   }
 
   const auto outcome = overwrite_nv21(anb, fence);
+
+  if (n <= 5 || (n % 30) == 0)
+    LOGI(OBF("camera_output v1 yuv=%d jpeg=%d raw10=%d unsupported=%d").c_str(),
+         g_stat_blit_ok.load(), g_stat_blob_ok.load(), g_stat_skip_raw10.load(),
+         g_stat_skip_fmt.load());
 
   if ((n % 60) == 0)
   {

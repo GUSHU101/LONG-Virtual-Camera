@@ -489,7 +489,7 @@ public final class MainActivity extends Activity
                 + "\n照片替换：" + cameraState(state, state.photoEnabled)
                 + "\n虚拟麦克风：" + microphoneState(state)
                 + (state.micEnabled ? "" : "（手机原生麦克风）")
-                + "\n\n本地媒体与 OBS 共用同一条手机端解码和系统服务替换管线。";
+                + cameraOutputSummary(state);
     }
 
     private static String cameraState(RuntimeState state, boolean enabled) {
@@ -499,7 +499,18 @@ public final class MainActivity extends Activity
         if (!state.cameraHookReady) return "等待 cameraserver hook";
         if (!state.videoChannelReady) return state.visualUsesObs()
                 ? "等待 OBS H.264 视频帧" : "等待本地视频帧";
-        return "载荷已接入且有输入帧，实际画面需在相机中确认";
+        return "载荷已接入且有输入帧";
+    }
+
+    private static String cameraOutputSummary(RuntimeState state) {
+        if ((!state.cameraEnabled && !state.photoEnabled) || !state.cameraHookReady)
+            return "";
+        if (!state.hasCameraOutputStats())
+            return "\n\n尚无相机输出记录。打开相机后返回刷新状态。";
+        return "\n\n当前相机服务累计写入：YUV " + state.cameraWrittenYuv
+                + " 帧，JPEG " + state.cameraWrittenJpeg + " 张。"
+                + "\n格式不支持而保留原画面：" + state.cameraUnsupported
+                + " 次（RAW10 " + state.cameraRawTen + " 次）。";
     }
 
     private static String microphoneState(RuntimeState state) {

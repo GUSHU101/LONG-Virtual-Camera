@@ -70,6 +70,11 @@ jobs:
             engines/camreplace/android/camhook/src/nv21_blit.c \
             -o /tmp/nv21_blit_test
           /tmp/nv21_blit_test
+          gcc -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -Iengines/camreplace/android/camhook/src tests/native/camera_jpeg_test.c \
+            engines/camreplace/android/camhook/src/jpeg_encode.c -lm -o /tmp/camera_jpeg_test
+          /tmp/camera_jpeg_test
       - name: Interruptible network listener
         run: |
           set -euo pipefail

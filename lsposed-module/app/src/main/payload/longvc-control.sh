@@ -297,9 +297,17 @@ wait_service() {
 
 camera_packages() {
   dumpsys media.camera 2>/dev/null |
-    sed -nE -e 's/.*Client Package Name: *([A-Za-z0-9._]+).*/\1/p' \
-      -e 's/.*client for package ([A-Za-z0-9._]+).*/\1/p' |
-    head -n 3 | sort -u
+    awk '
+      /^Active Camera Clients:/ {
+        active = $0 !~ /\[\]/
+        next
+      }
+      active && /^[[:space:]]*\]|^Allowed user IDs:|^==/ { exit }
+      active && /Client Package Name:/ {
+        sub(/^.*Client Package Name:[[:space:]]*/, "")
+        if (match($0, /^[A-Za-z0-9._]+/)) print substr($0, RSTART, RLENGTH)
+      }' |
+    sort -u | head -n 3
 }
 
 remember_and_close_camera() {
@@ -664,16 +672,16 @@ arm_photo() {
     rm -f "$CONTROL/photo.lease"
     return 1
   fi
-  if ! install_camera_flag "$DATA/photo_mode"; then
-    rm -f "$CONTROL/photo.lease" "$DATA/photo_mode"
-    return 1
-  fi
   if ! ensure_video; then
     rm -f "$CONTROL/photo.lease" "$DATA/photo_mode"
     if [ ! -e "$CONTROL/camera.lease" ]; then
       stop_video_passthrough
       unload_camera_hook
     fi
+    return 1
+  fi
+  if ! install_camera_flag "$DATA/photo_mode"; then
+    disarm_photo
     return 1
   fi
 }
@@ -723,6 +731,24 @@ stop_all() {
   unload_camera_hook || stop_all_rc=1
   unload_audio_hook || stop_all_rc=1
   return "$stop_all_rc"
+}
+
+camera_output_stats() {
+  case "$1" in ''|*[!0-9]*) return ;; esac
+  # Only export structured counters from the currently mapped cameraserver.
+  # Older payloads and devices without log access simply omit these fields.
+  logcat --pid="$1" -b main -d -v raw -s cr_camhook:I 2>/dev/null |
+    awk '/^camera_output v1 yuv=[0-9]+ jpeg=[0-9]+ raw10=[0-9]+ unsupported=[0-9]+$/ {
+      split($3, yuv, "="); split($4, jpeg, "=")
+      split($5, raw, "="); split($6, unsupported, "=")
+      found = 1
+    } END {
+      if (!found) exit
+      print "camera_written_yuv=" yuv[2]
+      print "camera_written_jpeg=" jpeg[2]
+      print "camera_raw_ten=" raw[2]
+      print "camera_unsupported=" unsupported[2]
+    }'
 }
 
 print_status() {
@@ -808,6 +834,7 @@ print_status() {
   say "audio_hook_ready=$audio_hook_ready"
   say "camera_hook_pid=$camera_hook"
   say "audio_hook_pid=$audio_hook"
+  camera_output_stats "$camera_hook"
   say "selinux=$(getenforce 2>/dev/null)"
   say "result=ok"
 }
