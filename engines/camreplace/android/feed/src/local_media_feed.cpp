@@ -10,6 +10,7 @@
 
 #include "../include/cr_feed.h"
 #include "audio_shm.h"
+#include "feed_queues.h"
 #include "h264_decode_pipe.h"
 #include "media_codec_runtime.h"
 
@@ -30,15 +31,20 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <exception>
 #include <limits>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "util/Obf.h"
 #include "media/AdaptiveGeometry.h"
 #include "media/FrameLayout.h"
+#include "media/Yuv420Nv21.h"
 
 #define TAG "cr_feed"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -57,7 +63,7 @@ constexpr int32_t kColorYuv420PackedSemiPlanar = 39;
 constexpr uint32_t kImageMagic = 0x31564e4cu; // "LNV1" little-endian
 constexpr uint64_t kMaxMediaBytes = 4ull * 1024ull * 1024ull * 1024ull;
 constexpr int32_t kMaxDecoderDimension = 16384;
-// Allow padded 8K YUV420 layouts while bounding each CPU-side frame copy.
+// Bound the mapped span of padded decoder YUV420 layouts.
 constexpr size_t kMaxDecoderFrameBytes = 96u * 1024u * 1024u;
 
 uint64_t monotonic_us()
@@ -99,21 +105,36 @@ bool open_regular_media(const char* path, int& fd, off_t& length)
   return true;
 }
 
-struct Plane
-{
-  const uint8_t* data = nullptr;
-  int32_t row_stride = 0;
-  int32_t pixel_stride = 1;
-};
-
 struct VideoFrame
 {
-  Plane y;
-  Plane u;
-  Plane v;
+  cr::media::YuvPlane y;
+  cr::media::YuvPlane u;
+  cr::media::YuvPlane v;
   int32_t width = 0;
   int32_t height = 0;
   int64_t pts_us = 0;
+
+  VideoFrame() = default;
+  VideoFrame(const VideoFrame&) = delete;
+  VideoFrame& operator=(const VideoFrame&) = delete;
+  ~VideoFrame() { release(); }
+
+  void hold(AMediaCodec* codec, size_t index)
+  {
+    codec_ = codec;
+    index_ = index;
+  }
+
+  void release()
+  {
+    if (codec_)
+      AMediaCodec_releaseOutputBuffer(codec_, index_, false);
+    codec_ = nullptr;
+  }
+
+private:
+  AMediaCodec* codec_ = nullptr;
+  size_t index_ = 0;
 };
 
 class FileVideoDecoder
@@ -173,7 +194,7 @@ public:
     int32_t fps = 0;
     if (AMediaFormat_getInt32(selected, AMEDIAFORMAT_KEY_FRAME_RATE, &fps) &&
         fps >= 1 && fps <= 240)
-      fallback_interval_us_ = 1000000 / fps;
+      nominal_frame_interval_us_ = 1000000 / fps;
     AMediaFormat_getInt32(selected, OBF("rotation-degrees").c_str(), &rotation_);
     rotation_ = ((rotation_ % 360) + 360) % 360;
     if (rotation_ != 0 && rotation_ != 90 && rotation_ != 180 && rotation_ != 270)
@@ -207,7 +228,6 @@ public:
 
   void close()
   {
-    frame_.clear();
     output_layout_ = {};
     output_format_known_ = false;
     if (codec_)
@@ -230,6 +250,7 @@ public:
 
   bool next(VideoFrame& out)
   {
+    out.release();
     for (int attempt = 0; attempt < 96 && !g_stop.load(std::memory_order_relaxed);
          ++attempt)
     {
@@ -280,34 +301,21 @@ public:
       size_t capacity = 0;
       uint8_t* bytes =
           AMediaCodec_getOutputBuffer(codec_, static_cast<size_t>(output), &capacity);
-      bool copied = false;
       cr::media::PlaneSpan window;
+      if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+        rewind_pending_ = true;
       if (bytes && output_layout_.storage_bytes != 0 &&
           cr::media::valid_codec_window(capacity, info.offset, info.size, window) &&
           window.bytes >= output_layout_.storage_bytes)
       {
-        try
-        {
-          const uint8_t* start = bytes + window.offset;
-          frame_.assign(start, start + output_layout_.storage_bytes);
-          describe(out);
-          copied = true;
-        }
-        catch (const std::bad_alloc&)
-        {
-          AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(output), false);
-          LOGE(OBF("local video: insufficient memory for decoded frame").c_str());
-          return false;
-        }
-      }
-      AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(output), false);
-      if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
-        rewind_pending_ = true;
-      if (copied)
-      {
+        // The frame owns this codec buffer until conversion is complete.
+        // No full-size intermediate copy is necessary.
+        out.hold(codec_, static_cast<size_t>(output));
+        describe(bytes + window.offset, out);
         out.pts_us = info.presentationTimeUs;
         return true;
       }
+      AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(output), false);
       if (rewind_pending_)
         break;
     }
@@ -315,6 +323,7 @@ public:
   }
 
   int rotation() const { return rotation_; }
+  uint64_t nominal_frame_interval_us() const { return nominal_frame_interval_us_; }
   bool take_looped()
   {
     const bool value = looped_;
@@ -396,7 +405,7 @@ private:
     AMediaFormat_delete(format);
   }
 
-  void describe(VideoFrame& out)
+  void describe(const uint8_t* base, VideoFrame& out)
   {
     const size_t y_bytes = static_cast<size_t>(stride_) * slice_height_;
     size_t u_offset = 0;
@@ -423,7 +432,6 @@ private:
       u_offset = y_bytes + crop;
       v_offset = u_offset + 1;
     }
-    const uint8_t* base = frame_.data();
     out.width = output_layout_.width;
     out.height = output_layout_.height;
     out.y = {base + static_cast<size_t>(crop_top_) * stride_ + crop_left_,
@@ -435,7 +443,6 @@ private:
   int fd_ = -1;
   AMediaExtractor* extractor_ = nullptr;
   AMediaCodec* codec_ = nullptr;
-  std::vector<uint8_t> frame_;
   int32_t coded_width_ = 0;
   int32_t coded_height_ = 0;
   int32_t stride_ = 0;
@@ -446,43 +453,13 @@ private:
   int32_t crop_right_ = 0;
   int32_t crop_bottom_ = 0;
   int32_t rotation_ = 0;
-  int64_t fallback_interval_us_ = 33333;
+  uint64_t nominal_frame_interval_us_ = 33333;
   cr::media::Yuv420Crop output_layout_;
   bool output_format_known_ = false;
   bool looped_ = false;
   bool input_eos_ = false;
   bool rewind_pending_ = false;
 };
-
-bool valid_plane(const Plane& plane, int32_t width)
-{
-  if (!plane.data || plane.row_stride <= 0 || plane.pixel_stride < 1 ||
-      plane.pixel_stride > 4 || width < 1)
-    return false;
-  const int64_t needed =
-      static_cast<int64_t>(width - 1) * plane.pixel_stride + 1;
-  return needed <= plane.row_stride;
-}
-
-uint8_t bilinear(const Plane& plane, int32_t width, int32_t height,
-                 uint32_t x16, uint32_t y16)
-{
-  const int32_t x0 = std::min<int32_t>(x16 >> 16, width - 1);
-  const int32_t y0 = std::min<int32_t>(y16 >> 16, height - 1);
-  const int32_t x1 = std::min<int32_t>(x0 + 1, width - 1);
-  const int32_t y1 = std::min<int32_t>(y0 + 1, height - 1);
-  const int32_t fx = x16 & 0xffffu;
-  const int32_t fy = y16 & 0xffffu;
-  const uint8_t* row0 = plane.data + static_cast<size_t>(y0) * plane.row_stride;
-  const uint8_t* row1 = plane.data + static_cast<size_t>(y1) * plane.row_stride;
-  const int32_t a = row0[x0 * plane.pixel_stride];
-  const int32_t b = row0[x1 * plane.pixel_stride];
-  const int32_t c = row1[x0 * plane.pixel_stride];
-  const int32_t d = row1[x1 * plane.pixel_stride];
-  const int32_t top = a + (((b - a) * fx) >> 16);
-  const int32_t bottom = c + (((d - c) * fx) >> 16);
-  return static_cast<uint8_t>(top + (((bottom - top) * fy) >> 16));
-}
 
 bool choose_output_geometry(int32_t source_width, int32_t source_height,
                             int rotation, int& output_width, int& output_height)
@@ -495,98 +472,142 @@ bool choose_output_geometry(int32_t source_width, int32_t source_height,
       output_width >= 16 && output_height >= 16;
 }
 
-bool frame_to_nv21(const VideoFrame& source, int rotation, int output_width,
-                   int output_height, std::vector<uint8_t>& destination)
+struct PlaybackFrame
 {
-  if (source.width < 2 || source.height < 2 || (source.width & 1) ||
-      (source.height & 1) || !valid_plane(source.y, source.width) ||
-      !valid_plane(source.u, source.width / 2) ||
-      !valid_plane(source.v, source.width / 2))
-    return false;
-  destination.assign(static_cast<size_t>(output_width) * output_height * 3 / 2,
-                     0);
+  cr_feed::Nv21Frame video;
+  bool looped = false;
+};
 
-  auto sample_oriented = [&](const Plane& plane, int32_t source_w,
-                             int32_t source_h, int32_t dest_x, int32_t dest_y,
-                             int32_t dest_w, int32_t dest_h) -> uint8_t
+class FileVideoPlayback
+{
+public:
+  ~FileVideoPlayback()
   {
-    const int32_t oriented_w =
-        (rotation == 90 || rotation == 270) ? source_h : source_w;
-    const int32_t oriented_h =
-        (rotation == 90 || rotation == 270) ? source_w : source_h;
-
-    int32_t crop_w = oriented_w;
-    int32_t crop_h = oriented_h;
-    if (static_cast<int64_t>(oriented_w) * dest_h >
-        static_cast<int64_t>(dest_w) * oriented_h)
-      crop_w = static_cast<int32_t>(
-          static_cast<int64_t>(oriented_h) * dest_w / dest_h);
-    else
-      crop_h = static_cast<int32_t>(
-          static_cast<int64_t>(oriented_w) * dest_h / dest_w);
-    crop_w = std::max(1, crop_w);
-    crop_h = std::max(1, crop_h);
-    const int32_t crop_x = (oriented_w - crop_w) / 2;
-    const int32_t crop_y = (oriented_h - crop_h) / 2;
-    const uint32_t ox16 =
-        static_cast<uint32_t>((static_cast<int64_t>(crop_x) << 16) +
-                              (static_cast<int64_t>(dest_x) * (crop_w - 1)
-                               << 16) /
-                                  std::max(1, dest_w - 1));
-    const uint32_t oy16 =
-        static_cast<uint32_t>((static_cast<int64_t>(crop_y) << 16) +
-                              (static_cast<int64_t>(dest_y) * (crop_h - 1)
-                               << 16) /
-                                  std::max(1, dest_h - 1));
-
-    uint32_t sx16 = ox16;
-    uint32_t sy16 = oy16;
-    if (rotation == 90)
-    {
-      sx16 = oy16;
-      sy16 = static_cast<uint32_t>((static_cast<int64_t>(source_h - 1) << 16) -
-                                   ox16);
-    }
-    else if (rotation == 180)
-    {
-      sx16 = static_cast<uint32_t>((static_cast<int64_t>(source_w - 1) << 16) -
-                                   ox16);
-      sy16 = static_cast<uint32_t>((static_cast<int64_t>(source_h - 1) << 16) -
-                                   oy16);
-    }
-    else if (rotation == 270)
-    {
-      sx16 = static_cast<uint32_t>((static_cast<int64_t>(source_w - 1) << 16) -
-                                   oy16);
-      sy16 = ox16;
-    }
-    return bilinear(plane, source_w, source_h, sx16, sy16);
-  };
-
-  uint8_t* y_plane = destination.data();
-  uint8_t* vu_plane =
-      y_plane + static_cast<size_t>(output_width) * output_height;
-  for (int y = 0; y < output_height; ++y)
-    for (int x = 0; x < output_width; ++x)
-      y_plane[static_cast<size_t>(y) * output_width + x] =
-          sample_oriented(source.y, source.width, source.height, x, y,
-                          output_width, output_height);
-  for (int y = 0; y < output_height / 2; ++y)
-  {
-    for (int x = 0; x < output_width / 2; ++x)
-    {
-      const size_t offset =
-          static_cast<size_t>(y) * output_width + static_cast<size_t>(x) * 2;
-      vu_plane[offset] =
-          sample_oriented(source.v, source.width / 2, source.height / 2, x, y,
-                          output_width / 2, output_height / 2);
-      vu_plane[offset + 1] =
-          sample_oriented(source.u, source.width / 2, source.height / 2, x, y,
-                          output_width / 2, output_height / 2);
-    }
+    stopping_.store(true, std::memory_order_relaxed);
+    free_.close();
+    ready_.close();
+    if (worker_.joinable())
+      worker_.join();
   }
-  return true;
-}
+
+  bool open(const char* path)
+  {
+    if (!decoder_.open(path))
+      return false;
+    try
+    {
+      for (auto& slot : buffers_)
+        free_.push(&slot);
+      worker_ = std::thread(&FileVideoPlayback::decode, this);
+    }
+    catch (const std::exception& error)
+    {
+      LOGE(OBF("local video: could not start decode worker (%s)").c_str(), error.what());
+      return false;
+    }
+
+    // Let the decoder start ahead of playback. This gives it time to seek
+    // and flush at a loop boundary while queued frames continue to play.
+    while (!g_stop.load(std::memory_order_relaxed) && !done_.load(std::memory_order_acquire) &&
+           ready_.size() < buffers_.size() - 1)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return true;
+  }
+
+  uint64_t nominal_frame_interval_us() const { return decoder_.nominal_frame_interval_us(); }
+
+  PlaybackFrame* next()
+  {
+    PlaybackFrame* slot = nullptr;
+    while (!g_stop.load(std::memory_order_relaxed))
+    {
+      if (ready_.pop_for(slot, std::chrono::milliseconds(50)))
+        return slot;
+      if (done_.load(std::memory_order_acquire))
+        break;
+    }
+    return nullptr;
+  }
+
+  void release(PlaybackFrame* slot)
+  {
+    free_.push(std::move(slot));
+  }
+
+private:
+  bool stopping() const
+  {
+    return stopping_.load(std::memory_order_relaxed) || g_stop.load(std::memory_order_relaxed);
+  }
+
+  void decode() noexcept
+  {
+    try
+    {
+      cr::media::Yuv420Nv21 converter;
+      while (!stopping())
+      {
+        PlaybackFrame* slot = nullptr;
+        if (!free_.pop_for(slot, std::chrono::milliseconds(50)))
+          continue;
+        if (!fill(*slot, converter))
+          break;
+        // Each queue holds pointers to at most the number of backing
+        // buffers. A slot is never in both queues at the same time.
+        if (!ready_.push(std::move(slot)))
+          break;
+      }
+    }
+    catch (const std::bad_alloc&)
+    {
+      LOGE(OBF("local video: insufficient memory for NV21 conversion").c_str());
+    }
+    done_.store(true, std::memory_order_release);
+    ready_.close();
+  }
+
+  bool fill(PlaybackFrame& slot, cr::media::Yuv420Nv21& converter)
+  {
+    const uint64_t deadline = monotonic_us() + 5000000ull;
+    while (!stopping())
+    {
+      if (!decoder_.rewind_if_drained())
+        return false;
+      VideoFrame frame;
+      if (decoder_.next(frame))
+      {
+        auto& output = slot.video;
+        if (!choose_output_geometry(frame.width, frame.height, decoder_.rotation(),
+                                    output.width, output.height) ||
+            !converter.convert(frame.y, frame.u, frame.v, frame.width, frame.height,
+                               decoder_.rotation(), output.width, output.height, output.data))
+        {
+          LOGE(OBF("local video: failed to convert decoded YUV frame").c_str());
+          return false;
+        }
+        output.pts_us = frame.pts_us;
+        slot.looped = decoder_.take_looped();
+        return true;
+      }
+      if (monotonic_us() >= deadline)
+      {
+        LOGE(OBF("local video: no decoder output for five seconds").c_str());
+        return false;
+      }
+      sleep_interruptible_us(2000);
+    }
+    return false;
+  }
+
+  static constexpr std::size_t kBuffers = 6;
+  FileVideoDecoder decoder_;
+  std::array<PlaybackFrame, kBuffers> buffers_;
+  cr_feed::BoundedQueue<PlaybackFrame*> free_{kBuffers};
+  cr_feed::BoundedQueue<PlaybackFrame*> ready_{kBuffers};
+  std::atomic<bool> stopping_{false};
+  std::atomic<bool> done_{false};
+  std::thread worker_;
+};
 
 class AudioShmWriter
 {
@@ -933,55 +954,50 @@ bool read_exact_fd(int fd, void* destination, size_t count)
 
 extern "C" int cr_feed_run_file_video(const char* path)
 {
-  FileVideoDecoder decoder;
-  if (!decoder.open(path))
+  FileVideoPlayback playback;
+  if (!playback.open(path))
     return -1;
   int output_width = 0;
   int output_height = 0;
   cr_feed::ShmOut shared;
 
-  std::vector<uint8_t> nv21;
   int64_t first_pts = -1;
+  int64_t previous_pts = -1;
   uint64_t epoch = monotonic_us();
+  uint64_t previous_target = 0;
+  uint64_t interval = playback.nominal_frame_interval_us();
   uint64_t published = 0;
-  uint64_t last_frame_us = epoch;
   while (!g_stop.load(std::memory_order_relaxed))
   {
-    if (!decoder.rewind_if_drained())
-      return -1;
-    VideoFrame frame{};
-    if (!decoder.next(frame))
+    auto* slot = playback.next();
+    if (!slot)
     {
-      if (monotonic_us() - last_frame_us > 5000000ull)
-      {
-        LOGE(OBF("local video: no decoder output for five seconds").c_str());
-        return -1;
-      }
       if (!g_stop.load(std::memory_order_relaxed))
-        sleep_interruptible_us(2000);
-      continue;
+        return -1;
+      break;
     }
-    if (decoder.take_looped() || first_pts < 0 || frame.pts_us < first_pts)
+    const auto& frame = slot->video;
+    const bool looped = slot->looped;
+    const int64_t pts = std::max<int64_t>(0, frame.pts_us);
+    if (looped || first_pts < 0 || pts < previous_pts)
     {
-      first_pts = frame.pts_us;
-      epoch = monotonic_us();
+      first_pts = pts;
+      const uint64_t now = monotonic_us();
+      epoch = looped ? std::max(now, previous_target + interval) : now;
     }
-    int next_width = 0;
-    int next_height = 0;
-    if (!choose_output_geometry(frame.width, frame.height, decoder.rotation(),
-                                next_width, next_height))
-      return -1;
-    if (next_width != output_width || next_height != output_height)
+    if (!looped && previous_pts >= 0 && pts > previous_pts && pts - previous_pts <= 2000000)
+    {
+      interval = static_cast<uint64_t>(pts - previous_pts);
+    }
+    if (frame.width != output_width || frame.height != output_height)
     {
       shared.shutdown();
-      if (!shared.init(next_width, next_height))
+      if (!shared.init(frame.width, frame.height))
         return -1;
-      output_width = next_width;
-      output_height = next_height;
+      output_width = frame.width;
+      output_height = frame.height;
     }
-    uint64_t target = epoch;
-    if (frame.pts_us >= first_pts)
-      target += static_cast<uint64_t>(frame.pts_us - first_pts);
+    uint64_t target = epoch + static_cast<uint64_t>(pts - first_pts);
     const uint64_t now = monotonic_us();
     if (target > now && target - now <= 2000000)
       sleep_interruptible_us(target - now);
@@ -989,16 +1005,15 @@ extern "C" int cr_feed_run_file_video(const char* path)
     {
       // Drop accumulated scheduling debt after a slow codec or app suspend.
       epoch = now;
-      first_pts = frame.pts_us;
+      first_pts = pts;
+      target = now;
     }
-    if (!frame_to_nv21(frame, decoder.rotation(), output_width, output_height,
-                       nv21))
-    {
-      LOGE(OBF("local video: failed to convert decoded YUV frame").c_str());
-      return -1;
-    }
-    shared.publish_nv21(nv21.data());
-    last_frame_us = monotonic_us();
+    if (g_stop.load(std::memory_order_relaxed))
+      break;
+    shared.publish_nv21(frame.data.data());
+    playback.release(slot);
+    previous_pts = pts;
+    previous_target = target;
     ++published;
   }
   LOGI(OBF("local video stopped after %llu frames").c_str(),

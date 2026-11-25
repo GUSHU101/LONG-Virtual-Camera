@@ -66,6 +66,11 @@ jobs:
             -Iengines/camreplace/common tests/native/adaptive_geometry_test.cpp \
             -o /tmp/adaptive_geometry_test
           /tmp/adaptive_geometry_test
+          g++ -std=c++20 -Wall -Wextra -Werror -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -Iengines/camreplace/common tests/native/yuv420_nv21_test.cpp \
+            -o /tmp/yuv420_nv21_test
+          /tmp/yuv420_nv21_test
           g++ -std=c++20 -Wall -Wextra -Werror \
             -Iengines/camreplace/android tests/native/sha256_test.cpp -o /tmp/sha256_test
           /tmp/sha256_test

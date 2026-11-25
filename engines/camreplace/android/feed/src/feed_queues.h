@@ -14,10 +14,9 @@
 // (FrameQueue). That drop policy preserves real-time responsiveness:
 // we'd rather see a 33-ms gap than a 200-ms backed-up burst when the
 // stream is misbehaving.
-// This file is intentionally header-only: the threaded transport that
-// uses it (tcp_h264_feed_v2.cpp, also new in sprint C) is the only TU
-// that includes it for now. Pre-existing single-threaded code keeps
-// using H264DecodePipe directly.
+// Local file playback uses the same queues to exchange pointers to a
+// fixed buffer pool. The number of slots bounds both queues without
+// dropping frames when the playback clock is waiting.
 
 #include <atomic>
 #include <chrono>
