@@ -67,14 +67,39 @@ final class MediaSourceManager {
         return prepareMedia(requireInput(uri), size, "audio", "");
     }
 
-    String configureObs(boolean allowLan) throws IOException, InterruptedException {
+    void configureObs(boolean allowLan, boolean obsAudio) throws IOException, InterruptedException {
         ensureStorage();
         SourceSnapshot current = readConfig();
+        String token = current.config.obsToken.isEmpty()
+                ? newObsKey() : current.config.obsToken;
+        commitConfig(current, current.config.withObs(token,
+                allowLan ? "lan" : "loopback", obsAudio));
+    }
+
+    boolean obsSettingsMatch(boolean allowLan, boolean obsAudio)
+            throws IOException, InterruptedException {
+        SourceConfig config = readConfig().config;
+        return "obs".equals(config.visualMode)
+                && obsAudio == "obs".equals(config.audioMode)
+                && (allowLan ? "lan" : "loopback").equals(config.obsBind);
+    }
+
+    String readObsKey() throws IOException, InterruptedException {
+        SourceConfig config = readConfig().config;
+        if (!config.usesObs()) throw new IOException("OBS 输入尚未配置");
+        return config.obsToken;
+    }
+
+    void rotateObsKey() throws IOException, InterruptedException {
+        SourceSnapshot current = readConfig();
+        if (!current.config.usesObs()) throw new IOException("OBS 输入尚未配置");
+        commitConfig(current, current.config.withObsKey(newObsKey()));
+    }
+
+    private static String newObsKey() {
         byte[] random = new byte[32];
         new SecureRandom().nextBytes(random);
-        String token = hex(random);
-        commitConfig(current, current.config.withObs(token, allowLan ? "lan" : "loopback"));
-        return token;
+        return hex(random);
     }
 
     private PreparedMedia prepareMedia(InputStream source, long declaredSize,
@@ -527,9 +552,18 @@ final class MediaSourceManager {
                     path, obsBind, obsToken);
         }
 
-        SourceConfig withObs(String token, String bind) {
-            return new SourceConfig("obs", visualKind, visualPath, "obs",
+        boolean usesObs() {
+            return "obs".equals(visualMode) || "obs".equals(audioMode);
+        }
+
+        SourceConfig withObs(String token, String bind, boolean useObsAudio) {
+            return new SourceConfig("obs", visualKind, visualPath, useObsAudio ? "obs" : "local",
                     audioPath, bind, token);
+        }
+
+        SourceConfig withObsKey(String token) {
+            return new SourceConfig(visualMode, visualKind, visualPath, audioMode,
+                    audioPath, obsBind, token);
         }
 
         String serialize() {

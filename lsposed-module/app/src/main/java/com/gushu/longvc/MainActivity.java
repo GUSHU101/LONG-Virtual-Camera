@@ -4,6 +4,11 @@ import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
+import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
@@ -18,7 +23,10 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.Collections;
+import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -45,6 +53,7 @@ public final class MainActivity extends Activity
     private Switch photoSwitch;
     private Switch micSwitch;
     private Switch obsLanSwitch;
+    private Switch obsAudioSwitch;
     private Button rootButton;
     private Button installButton;
     private Button stopButton;
@@ -55,6 +64,8 @@ public final class MainActivity extends Activity
     private Button selectAudioButton;
     private Button configureObsButton;
     private Button copyObsButton;
+    private Button revealObsButton;
+    private Button rotateObsButton;
     private boolean rendering;
     private boolean busy;
     private boolean emergencyBusy;
@@ -82,6 +93,7 @@ public final class MainActivity extends Activity
         photoSwitch = findViewById(R.id.photo_switch);
         micSwitch = findViewById(R.id.mic_switch);
         obsLanSwitch = findViewById(R.id.obs_lan_switch);
+        obsAudioSwitch = findViewById(R.id.obs_audio_switch);
         rootButton = findViewById(R.id.root_button);
         installButton = findViewById(R.id.install_button);
         stopButton = findViewById(R.id.stop_button);
@@ -92,6 +104,8 @@ public final class MainActivity extends Activity
         selectAudioButton = findViewById(R.id.select_audio_button);
         configureObsButton = findViewById(R.id.configure_obs_button);
         copyObsButton = findViewById(R.id.copy_obs_button);
+        revealObsButton = findViewById(R.id.reveal_obs_button);
+        rotateObsButton = findViewById(R.id.rotate_obs_button);
 
         // Privacy invariant: UI construction never arms a media path. In
         // particular, the microphone begins OFF and only this listener can arm it.
@@ -129,9 +143,18 @@ public final class MainActivity extends Activity
         selectAudioButton.setOnClickListener(view -> selectDocument("audio/*", PICK_AUDIO));
         configureObsButton.setOnClickListener(view -> {
             boolean allowLan = obsLanSwitch.isChecked();
-            runOperation("正在生成 OBS 推流密钥并切换输入源…",
-                    () -> rootController.configureObs(allowLan));
+            boolean useObsAudio = obsAudioSwitch.isChecked();
+            runOperation("正在保存手机端推流设置…",
+                    () -> rootController.configureObs(allowLan, useObsAudio));
         });
+        revealObsButton.setOnClickListener(view -> runOperation("正在读取推流密钥…",
+                rootController::revealObsKey));
+        rotateObsButton.setOnClickListener(view -> new android.app.AlertDialog.Builder(this)
+                .setMessage(R.string.obs_rotate_message)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.obs_rotate, (dialog, which) ->
+                        runOperation("正在重置推流密钥…", rootController::rotateObsKey))
+                .show());
         copyObsButton.setOnClickListener(view -> copyObsConfiguration());
 
         renderControls();
@@ -233,7 +256,7 @@ public final class MainActivity extends Activity
                 runOnUiThreadIfAlive(() -> {
                     if (generation != operationGeneration) return;
                     busy = false;
-                    RuntimeState display = preserveEphemeralObsKey(state);
+                    RuntimeState display = state;
                     lastState = display;
                     renderState(display);
                     operationLog.setText(buildSummary(display));
@@ -262,7 +285,7 @@ public final class MainActivity extends Activity
                 runOnUiThreadIfAlive(() -> {
                     if (generation != operationGeneration) return;
                     emergencyBusy = false;
-                    RuntimeState display = preserveEphemeralObsKey(state);
+                    RuntimeState display = state;
                     lastState = display;
                     renderState(display);
                     operationLog.setText(getString(R.string.recovery_verified,
@@ -303,7 +326,7 @@ public final class MainActivity extends Activity
             if (generation != operationGeneration) return;
             busy = false;
             emergencyBusy = false;
-            lastState = current == null ? null : preserveEphemeralObsKey(current);
+            lastState = current;
             renderState(lastState);
             String status = current == null
                     ? getString(R.string.runtime_state_unknown, readError)
@@ -361,7 +384,7 @@ public final class MainActivity extends Activity
             String status = String.format(Locale.ROOT,
                     "Root：%s  载荷：%s  ABI：%s  SELinux：%s",
                     state.root ? "可用" : "不可用",
-                    state.installed ? "已校验" : "未安装",
+                    state.installed ? "已校验" : "未通过当前 APK 校验",
                     state.abi, state.selinux);
             rootStatus.setText(status);
         }
@@ -392,8 +415,12 @@ public final class MainActivity extends Activity
         selectAudioButton.setEnabled(!blocked && rootReady);
         configureObsButton.setEnabled(!blocked && rootReady);
         obsLanSwitch.setEnabled(!blocked && rootReady);
-        copyObsButton.setEnabled(!blocked && lastState != null
-                && lastState.obsConfigured && !lastState.obsStreamKey.isBlank());
+        obsAudioSwitch.setEnabled(!blocked && rootReady);
+        boolean obsConfigured = !blocked && lastState != null && lastState.obsConfigured;
+        revealObsButton.setEnabled(obsConfigured);
+        rotateObsButton.setEnabled(obsConfigured);
+        copyObsButton.setEnabled(obsConfigured && !lastState.obsStreamKey.isBlank()
+                && !obsServerAddresses(lastState).isEmpty());
     }
 
     private void renderSource(RuntimeState state) {
@@ -412,10 +439,12 @@ public final class MainActivity extends Activity
                 : !state.visualSourceReady ? "本地（未选择）"
                 : "image".equals(state.visualKind) ? "本地图片" : "本地视频";
         String audio = state.audioUsesObs()
-                ? "OBS AAC" + (state.obsListenerReady ? "（监听中）" : "（待启用）")
+                ? !state.micEnabled ? "OBS AAC（虚拟麦克风关闭）"
+                    : state.audioChannelReady ? "OBS AAC（已收到音频）" : "OBS AAC（等待音频）"
                 : state.audioSourceReady ? "本地音频" : "手机原生麦克风（替换关闭）";
         sourceStatus.setText(getString(R.string.source_independent_status, visual, audio));
         if (state.obsConfigured) obsLanSwitch.setChecked("lan".equals(state.obsBind));
+        obsAudioSwitch.setChecked(state.audioUsesObs());
         obsConfiguration.setText(state.obsConfigured
                 ? formatObsConfiguration(state) : getString(R.string.obs_not_configured));
     }
@@ -526,7 +555,10 @@ public final class MainActivity extends Activity
     private void copyObsConfiguration() {
         RuntimeState state = lastState;
         if (state == null || !state.obsConfigured || state.obsStreamKey.isBlank()) return;
-        String configuration = formatObsConfiguration(state);
+        List<String> servers = obsServerAddresses(state);
+        if (servers.isEmpty()) return;
+        String configuration = "服务器：" + String.join("\n服务器：", servers)
+                + "\n推流密钥：" + state.obsStreamKey;
         ClipboardManager clipboard = getSystemService(ClipboardManager.class);
         if (clipboard == null) {
             Toast.makeText(this, "无法访问剪贴板", Toast.LENGTH_LONG).show();
@@ -546,36 +578,72 @@ public final class MainActivity extends Activity
     }
 
     private String formatObsConfiguration(RuntimeState state) {
-        String address = localIpv4Address();
-        String host = address == null ? "<手机局域网IP>" : address;
-        String key = state.obsStreamKey.isBlank()
-                ? "<仅在生成后的本次 App 会话显示，请重新生成>"
-                : state.obsStreamKey;
-        String lan = "lan".equals(state.obsBind)
-                ? "局域网服务器：rtmp://" + host + ":1935/live\n"
-                : "局域网监听：关闭（推荐）\n";
-        return lan + "推流密钥：" + key
-                + "\nUSB 服务器：rtmp://127.0.0.1:1935/live"
-                + "\nUSB 转发：adb forward tcp:1935 tcp:1935";
+        List<String> servers = obsServerAddresses(state);
+        String connection = "lan".equals(state.obsBind)
+                ? servers.isEmpty() ? "手机尚未取得 Wi-Fi 或以太网 IPv4 地址"
+                    : "手机服务器：" + String.join("\n手机服务器：", servers)
+                : "仅限手机本机：" + servers.get(0);
+        String input;
+        if (!state.obsListenerReady) {
+            boolean shouldListen = state.visualUsesObs() && (state.cameraEnabled || state.photoEnabled)
+                    || state.audioUsesObs() && state.micEnabled;
+            input = shouldListen
+                    ? "手机监听未就绪，请刷新状态"
+                    : "配置已保存。开启使用此来源的相机、照片或麦克风开关后，手机开始监听。";
+        } else if (state.visualUsesObs() && state.videoChannelReady) {
+            input = "正在接收已解码的 H.264 视频帧";
+        } else if (state.audioUsesObs() && state.audioChannelReady) {
+            input = "正在接收已解码的 AAC 音频";
+        } else {
+            input = "手机在监听，等待推流和可解码的媒体";
+        }
+        return connection + "\n" + input + "\n"
+                + (state.obsStreamKey.isBlank() ? "推流密钥已保存，点「显示推流密钥」查看。"
+                    : "推流密钥：" + state.obsStreamKey);
     }
 
-    private static String localIpv4Address() {
+    @SuppressWarnings("deprecation")
+    private List<String> obsServerAddresses(RuntimeState state) {
+        if (!"lan".equals(state.obsBind)) return Collections.singletonList("rtmp://127.0.0.1:1935/live");
+        LinkedHashSet<String> servers = new LinkedHashSet<>();
+        ConnectivityManager manager = getSystemService(ConnectivityManager.class);
+        if (manager != null) {
+            for (Network network : manager.getAllNetworks()) {
+                NetworkCapabilities caps = manager.getNetworkCapabilities(network);
+                if (caps == null || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                        || !(caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                        || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) continue;
+                LinkProperties properties = manager.getLinkProperties(network);
+                if (properties == null) continue;
+                for (LinkAddress link : properties.getLinkAddresses()) {
+                    addLanServer(servers, link.getAddress());
+                }
+            }
+        }
         try {
             Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
             while (interfaces != null && interfaces.hasMoreElements()) {
                 NetworkInterface network = interfaces.nextElement();
                 if (!network.isUp() || network.isLoopback()) continue;
+                // Hotspot links may be absent from ConnectivityManager's
+                // client networks. Avoid publishing VPN or cellular addresses.
+                if (!network.getName().matches("(?i)(wlan|ap|softap|eth)[0-9]+")) continue;
                 Enumeration<InetAddress> addresses = network.getInetAddresses();
                 while (addresses.hasMoreElements()) {
-                    InetAddress address = addresses.nextElement();
-                    if (address instanceof Inet4Address && !address.isLoopbackAddress()
-                            && !address.isLinkLocalAddress()) return address.getHostAddress();
+                    addLanServer(servers, addresses.nextElement());
                 }
             }
         } catch (Exception ignored) {
-            // UI falls back to a descriptive placeholder.
+            // Keep addresses already supplied by ConnectivityManager.
         }
-        return null;
+        return new ArrayList<>(servers);
+    }
+
+    private static void addLanServer(LinkedHashSet<String> servers, InetAddress address) {
+        if (address instanceof Inet4Address && !address.isAnyLocalAddress()
+                && !address.isLoopbackAddress() && !address.isLinkLocalAddress()) {
+            servers.add("rtmp://" + address.getHostAddress() + ":1935/live");
+        }
     }
 
     private static String sourceLabel(RuntimeState state) {
@@ -585,12 +653,6 @@ public final class MainActivity extends Activity
         if (state.usesObs()) return "混合来源";
         if (!state.visualSourceReady && !state.audioSourceReady) return "手机本地（未配置）";
         return "手机本地媒体";
-    }
-
-    private RuntimeState preserveEphemeralObsKey(RuntimeState state) {
-        if (state == null || !state.obsConfigured || !state.obsStreamKey.isBlank()
-                || lastState == null || lastState.obsStreamKey.isBlank()) return state;
-        return state.withObsStreamKey(lastState.obsStreamKey);
     }
 
     private static String label(RootController.Action action) {

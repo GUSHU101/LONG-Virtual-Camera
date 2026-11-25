@@ -86,10 +86,20 @@ final class RootController {
         }
     }
 
-    RuntimeState configureObs(boolean allowLan) throws IOException, InterruptedException {
-        String[] token = new String[1];
-        RuntimeState state = replaceSource(() -> token[0] = mediaSources.configureObs(allowLan));
-        return state.withObsStreamKey(token[0]);
+    RuntimeState configureObs(boolean allowLan, boolean obsAudio)
+            throws IOException, InterruptedException {
+        if (mediaSources.obsSettingsMatch(allowLan, obsAudio)) return status();
+        return replaceSource(() -> mediaSources.configureObs(allowLan, obsAudio));
+    }
+
+    RuntimeState revealObsKey() throws IOException, InterruptedException {
+        RuntimeState state = status();
+        if (!state.obsConfigured) throw new IOException("OBS 输入尚未配置");
+        return state.withObsStreamKey(mediaSources.readObsKey());
+    }
+
+    RuntimeState rotateObsKey() throws IOException, InterruptedException {
+        return replaceSource(mediaSources::rotateObsKey);
     }
 
     RuntimeState status() throws IOException, InterruptedException {
@@ -150,7 +160,7 @@ final class RootController {
         }
 
         try {
-            restore(before);
+            restore(before, status());
             return status();
         } catch (InterruptedException cancelled) {
             Thread.currentThread().interrupt();
@@ -166,16 +176,17 @@ final class RootController {
         }
     }
 
-    private void restore(RuntimeState state) throws IOException, InterruptedException {
+    private void restore(RuntimeState state, RuntimeState source)
+            throws IOException, InterruptedException {
         RootShell.checkCancellation();
-        if (state.cameraEnabled) run(Action.ARM_CAMERA);
-        if (state.photoEnabled) run(Action.ARM_PHOTO);
-        if (state.micEnabled) run(Action.ARM_MIC);
+        if (state.cameraEnabled && source.visualSourceReady) run(Action.ARM_CAMERA);
+        if (state.photoEnabled && source.visualSourceReady) run(Action.ARM_PHOTO);
+        if (state.micEnabled && source.audioSourceReady) run(Action.ARM_MIC);
     }
 
     private void restoreBestEffort(RuntimeState state, Throwable failure) {
         try {
-            restore(state);
+            restore(state, state);
         } catch (IOException | InterruptedException | RuntimeException restoreFailure) {
             if (restoreFailure instanceof InterruptedException) Thread.currentThread().interrupt();
             failure.addSuppressed(restoreFailure);

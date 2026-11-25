@@ -5,7 +5,7 @@
     <string name="title">LONG Virtual Camera</string>
     <string name="subtitle">一个 system 作用域 · 一条全局原生替换链路</string>
     <string name="scope_title">LSPosed 系统层</string>
-    <string name="scope_hint">在管理器中按上方包名启用模块，作用域选择 system。模块加载状态与相机是否实际显示替换画面分别检查。</string>
+    <string name="scope_hint">在 LSPosed 中启用上方包名，只勾选 system。下方的 Root 载荷和相机输出状态用于确认 cameraserver 实际接管情况。</string>
     <string name="scope_button">仅申请 system 作用域</string>
     <string name="root_title">Root 控制平面</string>
     <string name="root_not_checked">Root：尚未检查</string>
@@ -20,10 +20,14 @@
     <string name="select_image">选择本地图片</string>
     <string name="select_audio">选择本地音频（可选麦克风源）</string>
     <string name="obs_title">OBS 直播输入</string>
-    <string name="obs_hint">生成随机推流密钥并在手机 1935 端口接收 H.264 + AAC。默认只监听本机回环并通过 adb forward 走 USB。</string>
-    <string name="obs_lan_opt_in">允许可信局域网连接（扩大网络暴露面）</string>
+    <string name="obs_hint">手机在 1935 端口接收 H.264。其他设备推流时，启用可信局域网接收，并使用这里显示的手机地址。只在可信网络上使用明文 RTMP。</string>
+    <string name="obs_lan_opt_in">允许可信局域网设备推流</string>
+    <string name="obs_audio_opt_in">选择 OBS AAC 作为虚拟麦克风输入</string>
     <string name="obs_not_configured">尚未启用 OBS 输入</string>
-    <string name="configure_obs">启用 OBS / 重新生成密钥</string>
+    <string name="configure_obs">保存手机端 OBS 输入</string>
+    <string name="obs_reveal">显示推流密钥</string>
+    <string name="obs_rotate">重置推流密钥</string>
+    <string name="obs_rotate_message">重置后，推流器需要使用新密钥重新连接。</string>
     <string name="copy_obs">复制 OBS 服务器与推流密钥</string>
     <string name="global_camera">全局摄像头替换</string>
     <string name="global_camera_hint">在受支持的 CameraService 输出缓冲区上处理画面。预览、录像和拍照可使用不同输出路径。</string>

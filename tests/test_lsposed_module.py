@@ -114,7 +114,10 @@ class LsposedModuleContractTests(unittest.TestCase):
             node.attrib.get(android + "name")
             for node in root.findall("uses-permission")
         }
-        self.assertEqual({"android.permission.INTERNET"}, permissions)
+        self.assertEqual(
+            {"android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE"},
+            permissions,
+        )
         application = root.find("application")
         self.assertIsNotNone(application)
         assert application is not None
@@ -175,6 +178,18 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertNotIn('say "obs_stream_key=', script)
         self.assertIn("rtmp:listen:1935:config:", script)
         self.assertIn("*) say loopback", script)
+
+    def test_obs_panel_uses_phone_addresses_and_separate_audio_selection(self) -> None:
+        app = MODULE / "java/com/gushu/longvc"
+        activity = (app / "MainActivity.java").read_text(encoding="utf-8")
+        controller = (app / "RootController.java").read_text(encoding="utf-8")
+        sources = (app / "MediaSourceManager.java").read_text(encoding="utf-8")
+        self.assertNotIn("adb forward", activity)
+        self.assertIn("NetworkCapabilities.TRANSPORT_WIFI", activity)
+        self.assertIn("obsAudioSwitch.isChecked()", activity)
+        self.assertIn('useObsAudio ? "obs" : "local"', sources)
+        self.assertIn("obsSettingsMatch(allowLan, obsAudio)", controller)
+        self.assertIn("rootController::revealObsKey", activity)
 
     def test_camera_hook_targets_only_cameraserver(self) -> None:
         script = (MODULE / "payload/longvc-control.sh").read_text(encoding="utf-8")
