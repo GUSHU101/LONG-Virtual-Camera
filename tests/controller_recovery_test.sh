@@ -57,6 +57,31 @@ camera_dump=$'Active Camera Clients:\n[]\nAllowed user IDs: 0\n'"$camera_history
 camera_dump=$'Active Camera Clients:\n[\n(Camera ID: 0, Client Package Name: com.example.active, Conflicting Client Devices: {})\n]\n'"$camera_history"
 [[ $(camera_packages) == com.example.active ]]
 
+(
+  BASE=$fixture
+  INJECTOR=true
+  HOOK=$fixture/libcr_hooks.so
+  CAM_READY=$fixture/camhook.ready
+  pidof() { return 1; }
+  wait_service() { return 0; }
+  prepare_camera_ready() { return 0; }
+  remember_and_close_camera() { activation=loading; }
+  restore_camera() { activation=reopened; }
+  hook_pid() {
+    case "$activation" in
+      loading) printf '%s\n' 42 ;;
+      reopened) [ -n "$reopened_pid" ] || return 1; printf '%s\n' "$reopened_pid" ;;
+      *) return 1 ;;
+    esac
+  }
+  activation=off reopened_pid=42
+  ensure_camera_hook || exit 1
+  activation=off reopened_pid=43
+  if ensure_camera_hook; then exit 1; fi
+  activation=off reopened_pid=
+  if ensure_camera_hook; then exit 1; fi
+)
+
 ensure_video() { steps+=" video"; }
 install_camera_flag() { steps+=" flag"; [[ $flag_ready == 1 ]]; }
 disarm_photo() { steps+=" rollback"; rm -f "$CONTROL/photo.lease"; }

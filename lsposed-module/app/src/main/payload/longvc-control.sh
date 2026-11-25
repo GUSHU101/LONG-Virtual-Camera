@@ -411,12 +411,17 @@ ensure_camera_hook() {
     --target cameraserver --lib "$HOOK" --init cr_camhook_init \
     --feed tcp_h264:listen:8901
   inject_rc=$?
+  installed_camera_pid=
   if [ "$inject_rc" -eq 0 ]; then
-    hook_pid cameraserver "$CAM_READY" >/dev/null 2>&1
-    inject_rc=$?
+    installed_camera_pid=$(hook_pid cameraserver "$CAM_READY" 2>/dev/null) ||
+      inject_rc=1
   fi
   restore_camera
-  return "$inject_rc"
+  [ "$inject_rc" -eq 0 ] || return "$inject_rc"
+  # The service can exit as its clients reconnect. Check the same live
+  # process before a caller installs its lease flag and reports success.
+  [ -n "$installed_camera_pid" ] &&
+    [ "$(hook_pid cameraserver "$CAM_READY" 2>/dev/null)" = "$installed_camera_pid" ]
 }
 
 ensure_audio_hook() {
