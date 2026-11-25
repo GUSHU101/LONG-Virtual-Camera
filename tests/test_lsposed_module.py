@@ -143,8 +143,8 @@ class LsposedModuleContractTests(unittest.TestCase):
             ROOT / "engines/camreplace/android/feed/src/audio_shm.h"
         ).read_text(encoding="utf-8")
 
-        self.assertIn('read_u32_hex "$DATA/feed" 48', script)
-        self.assertIn('read_u32_hex "$DATA/audio" 36', script)
+        self.assertIn('channel_has_header "$DATA/feed" 44465243 48', script)
+        self.assertIn('channel_has_header "$DATA/audio" 55415243 36', script)
         self.assertIn('say "video_channel_ready=$video_channel"', script)
         self.assertIn('say "audio_channel_ready=$audio_channel"', script)
         self.assertIn("&& videoChannelReady", runtime)

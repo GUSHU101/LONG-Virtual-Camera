@@ -23,6 +23,7 @@ AUDIO_LOG=$BASE/cr_feed_audio.log
 OBS_LOG=$BASE/cr_feed_obs.log
 LAST_CAM=$BASE/cr_last_cam_pkgs
 SOURCE_CONFIG=$CONTROL/source.conf
+PROC_ROOT=/proc
 
 say() {
   printf '%s\n' "$*"
@@ -106,71 +107,108 @@ prepare_data() {
     "$CAM_READY" "$AUD_READY" || return 1
 }
 
-find_feed_pid() {
-  wanted_tag=$1
+process_start_time() (
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  process_stat=$(cat "$PROC_ROOT/$1/stat" 2>/dev/null) || return 1
+  # Strip pid and comm, which is parenthesized and may contain spaces.
+  process_fields=${process_stat##*) }
+  set -f
+  set -- $process_fields
+  [ "$#" -ge 20 ] || return 1
+  case "$1" in Z|X|x) return 1 ;; esac
+  case "${20}" in ''|*[!0-9]*) return 1 ;; esac
+  say "${20}"
+)
+
+feeder_start_time() (
+  feeder_started=$(process_start_time "$1") || return 1
+  feeder_exe=$(readlink "$PROC_ROOT/$1/exe" 2>/dev/null) || return 1
+  case "$feeder_exe" in "$FEEDER"|"$FEEDER (deleted)") ;; *) return 1 ;; esac
+  feeder_cmd=$(tr '\000' ' ' 2>/dev/null < "$PROC_ROOT/$1/cmdline") || return 1
+  case "$feeder_cmd" in *"$2"*) ;; *) return 1 ;; esac
+  [ "$(process_start_time "$1")" = "$feeder_started" ] || return 1
+  say "$feeder_started"
+)
+
+find_feed_pid() (
   for feed_pid in $(pidof cr_feed_proc 2>/dev/null); do
-    [ -r "/proc/$feed_pid/exe" ] || continue
-    feed_exe=$(readlink "/proc/$feed_pid/exe" 2>/dev/null)
-    case "$feed_exe" in
-      "$FEEDER"|"$FEEDER (deleted)") ;;
-      *) continue ;;
-    esac
-    feed_cmd=$(tr '\000' ' ' < "/proc/$feed_pid/cmdline" 2>/dev/null)
-    case "$feed_cmd" in
-      *"$wanted_tag"*) say "$feed_pid"; return 0 ;;
-    esac
+    if feeder_start_time "$feed_pid" "$1" >/dev/null; then
+      say "$feed_pid"
+      return 0
+    fi
   done
   return 1
-}
+)
 
-stop_feeder() {
+wait_feeders_exit() (
+  stop_i=0
+  while [ "$stop_i" -lt 20 ]; do
+    stop_alive=0
+    for stop_identity in "$@"; do
+      stop_pid=${stop_identity%%:*}
+      if [ "$(process_start_time "$stop_pid")" = "${stop_identity#*:}" ]; then
+        stop_alive=1
+        break
+      fi
+    done
+    [ "$stop_alive" = 0 ] && return 0
+    stop_i=$((stop_i + 1))
+    sleep 0.1
+  done
+  return 1
+)
+
+stop_feeder() (
   stop_tag=$1
-  stop_pids=
+  set --
   for stop_pid in $(pidof cr_feed_proc 2>/dev/null); do
-    [ -r "/proc/$stop_pid/exe" ] || continue
-    stop_exe=$(readlink "/proc/$stop_pid/exe" 2>/dev/null)
-    case "$stop_exe" in
-      "$FEEDER"|"$FEEDER (deleted)") ;;
-      *) continue ;;
-    esac
-    stop_cmd=$(tr '\000' ' ' < "/proc/$stop_pid/cmdline" 2>/dev/null)
-    case "$stop_cmd" in
-      *"$stop_tag"*)
-        stop_pids="$stop_pids $stop_pid"
-        kill -TERM "$stop_pid" 2>/dev/null || return 1
-        ;;
-    esac
+    stop_started=$(feeder_start_time "$stop_pid" "$stop_tag") || continue
+    set -- "$@" "$stop_pid:$stop_started"
+    # One process exiting concurrently must not skip the other owned feeders.
+    kill -TERM "$stop_pid" 2>/dev/null || true
   done
-  [ -n "$stop_pids" ] || return 0
-  stop_i=0
-  while [ "$stop_i" -lt 20 ]; do
-    stop_alive=0
-    for stop_pid in $stop_pids; do
-      [ -d "/proc/$stop_pid" ] && stop_alive=1
+  wait_feeders_exit "$@" && return 0
+  for stop_identity in "$@"; do
+    stop_pid=${stop_identity%%:*}
+    if [ "$(feeder_start_time "$stop_pid" "$stop_tag")" = "${stop_identity#*:}" ]; then
+      kill -KILL "$stop_pid" 2>/dev/null || true
+    fi
+  done
+  wait_feeders_exit "$@"
+)
+
+feeder_owns_listener() (
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  listener_pid=$1
+  listener_port=$2
+  listener_dir=$PROC_ROOT/$listener_pid
+  listener_started=$(process_start_time "$listener_pid") || return 1
+  set --
+  for listener_table in "$listener_dir/net/tcp" "$listener_dir/net/tcp6"; do
+    [ ! -r "$listener_table" ] || set -- "$@" "$listener_table"
+  done
+  [ "$#" -gt 0 ] || return 1
+  listener_inodes=$(awk -v port="$listener_port" '
+    $4 == "0A" && $10 ~ /^[1-9][0-9]*$/ {
+      split($2, address, ":")
+      if (toupper(address[2]) == port) print $10
+    }' "$@" 2>/dev/null) || return 1
+  [ -n "$listener_inodes" ] || return 1
+  for listener_fd in "$listener_dir"/fd/*; do
+    listener_target=$(readlink "$listener_fd" 2>/dev/null) || continue
+    for listener_inode in $listener_inodes; do
+      if [ "$listener_target" = "socket:[$listener_inode]" ] &&
+         [ "$(process_start_time "$listener_pid")" = "$listener_started" ]; then
+        return 0
+      fi
     done
-    [ "$stop_alive" = 0 ] && return 0
-    stop_i=$((stop_i + 1))
-    sleep 0.1
-  done
-  for stop_pid in $stop_pids; do
-    [ ! -d "/proc/$stop_pid" ] || kill -KILL "$stop_pid" 2>/dev/null || return 1
-  done
-  stop_i=0
-  while [ "$stop_i" -lt 20 ]; do
-    stop_alive=0
-    for stop_pid in $stop_pids; do
-      [ -d "/proc/$stop_pid" ] && stop_alive=1
-    done
-    [ "$stop_alive" = 0 ] && return 0
-    stop_i=$((stop_i + 1))
-    sleep 0.1
   done
   return 1
-}
+)
 
-listener_present() {
-  listener_hex=$1
-  grep -qiE ":${listener_hex} .*0A" /proc/net/tcp /proc/net/tcp6 2>/dev/null
+channel_has_header() {
+  [ "$(read_u32_hex "$1" 0)" = "$2" ] &&
+    [ "$(read_u32_hex "$1" "$3")" = "00000001" ]
 }
 
 read_u32_hex() {
@@ -195,20 +233,16 @@ wait_feeder() {
   wait_kind=$2
   wait_i=0
   while [ "$wait_i" -lt 100 ]; do
-    if find_feed_pid "$wait_tag" >/dev/null 2>&1; then
+    if wait_pid=$(find_feed_pid "$wait_tag"); then
       case "$wait_kind" in
         video)
-          [ "$(read_u32_hex "$DATA/feed" 0 2>/dev/null)" = "44465243" ] &&
-            [ "$(read_u32_hex "$DATA/feed" 48 2>/dev/null)" = "00000001" ] &&
-            return 0
+          channel_has_header "$DATA/feed" 44465243 48 && return 0
           ;;
         audio)
-          [ "$(read_u32_hex "$DATA/audio" 0 2>/dev/null)" = "55415243" ] &&
-            [ "$(read_u32_hex "$DATA/audio" 36 2>/dev/null)" = "00000001" ] &&
-            return 0
+          channel_has_header "$DATA/audio" 55415243 36 && return 0
           ;;
         obs)
-          listener_present 078F && return 0
+          feeder_owns_listener "$wait_pid" 078F && return 0
           ;;
       esac
     fi
@@ -230,9 +264,14 @@ start_feeder() {
     fi
     # A live process without its listener can never become READY. Replace it
     # instead of making every later arm attempt fail on the same stale PID.
-    stop_feeder "$start_tag"
-    sleep 0.1
+    stop_feeder "$start_tag" || return 1
   fi
+  # A hard-killed writer can leave a READY header behind. Publish readiness
+  # only after the new writer has committed data to the ring.
+  case "$start_ready" in
+    video) revoke_u32 "$DATA/feed" 48 || return 1 ;;
+    audio) revoke_u32 "$DATA/audio" 36 || return 1 ;;
+  esac
   rm -f "$start_log"
   if command -v nohup >/dev/null 2>&1; then
     LD_LIBRARY_PATH="$BASE" nohup "$FEEDER" --feed "$start_url" --role "$start_role" \
@@ -391,11 +430,86 @@ ensure_audio_hook() {
 
 config_value() {
   config_key=$1
-  [ -r "$SOURCE_CONFIG" ] || return 1
-  [ "$(sed -n 's/^schema=//p' "$SOURCE_CONFIG" 2>/dev/null | head -n 1)" = 2 ] ||
+  config_file=${2:-$SOURCE_CONFIG}
+  [ -r "$config_file" ] || return 1
+  [ "$(sed -n 's/^schema=//p' "$config_file" 2>/dev/null | head -n 1)" = 2 ] ||
     return 1
-  sed -n "s/^${config_key}=//p" "$SOURCE_CONFIG" 2>/dev/null | head -n 1
+  sed -n "s/^${config_key}=//p" "$config_file" 2>/dev/null | head -n 1
 }
+
+valid_sha256() {
+  case "$1" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#1}" = 64 ]
+}
+
+file_sha256() (
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest_line=$(sha256sum "$@") || return 1
+  else
+    digest_line=$(toybox sha256sum "$@") || return 1
+  fi
+  digest=${digest_line%% *}
+  valid_sha256 "$digest" && say "$digest"
+)
+
+managed_media_path() (
+  case "$2" in
+    "$MEDIA/$1-"*.media) ;;
+    *) return 1 ;;
+  esac
+  media_digest=${2#"$MEDIA/$1-"}
+  valid_sha256 "${media_digest%.media}"
+)
+
+commit_source() (
+  [ "$#" = 3 ] || fail "invalid_source_commit"
+  source_name=$1
+  case "$source_name" in .source-config-* ) ;; *) fail "invalid_source_commit" ;; esac
+  source_suffix=${source_name#.source-config-}
+  case "$source_suffix" in ''|*[!0-9a-f-]*) fail "invalid_source_commit" ;; esac
+  valid_sha256 "$2" && valid_sha256 "$3" || fail "invalid_source_commit"
+  source_stage=$CONTROL/$source_name
+
+  for lease in camera photo mic; do
+    [ ! -e "$CONTROL/$lease.lease" ] || fail "source_runtime_active"
+  done
+  [ -f "$source_stage" ] && [ ! -L "$source_stage" ] ||
+    fail "source_stage_missing"
+  [ "$(file_sha256 "$source_stage")" = "$3" ] || fail "source_stage_checksum"
+  if [ -e "$SOURCE_CONFIG" ]; then
+    [ -f "$SOURCE_CONFIG" ] && [ ! -L "$SOURCE_CONFIG" ] || fail "source_config_invalid"
+    source_current=$(file_sha256 "$SOURCE_CONFIG") || fail "source_config_unreadable"
+  else
+    source_current=$(printf 'schema=2\n' | file_sha256) || fail "source_config_unreadable"
+  fi
+  [ "$source_current" = "$2" ] || fail "source_config_conflict"
+
+  next_visual=$(config_value visual_path "$source_stage") || fail "source_stage_invalid"
+  next_audio=$(config_value audio_path "$source_stage") || fail "source_stage_invalid"
+  old_visual=$(config_value visual_path 2>/dev/null || true)
+  old_audio=$(config_value audio_path 2>/dev/null || true)
+  for media_type in visual audio; do
+    case "$media_type" in
+      visual) next_path=$next_visual; old_path=$old_visual ;;
+      audio) next_path=$next_audio; old_path=$old_audio ;;
+    esac
+    [ -n "$next_path" ] && [ "$next_path" != "$old_path" ] || continue
+    managed_media_path "$media_type" "$next_path" &&
+      [ -f "$next_path" ] && [ ! -L "$next_path" ] || fail "source_media_missing"
+  done
+  chown 0:0 "$source_stage" && chmod 0600 "$source_stage" ||
+    fail "source_stage_permissions"
+  mv -f "$source_stage" "$SOURCE_CONFIG" || fail "source_config_commit_failed"
+
+  # Keep cleanup in the same transaction so concurrent readers never commit a
+  # config which references an earlier, already removed media file.
+  if [ "$old_visual" != "$next_visual" ] && managed_media_path visual "$old_visual"; then
+    rm -f "$old_visual" 2>/dev/null || true
+  fi
+  if [ "$old_audio" != "$next_audio" ] && managed_media_path audio "$old_audio"; then
+    rm -f "$old_audio" 2>/dev/null || true
+  fi
+)
 
 current_visual_mode() {
   selected_mode=$(config_value visual_mode 2>/dev/null)
@@ -763,7 +877,7 @@ print_status() {
      valid_obs_token; then
     obs_configured=1
   fi
-  if find_feed_pid "--role obs" >/dev/null 2>&1 && listener_present 078F; then
+  if obs_pid=$(find_feed_pid "--role obs") && feeder_owns_listener "$obs_pid" 078F; then
     obs_listener=1
   else
     obs_listener=0
@@ -773,8 +887,9 @@ print_status() {
   case "$visual_kind" in video|image) ;; *) visual_kind=none ;; esac
   if [ "$visual_mode" = obs ]; then
     visual_source_ready=$obs_configured
-    if find_feed_pid "--role obs-video" >/dev/null 2>&1 ||
-       find_feed_pid "--role obs-av" >/dev/null 2>&1; then
+    if [ "$obs_listener" = "1" ] &&
+       { find_feed_pid "--role obs-video" >/dev/null 2>&1 ||
+         find_feed_pid "--role obs-av" >/dev/null 2>&1; }; then
       video_feed=1
     else
       video_feed=0
@@ -786,8 +901,9 @@ print_status() {
 
   if [ "$audio_mode" = obs ]; then
     audio_source_ready=$obs_configured
-    if find_feed_pid "--role obs-audio" >/dev/null 2>&1 ||
-       find_feed_pid "--role obs-av" >/dev/null 2>&1; then
+    if [ "$obs_listener" = "1" ] &&
+       { find_feed_pid "--role obs-audio" >/dev/null 2>&1 ||
+         find_feed_pid "--role obs-av" >/dev/null 2>&1; }; then
       audio_feed=1
     else
       audio_feed=0
@@ -796,12 +912,8 @@ print_status() {
     local_audio_url >/dev/null 2>&1 && audio_source_ready=1 || audio_source_ready=0
     find_feed_pid "--role audio" >/dev/null 2>&1 && audio_feed=1 || audio_feed=0
   fi
-  video_magic=$(read_u32_hex "$DATA/feed" 0 || true)
-  video_channel_state=$(read_u32_hex "$DATA/feed" 48 || true)
-  audio_magic=$(read_u32_hex "$DATA/audio" 0 || true)
-  audio_channel_state=$(read_u32_hex "$DATA/audio" 36 || true)
-  [ "$video_magic" = "44465243" ] && [ "$video_channel_state" = "00000001" ] && video_channel=1 || video_channel=0
-  [ "$audio_magic" = "55415243" ] && [ "$audio_channel_state" = "00000001" ] && audio_channel=1 || audio_channel=0
+  [ "$video_feed" = "1" ] && channel_has_header "$DATA/feed" 44465243 48 && video_channel=1 || video_channel=0
+  [ "$audio_feed" = "1" ] && channel_has_header "$DATA/audio" 55415243 36 && audio_channel=1 || audio_channel=0
   camera_hook=$(hook_pid cameraserver "$CAM_READY" 2>/dev/null || true)
   audio_hook=$(hook_pid audioserver "$AUD_READY" 2>/dev/null || true)
   [ -n "$camera_hook" ] && camera_hook_ready=1 || camera_hook_ready=0
@@ -858,6 +970,11 @@ case "$action" in
     # corrupt. These actions need only the control script itself.
     acquire_lock
     reconcile_stale_leases
+    ;;
+  commit-source)
+    acquire_lock
+    shift
+    commit_source "$@" || exit 1
     ;;
   uninstall)
     acquire_lock

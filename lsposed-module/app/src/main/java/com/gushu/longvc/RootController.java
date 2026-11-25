@@ -68,23 +68,27 @@ final class RootController {
     }
 
     RuntimeState stageVideo(Uri uri) throws IOException, InterruptedException {
-        return replaceSource(() -> mediaSources.stageVideo(uri));
+        return replaceMedia(mediaSources.prepareVideo(uri));
     }
 
     RuntimeState stageImage(Uri uri) throws IOException, InterruptedException {
-        return replaceSource(() -> mediaSources.stageImage(uri));
+        return replaceMedia(mediaSources.prepareImage(uri));
     }
 
     RuntimeState stageAudio(Uri uri) throws IOException, InterruptedException {
-        return replaceSource(() -> mediaSources.stageAudio(uri));
+        return replaceMedia(mediaSources.prepareAudio(uri));
+    }
+
+    private RuntimeState replaceMedia(MediaSourceManager.PreparedMedia media)
+            throws IOException, InterruptedException {
+        try (media) {
+            return replaceSource(() -> mediaSources.commitMedia(media));
+        }
     }
 
     RuntimeState configureObs(boolean allowLan) throws IOException, InterruptedException {
         String[] token = new String[1];
-        RuntimeState state = replaceSource(() -> {
-            token[0] = mediaSources.configureObs(allowLan);
-            return token[0];
-        });
+        RuntimeState state = replaceSource(() -> token[0] = mediaSources.configureObs(allowLan));
         return state.withObsStreamKey(token[0]);
     }
 
@@ -133,6 +137,10 @@ final class RootController {
             // the old leases here would race recovery and re-arm replacement.
             Thread.currentThread().interrupt();
             throw cancelled;
+        } catch (MediaSourceManager.SourceConflictException conflict) {
+            // A concurrent controller owns the new state. Do not re-arm from
+            // the snapshot that failed the compare-and-replace.
+            throw conflict;
         } catch (IOException failure) {
             if (active && !Thread.currentThread().isInterrupted()) restoreBestEffort(before, failure);
             throw failure;
@@ -176,6 +184,6 @@ final class RootController {
 
     @FunctionalInterface
     private interface SourceMutation {
-        Object apply() throws IOException, InterruptedException;
+        void apply() throws IOException, InterruptedException;
     }
 }

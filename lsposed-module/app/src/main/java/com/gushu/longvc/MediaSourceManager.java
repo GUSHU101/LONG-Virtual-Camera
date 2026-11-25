@@ -27,6 +27,7 @@ import java.security.SecureRandom;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 
 final class MediaSourceManager {
     private static final String MEDIA_DIR = "/data/local/tmp/longvc-media";
@@ -48,67 +49,56 @@ final class MediaSourceManager {
         this.shell = shell;
     }
 
-    SourceInfo stageVideo(Uri uri) throws IOException, InterruptedException {
+    PreparedMedia prepareVideo(Uri uri) throws IOException, InterruptedException {
         requireMime(uri, "video/");
-        SourceInfo info = queryInfo(uri);
-        try (InputStream input = requireInput(uri)) {
-            stageVisual(input, info.size, "video");
-        }
-        return info;
+        long size = querySize(uri);
+        return prepareMedia(requireInput(uri), size, "visual", "video");
     }
 
-    SourceInfo stageImage(Uri uri) throws IOException, InterruptedException {
+    PreparedMedia prepareImage(Uri uri) throws IOException, InterruptedException {
         requireMime(uri, "image/");
-        SourceInfo info = queryInfo(uri);
         byte[] encoded = encodeImageAsNv21(uri);
-        try (InputStream input = new ByteArrayInputStream(encoded)) {
-            stageVisual(input, encoded.length, "image");
-        }
-        return info;
+        return prepareMedia(new ByteArrayInputStream(encoded), encoded.length, "visual", "image");
     }
 
-    SourceInfo stageAudio(Uri uri) throws IOException, InterruptedException {
+    PreparedMedia prepareAudio(Uri uri) throws IOException, InterruptedException {
         requireMime(uri, "audio/");
-        SourceInfo info = queryInfo(uri);
-        ensureStorage();
-        SourceConfig current = readConfig();
-        String suffix = Long.toUnsignedString(System.nanoTime());
-        String staged = MEDIA_DIR + "/.audio-" + suffix;
-        try (InputStream input = requireInput(uri)) {
-            Fingerprint fingerprint = streamAndVerify(input, info.size, staged);
-            String published = publishImmutable(staged, "audio", fingerprint);
-            commitConfig(current.withAudio(published));
-            cleanupReplacedMedia(current.audioPath, published, "audio");
-        } finally {
-            cleanup(staged);
-        }
-        return info;
+        long size = querySize(uri);
+        return prepareMedia(requireInput(uri), size, "audio", "");
     }
 
     String configureObs(boolean allowLan) throws IOException, InterruptedException {
         ensureStorage();
-        SourceConfig current = readConfig();
+        SourceSnapshot current = readConfig();
         byte[] random = new byte[32];
         new SecureRandom().nextBytes(random);
         String token = hex(random);
-        commitConfig(current.withObs(token, allowLan ? "lan" : "loopback"));
+        commitConfig(current, current.config.withObs(token, allowLan ? "lan" : "loopback"));
         return token;
     }
 
-    private void stageVisual(InputStream input, long declaredSize, String kind)
+    private PreparedMedia prepareMedia(InputStream source, long declaredSize,
+                                       String type, String kind)
             throws IOException, InterruptedException {
-        ensureStorage();
-        SourceConfig current = readConfig();
-        String suffix = Long.toUnsignedString(System.nanoTime());
-        String mediaStage = MEDIA_DIR + "/.visual-" + suffix;
-        try {
-            Fingerprint fingerprint = streamAndVerify(input, declaredSize, mediaStage);
-            String published = publishImmutable(mediaStage, "visual", fingerprint);
-            commitConfig(current.withVisual(kind, published));
-            cleanupReplacedMedia(current.visualPath, published, "visual");
-        } finally {
-            cleanup(mediaStage);
+        String staged = MEDIA_DIR + "/." + type + "-" + UUID.randomUUID();
+        Fingerprint fingerprint;
+        try (InputStream input = source) {
+            ensureStorage();
+            fingerprint = streamAndVerify(input, declaredSize, staged);
+        } catch (IOException | InterruptedException | RuntimeException failure) {
+            cleanup(staged);
+            throw failure;
         }
+        return new PreparedMedia(staged, type, kind, fingerprint);
+    }
+
+    void commitMedia(PreparedMedia media) throws IOException, InterruptedException {
+        SourceSnapshot current = readConfig();
+        String published = publishImmutable(media.staged, media.type, media.fingerprint);
+        SourceConfig next = "audio".equals(media.type)
+                ? current.config.withAudio(published)
+                : current.config.withVisual(media.kind, published);
+        commitConfig(current, next);
     }
 
     private void ensureStorage() throws IOException, InterruptedException {
@@ -185,39 +175,38 @@ final class MediaSourceManager {
         return published;
     }
 
-    private SourceConfig readConfig() throws IOException, InterruptedException {
+    private SourceSnapshot readConfig() throws IOException, InterruptedException {
         RootShell.Result result = shell.execute(
-                "if [ -r '" + SOURCE_CONFIG + "' ]; then cat '" + SOURCE_CONFIG
-                        + "'; else echo schema=2; fi", 15L);
-        requireOk("read source configuration", result);
-        return SourceConfig.parse(result.output);
+                "if [ -e '" + SOURCE_CONFIG + "' ]; then cat '" + SOURCE_CONFIG
+                        + "'; else printf 'schema=2\\n'; fi", 15L);
+        if (!result.ok()) throw new IOException("could not read source configuration");
+        byte[] contents = result.output.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        return new SourceSnapshot(SourceConfig.parse(result.output), hex(sha256().digest(contents)));
     }
 
-    private void commitConfig(SourceConfig config)
+    private void commitConfig(SourceSnapshot current, SourceConfig config)
             throws IOException, InterruptedException {
-        byte[] bytes = config.serialize().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        Fingerprint fingerprint = new Fingerprint(hex(sha256().digest(bytes)), bytes.length);
-        String staged = CONTROL_DIR + "/.source-config-"
-                + Long.toUnsignedString(System.nanoTime());
+        String serialized = config.serialize();
+        byte[] bytes = serialized.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        String stageDigest = hex(sha256().digest(bytes));
+        String stageName = ".source-config-" + UUID.randomUUID();
+        String staged = CONTROL_DIR + "/" + stageName;
         try {
-            streamSmall(config.serialize(), staged);
-            String command = "set -e; chown 0:0 '" + staged + "'; chmod 0600 '"
-                    + staged + "'; " + verifyCommand(staged, fingerprint)
-                    + "mv -f '" + staged + "' '" + SOURCE_CONFIG + "'; sync; "
-                    + verifyCommand(SOURCE_CONFIG, fingerprint) + "echo config-committed";
+            streamSmall(serialized, staged);
+            String command = PayloadInstaller.REMOTE_SCRIPT + " commit-source "
+                    + stageName + " " + current.digest + " " + stageDigest;
             RootShell.Result result = shell.execute(command, 30L);
+            if (result.hasLine("message=source_config_conflict")
+                    || result.hasLine("message=source_runtime_active")) {
+                throw new SourceConflictException();
+            }
             requireOk("commit source configuration", result);
-            if (!result.output.contains("config-committed")) {
+            if (!result.hasLine("result=ok") || !result.hasLine("action=commit-source")) {
                 throw new IOException("source configuration commit did not finish");
             }
         } finally {
             cleanup(staged);
         }
-    }
-
-    private void cleanupReplacedMedia(String previous, String current, String type) {
-        if (previous.equals(current) || !SourceConfig.validMediaPath(previous, type)) return;
-        cleanup(previous);
     }
 
     private boolean remoteMatches(String path, Fingerprint fingerprint)
@@ -393,26 +382,20 @@ final class MediaSourceManager {
         return new Size(outWidth, outHeight);
     }
 
-    private SourceInfo queryInfo(Uri uri) {
-        String name = "selected media";
-        long size = -1L;
+    private long querySize(Uri uri) {
         try (Cursor cursor = resolver.query(uri,
-                new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE},
+                new String[]{OpenableColumns.SIZE},
                 null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
-                int nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
                 int sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE);
-                if (nameIndex >= 0 && !cursor.isNull(nameIndex)) {
-                    name = cursor.getString(nameIndex);
-                }
                 if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
-                    size = cursor.getLong(sizeIndex);
+                    return cursor.getLong(sizeIndex);
                 }
             }
         } catch (RuntimeException ignored) {
             // The stream itself remains authoritative.
         }
-        return new SourceInfo(name, size);
+        return -1L;
     }
 
     private void requireMime(Uri uri, String prefix) throws IOException {
@@ -498,7 +481,9 @@ final class MediaSourceManager {
                 String key = line.substring(0, delimiter).trim();
                 String value = line.substring(delimiter + 1).trim();
                 if (key.matches("[a-z_]+") && value.length() <= 512) {
-                    values.put(key, value);
+                    if (values.putIfAbsent(key, value) != null) {
+                        throw new IOException("duplicate source configuration key");
+                    }
                 }
             }
             if (values.size() == 1 && "2".equals(values.get("schema"))) {
@@ -569,13 +554,30 @@ final class MediaSourceManager {
         }
     }
 
-    static final class SourceInfo {
-        final String name;
-        final long size;
+    private record SourceSnapshot(SourceConfig config, String digest) {}
 
-        SourceInfo(String name, long size) {
-            this.name = name;
-            this.size = size;
+    static final class SourceConflictException extends IOException {
+        SourceConflictException() {
+            super("来源或运行状态已由另一个进程更改，请刷新后重试");
+        }
+    }
+
+    final class PreparedMedia implements AutoCloseable {
+        private final String staged;
+        private final String type;
+        private final String kind;
+        private final Fingerprint fingerprint;
+
+        private PreparedMedia(String staged, String type, String kind, Fingerprint fingerprint) {
+            this.staged = staged;
+            this.type = type;
+            this.kind = kind;
+            this.fingerprint = fingerprint;
+        }
+
+        @Override
+        public void close() {
+            cleanup(staged);
         }
     }
 

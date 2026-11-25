@@ -26,6 +26,8 @@ jobs:
         run: |
           bash -n lsposed-module/app/src/main/payload/longvc-control.sh
           bash tests/controller_recovery_test.sh
+          bash tests/controller_feeder_test.sh
+          bash tests/controller_source_test.sh
       - name: Root lifecycle and protocol tests
         run: |
           set -euo pipefail
