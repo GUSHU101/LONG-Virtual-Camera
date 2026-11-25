@@ -35,7 +35,9 @@ python tests/verify_apk.py lsposed-module/app/build/outputs/apk/debug/app-debug.
 
 Windows 开发机可用 `lsposed-module\gradlew.bat` 执行相同 Gradle 任务，输出仍然是 Android APK。正式发布要求配置项目的 Android 签名密钥。CI 的开发包使用独立的应用 ID。载荷清单会核验 APK 内的文件大小、SHA-256 与 ARM64 ELF 架构。
 
-在 GitHub Actions 运行 **Build development APK**，填写版本号即可生成开发版 APK 和 SHA-256 校验文件，从该次运行的 Artifacts 下载。该工作流使用固定的开发签名，并在上传前校验证书指纹。从 v2.0.7 起，同一开发渠道可用较高版本号直接覆盖升级。旧 CI 开发包使用过一次性签名，需要先卸载旧 APK，再安装固定签名版。通过控制面板导入的媒体和来源配置保存在独立的 `/data/cr` 下。
+在 GitHub Actions 运行 **Build development APK**，填写版本号即可生成开发版 APK 和 SHA-256 校验文件，从该次运行的 Artifacts 下载。该工作流使用固定的开发签名，并在上传前校验证书指纹。从 v2.0.7 起，同一开发渠道可直接覆盖升级。打包时使用等于或高于手机上已安装版本的版本号。
+
+旧 CI 开发包使用过一次性签名，需要先卸载旧 APK，再安装固定签名版。通过控制面板导入的媒体和来源配置保存在独立的 `/data/cr` 下。首次重装后，在 Root 管理器为新安装的 App 恢复授权，并在 LSPosed 恢复 `system` 作用域。打开控制面板，用“校验并安装载荷”加载新 APK 的系统组件。
 
 仓库维护者通过 Actions Secrets 提供 `LONGVC_DEVELOPMENT_KEYSTORE_BASE64` 和 `LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD`。开发密钥别名为 `longvc-development`，证书 SHA-256 必须与 `.github/development-cert.sha256` 一致。Quality 只校验构建，手机安装包从 **Build development APK** 下载。
 
