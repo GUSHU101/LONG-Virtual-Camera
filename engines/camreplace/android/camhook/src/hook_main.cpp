@@ -735,8 +735,8 @@ static bool wait_for_fence(int fence)
   {
     rc = poll(&pfd, 1, 3000);
   } while (rc < 0 && errno == EINTR);
-  return rc == 1 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0 &&
-         (pfd.revents & POLLNVAL) == 0;
+  return rc == 1 && (pfd.revents & POLLIN) != 0 &&
+         (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
 }
 
 static bool lock_via_ahb(const void* anb, int W, int H, int fence,
@@ -1132,7 +1132,7 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
     }
     if (photo_on)
       return overwrite_blob_jpeg(anb, fence)
-                 ? cr::camhook::ReplacementOutcome::Succeeded
+                 ? cr::camhook::ReplacementOutcome::JpegWritten
                  : cr::camhook::ReplacementOutcome::AttemptedFailed;
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
@@ -1218,7 +1218,7 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
   replaced = unlock(handle, ahb, view) && replaced;
   if (replaced)
     ++g_stat_blit_ok;
-  return replaced ? cr::camhook::ReplacementOutcome::Succeeded
+  return replaced ? cr::camhook::ReplacementOutcome::YuvWritten
                   : cr::camhook::ReplacementOutcome::AttemptedFailed;
 }
 
@@ -1244,19 +1244,25 @@ static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
          layout_ok ? bi.format : -1, layout_ok ? bi.handle : nullptr);
   }
 
-  const auto outcome = overwrite_nv21(anb, fence);
+  return overwrite_nv21(anb, fence);
+}
 
+static void report_queue_stats() noexcept
+{
+  const std::uint64_t n = g_hook_counters.callback_seen.load(std::memory_order_relaxed);
   if (n <= 5 || (n % 30) == 0)
-    LOGI(OBF("camera_output v1 yuv=%d jpeg=%d raw10=%d unsupported=%d").c_str(),
+    LOGI(OBF("camera_output v2 yuv=%d jpeg=%d raw10=%d unsupported=%d queued_yuv=%llu queued_jpeg=%llu queue_error=%llu").c_str(),
          g_stat_blit_ok.load(), g_stat_blob_ok.load(), g_stat_skip_raw10.load(),
-         g_stat_skip_fmt.load());
+         g_stat_skip_fmt.load(),
+         (unsigned long long) g_hook_counters.yuv_queued.load(),
+         (unsigned long long) g_hook_counters.jpeg_queued.load(),
+         (unsigned long long) g_hook_counters.original_queue_failed.load());
 
   if ((n % 60) == 0)
   {
-    LOGI(OBF("stats: callbacks=%llu attempted=%llu succeeded=%llu pass=%llu queue_failed=%llu skip_channel=%d skip_noframe=%d skip_stale=%d skip_noshm=%d skip_fmt=%d skip_lock=%d blit_ok=%d blob_ok=%d blob_cache_hit=%d noanb=%d layout=%d nogbm=%d dims=%d hnd=%d novu=%d").c_str(),
+    LOGI(OBF("stats: callbacks=%llu attempted=%llu pass=%llu queue_failed=%llu skip_channel=%d skip_noframe=%d skip_stale=%d skip_noshm=%d skip_fmt=%d skip_lock=%d blit_ok=%d blob_ok=%d blob_cache_hit=%d noanb=%d layout=%d nogbm=%d dims=%d hnd=%d novu=%d").c_str(),
          (unsigned long long) g_hook_counters.callback_seen.load(),
          (unsigned long long) g_hook_counters.replacement_attempted.load(),
-         (unsigned long long) g_hook_counters.replacement_succeeded.load(),
          (unsigned long long) g_hook_counters.pass_through.load(),
          (unsigned long long) g_hook_counters.original_queue_failed.load(),
          g_stat_skip_channel.load(),
@@ -1275,23 +1281,26 @@ static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
          g_stat_skip_handle.load(),
          g_stat_no_vu.load());
   }
-  return outcome;
 }
 
 static std::int32_t proxy_qbtc_surfaces(void* thiz, void* consumer, ANWB* anb,
                                         int fence, const std::vector<std::size_t>& surface_ids)
 {
-  return cr::camhook::dispatch_queue(
+  const auto status = cr::camhook::dispatch_queue(
       g_hook_counters, [=] { return replace_for_queue(anb, fence); },
       g_orig_qbtc_surfaces, thiz, consumer, anb, fence, surface_ids);
+  report_queue_stats();
+  return status;
 }
 
 static std::int32_t proxy_qbtc_legacy(void* thiz, void* consumer, ANWB* anb,
                                       int fence)
 {
-  return cr::camhook::dispatch_queue(
+  const auto status = cr::camhook::dispatch_queue(
       g_hook_counters, [=] { return replace_for_queue(anb, fence); },
       g_orig_qbtc_legacy, thiz, consumer, anb, fence);
+  report_queue_stats();
+  return status;
 }
 
 static int try_hook_primary()

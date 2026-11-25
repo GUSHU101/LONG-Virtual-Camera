@@ -536,10 +536,16 @@ public final class MainActivity extends Activity
             return "";
         if (!state.hasCameraOutputStats())
             return "\n\n尚无相机输出记录。打开相机后返回刷新状态。";
+        String queued = state.hasCameraQueueStats()
+                ? "\n系统队列累计接受：YUV " + state.cameraQueuedYuv
+                    + " 帧，JPEG " + state.cameraQueuedJpeg
+                    + " 张。队列失败 " + state.cameraQueueErrors + " 次。"
+                : "\n当前载荷暂无系统队列统计。";
         return "\n\n当前相机服务累计写入：YUV " + state.cameraWrittenYuv
-                + " 帧，JPEG " + state.cameraWrittenJpeg + " 张。"
+                + " 帧，JPEG " + state.cameraWrittenJpeg + " 张。" + queued
                 + "\n格式不支持而保留原画面：" + state.cameraUnsupported
-                + " 次（RAW10 " + state.cameraRawTen + " 次）。";
+                + " 次（RAW10 " + state.cameraRawTen + " 次）。"
+                + "\n客户端最终显示的画面以实际输出为准。";
     }
 
     private static String microphoneState(RuntimeState state) {

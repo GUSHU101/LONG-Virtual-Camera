@@ -852,16 +852,27 @@ camera_output_stats() {
   # Only export structured counters from the currently mapped cameraserver.
   # Older payloads and devices without log access simply omit these fields.
   logcat --pid="$1" -b main -d -v raw -s cr_camhook:I 2>/dev/null |
-    awk '/^camera_output v1 yuv=[0-9]+ jpeg=[0-9]+ raw10=[0-9]+ unsupported=[0-9]+$/ {
+    awk '(/^camera_output v1 yuv=[0-9]+ jpeg=[0-9]+ raw10=[0-9]+ unsupported=[0-9]+$/ ||
+          /^camera_output v2 yuv=[0-9]+ jpeg=[0-9]+ raw10=[0-9]+ unsupported=[0-9]+ queued_yuv=[0-9]+ queued_jpeg=[0-9]+ queue_error=[0-9]+$/) {
       split($3, yuv, "="); split($4, jpeg, "=")
       split($5, raw, "="); split($6, unsupported, "=")
       found = 1
+      queued = ($2 == "v2")
+      if (queued) {
+        split($7, queued_yuv, "="); split($8, queued_jpeg, "=")
+        split($9, queue_error, "=")
+      }
     } END {
       if (!found) exit
       print "camera_written_yuv=" yuv[2]
       print "camera_written_jpeg=" jpeg[2]
       print "camera_raw_ten=" raw[2]
       print "camera_unsupported=" unsupported[2]
+      if (queued) {
+        print "camera_queued_yuv=" queued_yuv[2]
+        print "camera_queued_jpeg=" queued_jpeg[2]
+        print "camera_queue_errors=" queue_error[2]
+      }
     }'
 }
 

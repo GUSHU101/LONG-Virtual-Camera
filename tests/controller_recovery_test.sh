@@ -35,6 +35,11 @@ logcat() {
 }
 [[ $(camera_output_stats 42) == $'camera_written_yuv=59\ncamera_written_jpeg=0\ncamera_raw_ten=60\ncamera_unsupported=61' ]]
 [[ -z $(camera_output_stats 43) && -z $(camera_output_stats invalid) ]]
+logcat() {
+  printf '%s\n' 'camera_output v1 yuv=59 jpeg=0 raw10=60 unsupported=61' \
+    'camera_output v2 yuv=62 jpeg=1 raw10=63 unsupported=64 queued_yuv=60 queued_jpeg=1 queue_error=2'
+}
+[[ $(camera_output_stats 42) == $'camera_written_yuv=62\ncamera_written_jpeg=1\ncamera_raw_ten=63\ncamera_unsupported=64\ncamera_queued_yuv=60\ncamera_queued_jpeg=1\ncamera_queue_errors=2' ]]
 
 dumpsys() { printf '%s\n' "$camera_dump"; }
 camera_history=$'== Camera service events log ==\nDISCONNECT device 0 client for package com.example.previous\nClient Package Name: com.example.closed'

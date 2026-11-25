@@ -112,6 +112,12 @@ public final class RootLifecycleTest {
         check(state.hasCameraOutputStats() && state.cameraWrittenYuv == 59
                 && state.cameraWrittenJpeg == 0 && state.cameraRawTen == 60,
                 "mixed YUV and RAW streams must remain distinguishable");
+        check(!state.hasCameraQueueStats(), "old write counters do not confirm queue submission");
+        RuntimeState queued = RuntimeState.parseController(raw + counters
+                + "camera_queued_yuv=57\ncamera_queued_jpeg=0\ncamera_queue_errors=2\n",
+                true, true);
+        check(queued.hasCameraQueueStats() && queued.cameraQueuedYuv == 57
+                && queued.cameraQueueErrors == 2, "queue failures must remain distinct from writes");
         check(!RuntimeState.parseController(raw + counters.replace("=60\n", "=-1\n"),
                 true, true).hasCameraOutputStats(), "invalid counters must be absent");
     }
