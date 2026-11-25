@@ -7,6 +7,7 @@ trap 'rm -rf -- "$fixture"' EXIT
 PROC_ROOT=$fixture/proc
 DATA=$fixture/data
 CONTROL=$DATA/control
+MIC_MODE=$DATA/mic_mode
 SOURCE_CONFIG=$CONTROL/source.conf
 mkdir -p "$CONTROL" "$PROC_ROOT"/{41,42,43,44}/fd "$PROC_ROOT"/42/net
 
@@ -42,6 +43,9 @@ kill() {
 [[ $(process_start_time 42) == 142 ]]
 [[ -z $(process_start_time 43 || true) ]]
 [[ -z $(feeder_start_time 44 '' || true) ]]
+printf '%s\n' "$LEGACY_FEEDER (deleted)" > "$PROC_ROOT/44/exe"
+[[ $(feeder_start_time 44 '--role obs-video') == 144 ]]
+printf '/unrelated/cr_feed_proc\n' > "$PROC_ROOT/44/exe"
 printf '%s\n' '0: 0100007F:078F 00000000:0000 0A 0:0 00:0 0 0 0 7259' \
   '1: 0100007F:078F 00000000:0000 01 0:0 00:0 0 0 0 7260' > "$PROC_ROOT/42/net/tcp"
 printf 'socket:[7260]\n' > "$PROC_ROOT/42/fd/4"

@@ -7,10 +7,12 @@ fixture=$(mktemp -d)
 trap 'rmdir "$fixture"' EXIT
 DATA=$fixture
 CONTROL=$fixture
+MIC_MODE=$fixture/mic_mode
 
 verify_steps() {
   local fail_step=$1 expected_rc=$2 rc=0
   steps=""
+  touch "$MIC_MODE"
   revoke_u32() { steps+=" revoke"; [[ $fail_step != revoke ]]; }
   stop_feeder() { steps+=" feeder"; [[ $fail_step != feeder ]]; }
   unload_camera_hook() { steps+=" camera"; [[ $fail_step != camera ]]; }
@@ -18,6 +20,7 @@ verify_steps() {
   stop_all || rc=$?
   [[ $steps == " revoke revoke feeder revoke revoke camera audio" ]]
   [[ $rc == "$expected_rc" ]]
+  [[ ! -e "$MIC_MODE" ]]
 }
 
 verify_steps none 0

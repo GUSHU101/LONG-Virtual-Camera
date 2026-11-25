@@ -5,6 +5,30 @@
 #include <netinet/in.h>
 #include <thread>
 
+static void verify_transfer_deadlines()
+{
+  using namespace std::chrono_literals;
+  using Socket = cr::feed::DeadlineSocket;
+  int pair[2];
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+  std::atomic<bool> stop{false};
+  const auto started = Socket::Clock::now();
+  Socket input(pair[0], stop, 2s, started + 80ms);
+  const char sample = 'x';
+  assert(::send(pair[1], &sample, 1, 0) == 1);
+  char bytes[2]{};
+  assert(!input.receive(bytes, sizeof(bytes)) && errno == ETIMEDOUT);
+  assert(bytes[0] == sample);
+  assert(Socket::Clock::now() - started < 1s);
+  input.finish_startup();
+  assert(input.send(&sample, 1));
+  assert(::recv(pair[1], bytes, 1, 0) == 1 && bytes[0] == sample);
+  stop.store(true, std::memory_order_relaxed);
+  assert(!input.receive(bytes, 1) && errno == ECANCELED);
+  assert(::close(pair[0]) == 0);
+  assert(::close(pair[1]) == 0);
+}
+
 int main()
 {
   using namespace std::chrono_literals;
@@ -41,4 +65,5 @@ int main()
   assert(cancelled == -1 && error == ECANCELED);
   assert(std::chrono::steady_clock::now() - started < 2s);
   assert(::close(server) == 0);
+  verify_transfer_deadlines();
 }

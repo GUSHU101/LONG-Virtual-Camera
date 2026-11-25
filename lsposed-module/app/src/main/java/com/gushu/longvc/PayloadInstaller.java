@@ -17,9 +17,10 @@ import java.util.Locale;
 import java.util.Map;
 
 final class PayloadInstaller {
-    static final String REMOTE_SCRIPT = "/data/local/tmp/longvc-control.sh";
+    private static final String DEPLOY_DIR = "/data/cr/payload";
+    static final String REMOTE_SCRIPT = DEPLOY_DIR + "/longvc-control.sh";
     private static final String ASSET_ROOT = "payload/arm64-v8a/";
-    private static final String REMOTE_ROOT = "/data/local/tmp/";
+    private static final String REMOTE_ROOT = DEPLOY_DIR + "/";
     private static final String REMOTE_MANIFEST = REMOTE_ROOT + "longvc-payload.sha256";
     private static final String[] FILES = {
             "cr_injector", "cr_feed_proc", "libcr_hooks.so", "longvc-control.sh"
@@ -45,6 +46,7 @@ final class PayloadInstaller {
     private static void appendInstalledChecks(StringBuilder command,
                                                Map<String, Entry> expected)
             throws IOException {
+        appendTrustedDeploymentChecks(command);
         for (String name : FILES) {
             appendEntryCheck(command, REMOTE_ROOT + name, requireEntry(expected, name));
         }
@@ -58,13 +60,30 @@ final class PayloadInstaller {
     }
 
     private static void appendEntryCheck(StringBuilder command, String remote, Entry entry) {
-        command.append("[ -f '").append(remote).append("' ]; ")
+        command.append("[ -f '").append(remote).append("' ]; trusted_path '")
+                .append(remote).append("'; ")
                 .append("[ \"$(wc -c < '").append(remote).append("' | tr -d ' ')\" = '")
                 .append(entry.size).append("' ]; ")
                 .append("h=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum '")
                 .append(remote).append("'; else toybox sha256sum '").append(remote)
                 .append("'; fi | awk '{print $1}'); ")
                 .append("[ \"$h\" = '").append(entry.hash).append("' ]; ");
+    }
+
+    private static void appendTrustedDeploymentChecks(StringBuilder command) {
+        command.append(RootShell.TRUSTED_STORAGE)
+                .append("trusted_dir '/data/cr'; trusted_dir '").append(DEPLOY_DIR).append("'; ");
+    }
+
+    private void ensureDeploymentDirectory() throws IOException, InterruptedException {
+        String command = "set -e; umask 077; " + RootShell.TRUSTED_STORAGE
+                + "ensure_trusted_dir '/data/cr' 0711; ensure_trusted_dir '"
+                + DEPLOY_DIR + "' 0711; "
+                + "if command -v chcon >/dev/null 2>&1; then "
+                + "chcon u:object_r:system_data_file:s0 '/data/cr' '" + DEPLOY_DIR
+                + "' 2>/dev/null || [ \"$(getenforce 2>/dev/null)\" != Enforcing ]; "
+                + "else [ \"$(getenforce 2>/dev/null)\" != Enforcing ]; fi";
+        requireOk("prepare protected payload directory", shell.execute(command, 15L));
     }
 
     boolean isControlScriptCurrent() throws IOException, InterruptedException {
@@ -79,6 +98,7 @@ final class PayloadInstaller {
         Entry script = requireEntry(expected, "longvc-control.sh");
         verifyPackagedAsset("longvc-control.sh", script);
         if (isRemoteEntryCurrent(REMOTE_SCRIPT, script, true)) return;
+        ensureDeploymentDirectory();
 
         String suffix = Long.toUnsignedString(System.nanoTime());
         String staged = REMOTE_ROOT + ".longvc-control-" + suffix;
@@ -96,6 +116,7 @@ final class PayloadInstaller {
                     + "mv -f '" + staged + "' '" + REMOTE_SCRIPT + "'; "
                     + "chown 0:0 '" + REMOTE_SCRIPT + "'; chmod 0755 '" + REMOTE_SCRIPT + "'; "
                     + "[ -x '" + REMOTE_SCRIPT + "' ]; ");
+            appendTrustedDeploymentChecks(command);
             appendEntryCheck(command, REMOTE_SCRIPT, script);
             command.append("trap - EXIT HUP INT TERM; echo control-ready");
             RootShell.Result result = shell.execute(command.toString(), 15L);
@@ -114,6 +135,7 @@ final class PayloadInstaller {
         requireArm64();
         Map<String, Entry> expected = readManifest();
         verifyPackagedAssets(expected);
+        ensureDeploymentDirectory();
 
         String suffix = Long.toUnsignedString(System.nanoTime());
         String stage = REMOTE_ROOT + ".longvc-stage-" + suffix;
@@ -155,6 +177,8 @@ final class PayloadInstaller {
     private void verifyRemoteStage(String stage, Map<String, Entry> expected)
             throws IOException, InterruptedException {
         StringBuilder command = new StringBuilder("set -e; ");
+        appendTrustedDeploymentChecks(command);
+        command.append("trusted_dir '").append(stage).append("'; ");
         for (String name : FILES) {
             appendEntryCheck(command, stage + "/" + name, requireEntry(expected, name));
         }
@@ -206,9 +230,8 @@ final class PayloadInstaller {
     }
 
     private void discardStage(String command) {
-        if (Thread.currentThread().isInterrupted()) return;
         try {
-            RootShell.Result result = shell.execute(command, 10L);
+            RootShell.Result result = shell.executeStageCleanup(command, 10L);
             if (!result.ok()) Log.w("LongVcInstaller", "Payload cleanup did not complete");
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
@@ -308,14 +331,13 @@ final class PayloadInstaller {
 
     private boolean isRemoteEntryCurrent(String remote, Entry entry, boolean requireExecutable)
             throws IOException, InterruptedException {
-        String command = "set -e; [ -f '" + remote + "' ]; "
-                + (requireExecutable ? "[ -x '" + remote + "' ]; " : "")
-                + "[ \"$(wc -c < '" + remote + "' | tr -d ' ')\" = '" + entry.size + "' ]; "
-                + "h=$(if command -v sha256sum >/dev/null 2>&1; then sha256sum '" + remote
-                + "'; else toybox sha256sum '" + remote + "'; fi | awk '{print $1}'); "
-                + "[ \"$h\" = '" + entry.hash + "' ]; echo current";
-        RootShell.Result result = shell.execute(command, 15L);
-        return result.ok() && result.output.contains("current");
+        StringBuilder command = new StringBuilder("set -e; ");
+        appendTrustedDeploymentChecks(command);
+        appendEntryCheck(command, remote, entry);
+        if (requireExecutable) command.append("[ -x '").append(remote).append("' ]; ");
+        command.append("echo current");
+        RootShell.Result result = shell.execute(command.toString(), 15L);
+        return result.ok() && hasLine(result, "current");
     }
 
     private static Entry requireEntry(Map<String, Entry> entries, String name) throws IOException {

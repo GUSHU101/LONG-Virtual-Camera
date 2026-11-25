@@ -39,7 +39,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -80,46 +79,6 @@ bool constant_time_equal(std::string_view left, std::string_view right)
     difference |= static_cast<unsigned char>(left[i]) ^
                   static_cast<unsigned char>(right[i]);
   return difference == 0;
-}
-
-bool recv_all(int s, void* out, size_t n)
-{
-  uint8_t* p = (uint8_t*) out;
-  while (n > 0)
-  {
-    if (g_stop.load(std::memory_order_relaxed))
-      return false;
-    ssize_t r = ::recv(s, p, n > (1u << 20) ? (1u << 20) : n, 0);
-    if (r == 0)
-      return false;
-    if (r < 0)
-    {
-      if (errno == EINTR)
-        continue;
-      return false;
-    }
-    p += r;
-    n -= (size_t) r;
-  }
-  return true;
-}
-
-bool send_all(int s, const void* buf, size_t n)
-{
-  const uint8_t* p = (const uint8_t*) buf;
-  while (n > 0)
-  {
-    ssize_t w = ::send(s, p, n > (1u << 20) ? (1u << 20) : n, MSG_NOSIGNAL);
-    if (w <= 0)
-    {
-      if (errno == EINTR)
-        continue;
-      return false;
-    }
-    p += w;
-    n -= (size_t) w;
-  }
-  return true;
 }
 
 inline uint32_t be24(const uint8_t* p)
@@ -339,19 +298,14 @@ bool serve_client(int client, const std::string& expected_stream_key,
 {
   int no_delay = 1;
   setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
-  timeval io_timeout{};
-  io_timeout.tv_sec = 10;
-  if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &io_timeout,
-                 sizeof(io_timeout)) != 0 ||
-      setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &io_timeout,
-                 sizeof(io_timeout)) != 0)
-  {
-    return false;
-  }
+  const auto auth_deadline =
+      cr::feed::DeadlineSocket::Clock::now() + kPublishAuthDeadline;
+  cr::feed::DeadlineSocket connection(client, g_stop, std::chrono::seconds(10),
+                                      auth_deadline);
 
   // ---- Handshake (simple, no digest) -----------------------------------
   uint8_t c0c1[1 + 1536];
-  if (!recv_all(client, c0c1, sizeof(c0c1)))
+  if (!connection.receive(c0c1, sizeof(c0c1)))
     return false;
   if (c0c1[0] != 0x03)
   {
@@ -367,11 +321,11 @@ bool serve_client(int client, const std::string& expected_stream_key,
     s1[i] = (uint8_t) rd();
   s0s1s2.insert(s0s1s2.end(), s1, s1 + 1536);
   s0s1s2.insert(s0s1s2.end(), c0c1 + 1, c0c1 + 1 + 1536);
-  if (!send_all(client, s0s1s2.data(), s0s1s2.size()))
+  if (!connection.send(s0s1s2.data(), s0s1s2.size()))
     return false;
 
   uint8_t c2[1536];
-  if (!recv_all(client, c2, sizeof(c2)))
+  if (!connection.receive(c2, sizeof(c2)))
     return false;
   LOGI(OBF("rtmp: handshake done").c_str());
 
@@ -410,8 +364,6 @@ bool serve_client(int client, const std::string& expected_stream_key,
   bool audio_pipe_started = false;
   bool publisher_authorized = false;
   size_t pre_auth_bytes = 0;
-  const auto auth_deadline =
-      std::chrono::steady_clock::now() + kPublishAuthDeadline;
 
   auto try_start_pipe = [&]()
   {
@@ -450,7 +402,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
     put_be32(body, 5'000'000);
     std::vector<uint8_t> msg;
     build_rtmp_message(msg, 2, 0, 0x05, 0, body, 4, out_chunk_size);
-    if (!send_all(client, msg.data(), msg.size()))
+    if (!connection.send(msg.data(), msg.size()))
       return false;
   }
   {
@@ -459,7 +411,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
     body[4] = 2;
     std::vector<uint8_t> msg;
     build_rtmp_message(msg, 2, 0, 0x06, 0, body, 5, out_chunk_size);
-    if (!send_all(client, msg.data(), msg.size()))
+    if (!connection.send(msg.data(), msg.size()))
       return false;
   }
   {
@@ -467,7 +419,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
     put_be32(body, out_chunk_size);
     std::vector<uint8_t> msg;
     build_rtmp_message(msg, 2, 0, 0x01, 0, body, 4, out_chunk_size);
-    if (!send_all(client, msg.data(), msg.size()))
+    if (!connection.send(msg.data(), msg.size()))
       return false;
   }
 
@@ -475,21 +427,21 @@ bool serve_client(int client, const std::string& expected_stream_key,
   {
     // --- Basic header -------------------------------------------------
     uint8_t bh0;
-    if (!recv_all(client, &bh0, 1))
+    if (!connection.receive(&bh0, 1))
       break;
     uint32_t fmt = bh0 >> 6;
     uint32_t cs_id = bh0 & 0x3f;
     if (cs_id == 0)
     {
       uint8_t ext;
-      if (!recv_all(client, &ext, 1))
+      if (!connection.receive(&ext, 1))
         break;
       cs_id = 64u + ext;
     }
     else if (cs_id == 1)
     {
       uint8_t ext[2];
-      if (!recv_all(client, ext, 2))
+      if (!connection.receive(ext, 2))
         break;
       cs_id = 64u + (uint32_t) ext[0] + ((uint32_t) ext[1] << 8);
     }
@@ -518,7 +470,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
     if (fmt == 0)
     {
       uint8_t h[11];
-      if (!recv_all(client, h, 11))
+      if (!connection.receive(h, 11))
         break;
       const uint32_t raw_timestamp = be24(h);
       last.timestamp = raw_timestamp;
@@ -532,7 +484,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
       if (last.extended_timestamp)
       {
         uint8_t ext[4];
-        if (!recv_all(client, ext, 4))
+        if (!connection.receive(ext, 4))
           break;
         last.timestamp = be32(ext);
       }
@@ -543,7 +495,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
       if (!last.valid)
         return false;
       uint8_t h[7];
-      if (!recv_all(client, h, 7))
+      if (!connection.receive(h, 7))
         break;
       const uint32_t raw_delta = be24(h);
       uint32_t delta = raw_delta;
@@ -553,7 +505,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
       if (last.extended_timestamp)
       {
         uint8_t ext[4];
-        if (!recv_all(client, ext, 4))
+        if (!connection.receive(ext, 4))
           break;
         delta = be32(ext);
       }
@@ -565,7 +517,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
       if (!last.valid)
         return false;
       uint8_t h[3];
-      if (!recv_all(client, h, 3))
+      if (!connection.receive(h, 3))
         break;
       const uint32_t raw_delta = be24(h);
       uint32_t delta = raw_delta;
@@ -573,7 +525,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
       if (last.extended_timestamp)
       {
         uint8_t ext[4];
-        if (!recv_all(client, ext, 4))
+        if (!connection.receive(ext, 4))
           break;
         delta = be32(ext);
       }
@@ -587,7 +539,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
       if (last.extended_timestamp)
       {
         uint8_t ignored[4];
-        if (!recv_all(client, ignored, 4))
+        if (!connection.receive(ignored, 4))
           break;
       }
       if (first_chunk)
@@ -617,7 +569,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
     buf.resize(old_size + take);
     if (take > 0)
     {
-      if (!recv_all(client, buf.data() + old_size, take))
+      if (!connection.receive(buf.data() + old_size, take))
         goto done;
     }
     if (!publisher_authorized)
@@ -696,7 +648,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
           amf_put_obj_end(resp);
           std::vector<uint8_t> msg;
           build_rtmp_message(msg, 3, 0, 0x14, 0, resp.data(), resp.size(), out_chunk_size);
-          if (!send_all(client, msg.data(), msg.size()))
+          if (!connection.send(msg.data(), msg.size()))
             goto done;
         }
         else if (cmd == OBF("releaseStream").c_str() || cmd == OBF("FCPublish").c_str() || cmd == OBF("FCUnpublish").c_str() || cmd == OBF("deleteStream").c_str())
@@ -708,7 +660,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
           amf_put_null(resp);
           std::vector<uint8_t> msg;
           build_rtmp_message(msg, 3, 0, 0x14, 0, resp.data(), resp.size(), out_chunk_size);
-          if (!send_all(client, msg.data(), msg.size()))
+          if (!connection.send(msg.data(), msg.size()))
             goto done;
         }
         else if (cmd == OBF("createStream").c_str())
@@ -720,7 +672,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
           amf_put_number(resp, 1.0);
           std::vector<uint8_t> msg;
           build_rtmp_message(msg, 3, 0, 0x14, 0, resp.data(), resp.size(), out_chunk_size);
-          if (!send_all(client, msg.data(), msg.size()))
+          if (!connection.send(msg.data(), msg.size()))
             goto done;
         }
         else if (cmd == OBF("publish").c_str())
@@ -737,6 +689,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
             return false;
           }
           publisher_authorized = true;
+          connection.finish_startup();
           std::vector<uint8_t> resp;
           amf_put_string(resp, OBF("onStatus").c_str());
           amf_put_number(resp, 0.0);
@@ -751,7 +704,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
           amf_put_obj_end(resp);
           std::vector<uint8_t> msg;
           build_rtmp_message(msg, 4, 0, 0x14, 1, resp.data(), resp.size(), out_chunk_size);
-          if (!send_all(client, msg.data(), msg.size()))
+          if (!connection.send(msg.data(), msg.size()))
             goto done;
         }
         break;

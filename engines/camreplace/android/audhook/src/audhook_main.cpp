@@ -2,6 +2,7 @@
 
 #include "../../feed/src/audio_shm.h"
 #include "media/PcmResampler.h"
+#include "VirtualMicGate.h"
 #include "shadowhook.h"
 
 #include <android/log.h>
@@ -9,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -35,8 +37,8 @@
  * Stream state is keyed by the HAL object and guarded by g_stream_mu; it keeps
  * independent consumer cursors, format probing, and prebuffer state. The feed
  * process owns and publishes the shared-memory header and samples; audioserver
- * only maps them read-only. Invalid headers, format transitions, underruns,
- * and unresolved hooks preserve pass-through microphone behaviour.
+ * only maps them read-only. While the user-selected mode is active, invalid
+ * headers, format transitions and underruns produce silence.
  */
 
 #define TAG "cr_audhook"
@@ -507,8 +509,12 @@ static bool deliver_pcm_locked(ConsumerState& state, uint8_t* dst, size_t bytes,
   return true;
 }
 
-static void apply_substitute(void* thiz, uint8_t* buffer, size_t got, const char* path_tag)
+static void apply_substitute(void* thiz, uint8_t* buffer, size_t got,
+                             const char* path_tag) noexcept try
 {
+  if (!cr::audhook::prepare_virtual_mic_read(OBF("/data/cr/mic_mode").c_str(), buffer, got))
+    return;
+
   if (!g_shm_ready.load(std::memory_order_acquire))
   {
     try_lazy_open();
@@ -524,12 +530,6 @@ static void apply_substitute(void* thiz, uint8_t* buffer, size_t got, const char
   }
   if (gate.channel_state != CR_CHANNEL_STATE_READY)
     return;
-
-  // Virtual microphone is explicitly active. Clear the complete real-HAL
-  // result before probing or copying so startup, underrun and short reads are
-  // silence-padded and can never leak a real microphone tail. When the user
-  // disables the option channel_state is not READY and this code is bypassed.
-  memset(buffer, 0, got);
 
   // From this point forward every failure is fail-closed to silence. A corrupt
   // or concurrently invalidated virtual header must not expose the real-HAL
@@ -584,6 +584,12 @@ static void apply_substitute(void* thiz, uint8_t* buffer, size_t got, const char
   {
     LOGI(OBF("%s hit#%llu bytes=%zu replaced=%d total=%llu underruns=%llu resampled=%llu").c_str(), path_tag, (unsigned long long) n, got, (int) replaced, (unsigned long long) g_stat_total_bytes.load(), (unsigned long long) g_stat_underrun.load(), (unsigned long long) g_stat_resampled.load());
   }
+}
+catch (...)
+{
+  // Allocation or bookkeeping must neither unwind through the HAL ABI nor
+  // expose the original samples. The mode check runs before those operations.
+  memset(buffer, 0, got);
 }
 
 static int32_t proxy_streamin_read(void* thiz, void* buffer, size_t bytes, size_t* read_out)
@@ -810,6 +816,13 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_audhook_sh
 
 extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_audhook_init(const char* feed_url)
 {
+  const char* process = getprogname();
+  if (!process || strcmp(process, "audioserver") != 0)
+    return -1;
+  struct stat mode{};
+  if (::lstat(OBF("/data/cr/mic_mode").c_str(), &mode) != 0 ||
+      !S_ISREG(mode.st_mode))
+    return -1;
   if (g_installed.exchange(true))
   {
     LOGI(OBF("already installed").c_str());
@@ -827,9 +840,15 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_audhook_in
     {
       char buf[32];
       int n = snprintf(buf, sizeof(buf), "%ld\n", (long) getpid());
-      if (n > 0)
-        (void) write(fd, buf, (size_t) n);
+      const bool written = n > 0 && n < static_cast<int>(sizeof(buf)) &&
+                           write(fd, buf, static_cast<size_t>(n)) == n;
       close(fd);
+      if (!written)
+      {
+        LOGE("Cannot write audio readiness marker");
+        cr_audhook_shutdown();
+        return -1;
+      }
     }
     else
     {

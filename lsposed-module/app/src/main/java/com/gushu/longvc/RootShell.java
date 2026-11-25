@@ -10,6 +10,15 @@ import java.util.concurrent.atomic.AtomicReference;
 
 final class RootShell {
     private static final int MAX_CAPTURE_BYTES = 128 * 1024;
+    static final String TRUSTED_STORAGE = "trusted_path() { "
+            + "[ ! -L \"$1\" ] || return 1; "
+            + "case \"$(stat -c '%u:%a' \"$1\" 2>/dev/null)\" in "
+            + "0:[0-7][0145][0145]) return 0 ;; *) return 1 ;; esac; }; "
+            + "trusted_dir() { [ -d \"$1\" ] && trusted_path \"$1\"; }; "
+            + "ensure_trusted_dir() { "
+            + "if [ ! -e \"$1\" ] && [ ! -L \"$1\" ]; then "
+            + "mkdir \"$1\" 2>/dev/null || trusted_dir \"$1\" || return 1; fi; "
+            + "trusted_dir \"$1\" && chmod \"$2\" \"$1\"; }; ";
 
     static final class Result {
         final int exitCode;
@@ -51,6 +60,18 @@ final class RootShell {
 
     Result execute(String command, long timeoutSeconds) throws IOException, InterruptedException {
         return run(command, null, timeoutSeconds);
+    }
+
+    // Only for removing this operation's private staging files. Preserve the
+    // cancellation before returning so ordinary root actions still abort.
+    Result executeStageCleanup(String command, long timeoutSeconds)
+            throws IOException, InterruptedException {
+        boolean cancelled = Thread.interrupted();
+        try {
+            return execute(command, timeoutSeconds);
+        } finally {
+            if (cancelled) Thread.currentThread().interrupt();
+        }
     }
 
     Result stream(String command, InputStream input, long timeoutSeconds)

@@ -16,6 +16,7 @@
 #include <exception>
 #include <new>
 #include <string>
+#include <string_view>
 #include "util/Obf.h"
 
 #define TAG "cr_feed"
@@ -158,9 +159,11 @@ bool trusted_local_media_path(const char* value, std::string& canonical)
   char resolved[PATH_MAX] = {};
   if (!realpath(value, resolved))
     return false;
-  constexpr const char* root = "/data/local/tmp/longvc-media/";
-  const size_t root_length = strlen(root);
-  if (strncmp(resolved, root, root_length) != 0 || resolved[root_length] == '\0')
+  std::string_view path(resolved);
+  constexpr std::string_view current = "/data/cr/media/";
+  constexpr std::string_view legacy = "/data/local/tmp/longvc-media/";
+  if (!(path.size() > current.size() && path.starts_with(current)) &&
+      !(path.size() > legacy.size() && path.starts_with(legacy)))
     return false;
   canonical.assign(resolved);
   return true;

@@ -8,16 +8,19 @@
 PATH=/system/bin:/system/xbin:/sbin:/vendor/bin:/data/adb/magisk:$PATH
 export PATH
 
-BASE=/data/local/tmp
 DATA=/data/cr
+BASE=$DATA/payload
 CONTROL=$DATA/control
-MEDIA=$BASE/longvc-media
+MEDIA=$DATA/media
+LEGACY_MEDIA=/data/local/tmp/longvc-media
 LOCK=$BASE/.longvc-control.lock
 INJECTOR=$BASE/cr_injector
 FEEDER=$BASE/cr_feed_proc
+LEGACY_FEEDER=/data/local/tmp/cr_feed_proc
 HOOK=$BASE/libcr_hooks.so
 CAM_READY=$DATA/camhook.ready
 AUD_READY=$DATA/audhook.ready
+MIC_MODE=$DATA/mic_mode
 VIDEO_LOG=$BASE/cr_feed.log
 AUDIO_LOG=$BASE/cr_feed_audio.log
 OBS_LOG=$BASE/cr_feed_obs.log
@@ -123,7 +126,10 @@ process_start_time() (
 feeder_start_time() (
   feeder_started=$(process_start_time "$1") || return 1
   feeder_exe=$(readlink "$PROC_ROOT/$1/exe" 2>/dev/null) || return 1
-  case "$feeder_exe" in "$FEEDER"|"$FEEDER (deleted)") ;; *) return 1 ;; esac
+  case "$feeder_exe" in
+    "$FEEDER"|"$FEEDER (deleted)"|"$LEGACY_FEEDER"|"$LEGACY_FEEDER (deleted)") ;;
+    *) return 1 ;;
+  esac
   feeder_cmd=$(tr '\000' ' ' 2>/dev/null < "$PROC_ROOT/$1/cmdline") || return 1
   case "$feeder_cmd" in *"$2"*) ;; *) return 1 ;; esac
   [ "$(process_start_time "$1")" = "$feeder_started" ] || return 1
@@ -453,11 +459,12 @@ file_sha256() (
 )
 
 managed_media_path() (
+  media_root=${3:-$MEDIA}
   case "$2" in
-    "$MEDIA/$1-"*.media) ;;
+    "$media_root/$1-"*.media) ;;
     *) return 1 ;;
   esac
-  media_digest=${2#"$MEDIA/$1-"}
+  media_digest=${2#"$media_root/$1-"}
   valid_sha256 "${media_digest%.media}"
 )
 
@@ -571,8 +578,9 @@ ensure_obs_feeder() {
 
 local_visual_url() {
   visual_source=$(config_value visual_path 2>/dev/null)
-  case "$visual_source" in "$MEDIA"/visual-[0-9a-f]*.media) ;; *) return 1 ;; esac
-  [ -r "$visual_source" ] || return 1
+  managed_media_path visual "$visual_source" ||
+    managed_media_path visual "$visual_source" "$LEGACY_MEDIA" || return 1
+  [ -f "$visual_source" ] && [ ! -L "$visual_source" ] && [ -r "$visual_source" ] || return 1
   visual_kind=$(config_value visual_kind 2>/dev/null)
   case "$visual_kind" in
     video) say "file_video:$visual_source" ;;
@@ -583,8 +591,9 @@ local_visual_url() {
 
 local_audio_url() {
   audio_source=$(config_value audio_path 2>/dev/null)
-  case "$audio_source" in "$MEDIA"/audio-[0-9a-f]*.media) ;; *) return 1 ;; esac
-  [ -r "$audio_source" ] || return 1
+  managed_media_path audio "$audio_source" ||
+    managed_media_path audio "$audio_source" "$LEGACY_MEDIA" || return 1
+  [ -f "$audio_source" ] && [ ! -L "$audio_source" ] && [ -r "$audio_source" ] || return 1
   say "file_audio:$audio_source"
 }
 
@@ -626,7 +635,7 @@ ensure_audio() {
     audio_url=$(local_audio_url) || return 1
     start_feeder "$audio_url" audio audio "$AUDIO_LOG" || return 1
   fi
-  if ! ensure_audio_hook; then
+  if ! publish_mic_mode || ! ensure_audio_hook; then
     if [ "$(current_audio_mode)" = obs ]; then
       [ "$(current_visual_mode)" = obs ] &&
         { [ -e "$CONTROL/camera.lease" ] || [ -e "$CONTROL/photo.lease" ]; } ||
@@ -704,7 +713,7 @@ reconcile_stale_leases() {
     audio_live=1
   fi
   if [ "$audio_live" = "0" ]; then
-    rm -f "$CONTROL/mic.lease"
+    rm -f "$CONTROL/mic.lease" "$MIC_MODE"
   fi
 }
 
@@ -810,13 +819,25 @@ disarm_photo() {
   fi
 }
 
+publish_mic_mode() {
+  mic_stage=$DATA/.mic-mode.$$
+  if (umask 077; set -C; printf '1\n' > "$mic_stage") &&
+     chown 0:0 "$mic_stage" && chmod 0400 "$mic_stage" &&
+     apply_data_context "$mic_stage" &&
+     mv -f "$mic_stage" "$MIC_MODE"; then
+    return 0
+  fi
+  rm -f "$mic_stage"
+  return 1
+}
+
 arm_mic() {
   if ! (: > "$CONTROL/mic.lease" && chmod 0600 "$CONTROL/mic.lease"); then
-    rm -f "$CONTROL/mic.lease"
+    rm -f "$CONTROL/mic.lease" "$MIC_MODE"
     return 1
   fi
   if ! ensure_audio; then
-    rm -f "$CONTROL/mic.lease"
+    rm -f "$CONTROL/mic.lease" "$MIC_MODE"
     stop_audio_passthrough
     unload_audio_hook
     return 1
@@ -824,8 +845,8 @@ arm_mic() {
 }
 
 disarm_mic() {
-  rm -f "$CONTROL/mic.lease" || return 1
   disarm_rc=0
+  rm -f "$CONTROL/mic.lease" "$MIC_MODE" || disarm_rc=1
   stop_audio_passthrough || disarm_rc=1
   unload_audio_hook || disarm_rc=1
   return "$disarm_rc"
@@ -834,7 +855,7 @@ disarm_mic() {
 stop_all() {
   stop_all_rc=0
   rm -f "$CONTROL/camera.lease" "$CONTROL/photo.lease" \
-    "$CONTROL/mic.lease" "$DATA/photo_mode" "$DATA/video_mode" || stop_all_rc=1
+    "$CONTROL/mic.lease" "$MIC_MODE" "$DATA/photo_mode" "$DATA/video_mode" || stop_all_rc=1
   # A partial transaction can leave a feeder from the previous source.
   # Recovery must cover every owned feeder regardless of the saved plan.
   revoke_u32 "$DATA/feed" 48 || stop_all_rc=1
@@ -931,7 +952,7 @@ print_status() {
   [ -n "$audio_hook" ] && audio_hook_ready=1 || audio_hook_ready=0
   [ -e "$CONTROL/camera.lease" ] && camera_enabled=1 || camera_enabled=0
   [ -e "$CONTROL/photo.lease" ] && [ -e "$DATA/photo_mode" ] && photo_enabled=1 || photo_enabled=0
-  [ -e "$CONTROL/mic.lease" ] && audio_enabled=1 || audio_enabled=0
+  [ -e "$CONTROL/mic.lease" ] && [ -f "$MIC_MODE" ] && audio_enabled=1 || audio_enabled=0
 
   say "schema=1"
   say "root=1"

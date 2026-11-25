@@ -30,7 +30,7 @@ import java.util.Map;
 import java.util.UUID;
 
 final class MediaSourceManager {
-    private static final String MEDIA_DIR = "/data/local/tmp/longvc-media";
+    private static final String MEDIA_DIR = "/data/cr/media";
     private static final String CONTROL_DIR = "/data/cr/control";
     private static final String SOURCE_CONFIG = CONTROL_DIR + "/source.conf";
     private static final long MAX_MEDIA_BYTES = 2L * 1024L * 1024L * 1024L;
@@ -127,9 +127,9 @@ final class MediaSourceManager {
     }
 
     private void ensureStorage() throws IOException, InterruptedException {
-        String command = "set -e; umask 077; mkdir -p '" + MEDIA_DIR + "' '"
-                + CONTROL_DIR + "'; chown 0:0 '" + MEDIA_DIR + "' '" + CONTROL_DIR
-                + "'; chmod 0700 '" + MEDIA_DIR + "' '" + CONTROL_DIR + "'; "
+        String command = "set -e; umask 077; " + RootShell.TRUSTED_STORAGE
+                + "ensure_trusted_dir '/data/cr' 0711; ensure_trusted_dir '" + MEDIA_DIR
+                + "' 0700; ensure_trusted_dir '" + CONTROL_DIR + "' 0700; "
                 + "if command -v chcon >/dev/null 2>&1; then "
                 + "chcon u:object_r:system_data_file:s0 '/data/cr' '" + CONTROL_DIR
                 + "' 2>/dev/null || [ \"$(getenforce 2>/dev/null)\" != Enforcing ]; "
@@ -442,7 +442,7 @@ final class MediaSourceManager {
         for (String path : paths) command.append(" '").append(path).append("'");
         command.append(" 2>/dev/null; true");
         try {
-            shell.execute(command.toString(), 15L);
+            shell.executeStageCleanup(command.toString(), 15L);
         } catch (IOException ignored) {
             // Best-effort cleanup must not mask the transaction result.
         } catch (InterruptedException interrupted) {
@@ -579,7 +579,7 @@ final class MediaSourceManager {
         }
 
         static boolean validMediaPath(String path, String type) {
-            return path.matches("^/data/local/tmp/longvc-media/" + type
+            return path.matches("^(?:/data/cr/media|/data/local/tmp/longvc-media)/" + type
                     + "-[0-9a-f]{64}\\.media$");
         }
 

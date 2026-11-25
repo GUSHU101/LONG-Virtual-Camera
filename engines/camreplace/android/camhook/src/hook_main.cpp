@@ -1227,8 +1227,8 @@ using qbtc_surfaces_t = std::int32_t (*)(void* thiz, void* consumer, ANWB* anb,
 using qbtc_legacy_t = std::int32_t (*)(void* thiz, void* consumer, ANWB* anb,
                                       int fence);
 
-static qbtc_surfaces_t g_orig_qbtc_surfaces = nullptr;
-static qbtc_legacy_t g_orig_qbtc_legacy = nullptr;
+static void* g_orig_qbtc_surfaces = nullptr;
+static void* g_orig_qbtc_legacy = nullptr;
 static cr::camhook::HookCounters g_hook_counters;
 
 static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
@@ -1288,7 +1288,8 @@ static std::int32_t proxy_qbtc_surfaces(void* thiz, void* consumer, ANWB* anb,
 {
   const auto status = cr::camhook::dispatch_queue(
       g_hook_counters, [=] { return replace_for_queue(anb, fence); },
-      g_orig_qbtc_surfaces, thiz, consumer, anb, fence, surface_ids);
+      reinterpret_cast<qbtc_surfaces_t>(__atomic_load_n(&g_orig_qbtc_surfaces, __ATOMIC_ACQUIRE)),
+      thiz, consumer, anb, fence, surface_ids);
   report_queue_stats();
   return status;
 }
@@ -1298,7 +1299,8 @@ static std::int32_t proxy_qbtc_legacy(void* thiz, void* consumer, ANWB* anb,
 {
   const auto status = cr::camhook::dispatch_queue(
       g_hook_counters, [=] { return replace_for_queue(anb, fence); },
-      g_orig_qbtc_legacy, thiz, consumer, anb, fence);
+      reinterpret_cast<qbtc_legacy_t>(__atomic_load_n(&g_orig_qbtc_legacy, __ATOMIC_ACQUIRE)),
+      thiz, consumer, anb, fence);
   report_queue_stats();
   return status;
 }
@@ -1320,20 +1322,20 @@ static int try_hook_primary()
       void* proxy = abi.kind == cr::camhook::TargetAbiKind::QueueWithSurfaceIds
                         ? reinterpret_cast<void*>(proxy_qbtc_surfaces)
                         : reinterpret_cast<void*>(proxy_qbtc_legacy);
-      void* original = nullptr;
-      void* stub = shadowhook_hook_sym_name(lib, abi.symbol, proxy, &original);
+      // ShadowHook publishes this storage before redirecting the target.
+      // Keep it alive and usable by a callback during installation itself.
+      void** original = abi.kind == cr::camhook::TargetAbiKind::QueueWithSurfaceIds
+                            ? &g_orig_qbtc_surfaces : &g_orig_qbtc_legacy;
+      __atomic_store_n(original, nullptr, __ATOMIC_RELAXED);
+      void* stub = shadowhook_hook_sym_name(lib, abi.symbol, proxy, original);
       if (stub)
       {
-        if (!original)
+        if (!__atomic_load_n(original, __ATOMIC_ACQUIRE))
         {
           LOGE(OBF("hook returned no original target; rolling back").c_str());
           shadowhook_unhook(stub);
           continue;
         }
-        if (abi.kind == cr::camhook::TargetAbiKind::QueueWithSurfaceIds)
-          g_orig_qbtc_surfaces = reinterpret_cast<qbtc_surfaces_t>(original);
-        else
-          g_orig_qbtc_legacy = reinterpret_cast<qbtc_legacy_t>(original);
         g_hook_stub = stub;
         LOGI(OBF("hook installed on queueBufferToConsumer (lib=%s sym=%s abi=%s)").c_str(),
              lib, abi.symbol,

@@ -550,11 +550,11 @@ public final class MainActivity extends Activity
 
     private static String microphoneState(RuntimeState state) {
         if (!state.micEnabled) return "关闭";
-        if (!state.audioFeederReady) return state.audioUsesObs()
-                ? "等待手机 RTMP 监听器" : "等待本地音频解码器";
         if (!state.audioHookReady) return "等待 audioserver hook";
+        if (!state.audioFeederReady) return state.audioUsesObs()
+                ? "等待手机 RTMP 监听器，输出静音" : "等待本地音频解码器，输出静音";
         if (!state.audioChannelReady) return state.audioUsesObs()
-                ? "等待 OBS AAC 音频帧" : "等待本地 PCM";
+                ? "等待 OBS AAC 音频帧，输出静音" : "等待本地 PCM，输出静音";
         return "READY";
     }
 

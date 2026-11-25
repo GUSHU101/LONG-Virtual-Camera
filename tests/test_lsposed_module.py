@@ -49,6 +49,12 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertLess(arm_case, disarm_case)
         self.assertIn("unload_audio_hook", script[disarm_case:])
         self.assertIn("reconcile_stale_leases", script)
+        self.assertIn('rm -f "$CONTROL/mic.lease" "$MIC_MODE"', script[disarm_case:])
+        audio = (ROOT / "engines/camreplace/android/audhook/src/audhook_main.cpp"
+                 ).read_text(encoding="utf-8")
+        substitute = audio.split("static void apply_substitute", 1)[1]
+        self.assertLess(substitute.index("prepare_virtual_mic_read"),
+                        substitute.index("audio_header_snapshot"))
 
     def test_root_script_keeps_selinux_enforcing(self) -> None:
         script = (MODULE / "payload/longvc-control.sh").read_text(encoding="utf-8")
@@ -230,6 +236,8 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertNotIn('rm -rf \\"$backup\\"', commit)
         cleanup = installer.split("private void discardStage(", 1)[1]
         self.assertIn("catch (IOException cleanupFailure)", cleanup)
+        self.assertIn('DEPLOY_DIR = "/data/cr/payload"', installer)
+        self.assertIn("appendTrustedDeploymentChecks(command)", installer)
 
     def test_injector_discovers_services_by_executable(self) -> None:
         source = (ROOT / "engines/camreplace/android/injector/src/ptrace_arm64.cpp"
