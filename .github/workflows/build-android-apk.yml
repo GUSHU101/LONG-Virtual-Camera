@@ -1,0 +1,179 @@
+name: Android APK build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      production:
+        default: false
+        type: boolean
+    secrets:
+      LONGVC_ANDROID_KEYSTORE_BASE64:
+        required: false
+      LONGVC_ANDROID_KEYSTORE_PASSWORD:
+        required: false
+      LONGVC_ANDROID_KEY_ALIAS:
+        required: false
+      LONGVC_ANDROID_KEY_PASSWORD:
+        required: false
+    outputs:
+      version:
+        value: ${{ jobs.validate.outputs.version }}
+      artifact:
+        value: ${{ jobs.validate.outputs.artifact }}
+
+permissions:
+  contents: read
+
+env:
+  CAMREPLACE_NDK_VERSION: 27.3.13750724
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      version_code: ${{ steps.version.outputs.code }}
+      channel: ${{ steps.version.outputs.channel }}
+      artifact: ${{ steps.version.outputs.artifact }}
+    steps:
+      - id: version
+        name: Validate release version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          SIGN_PRODUCTION: ${{ inputs.production }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_VERSION" =~ ^v([0-9]{1,4})\.([0-9]{1,3})\.([0-9]{1,3})([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $REQUESTED_VERSION" >&2
+            exit 1
+          fi
+          major=$((10#${BASH_REMATCH[1]}))
+          minor=$((10#${BASH_REMATCH[2]}))
+          patch=$((10#${BASH_REMATCH[3]}))
+          code=$((major * 1000000 + minor * 1000 + patch))
+          if (( code < 1 || code > 2100000000 )); then
+            echo "Android versionCode is out of range: $code" >&2
+            exit 1
+          fi
+          artifact="LONG-Virtual-Camera-${REQUESTED_VERSION}-LSPosed-arm64"
+          if [[ "$SIGN_PRODUCTION" == true ]]; then
+            channel=production
+          else
+            channel=development
+            artifact="$artifact-development"
+          fi
+          printf 'value=%s\ncode=%s\nchannel=%s\nartifact=%s\n' \
+            "$REQUESTED_VERSION" "$code" "$channel" "$artifact" >> "$GITHUB_OUTPUT"
+      - name: Check production signing secrets
+        if: steps.version.outputs.channel == 'production'
+        env:
+          LONGVC_ANDROID_KEYSTORE_BASE64: ${{ secrets.LONGVC_ANDROID_KEYSTORE_BASE64 }}
+          LONGVC_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEYSTORE_PASSWORD }}
+          LONGVC_ANDROID_KEY_ALIAS: ${{ secrets.LONGVC_ANDROID_KEY_ALIAS }}
+          LONGVC_ANDROID_KEY_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in LONGVC_ANDROID_KEYSTORE_BASE64 LONGVC_ANDROID_KEYSTORE_PASSWORD \
+                      LONGVC_ANDROID_KEY_ALIAS LONGVC_ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing repository Actions secret $name"
+              missing=1
+            fi
+          done
+          if (( missing )); then
+            echo 'To build an installable test APK, run the Build development APK workflow.' >&2
+            exit 1
+          fi
+
+  android:
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      ANDROID_OUT_DIR: ${{ github.workspace }}/build/camreplace-android/out
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      LONGVC_VERSION_CODE: ${{ needs.validate.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install pinned Android toolchain
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;$CAMREPLACE_NDK_VERSION" \
+            "platforms;android-37.0" "build-tools;37.0.0"
+      - name: Build phone-native ARM64 payload
+        run: |
+          set -euo pipefail
+          cmake -S engines/camreplace/android -B build/camreplace-android \
+            -G "Unix Makefiles" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/android-ndk.cmake" \
+            -DANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$CAMREPLACE_NDK_VERSION" \
+            -DCR_FEED_ENABLE_RTMP_DIRECT=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/camreplace-android --parallel 4
+          for file in cr_injector cr_feed_proc libcr_hooks.so; do
+            test -s "build/camreplace-android/out/$file"
+          done
+      - name: Build development LSPosed APK
+        if: needs.validate.outputs.channel == 'development'
+        run: |
+          set -euo pipefail
+          export LONGVC_VERSION_NAME="${RELEASE_VERSION#v}"
+          chmod +x lsposed-module/gradlew
+          lsposed-module/gradlew --no-daemon -p lsposed-module \
+            :app:assembleDebug :app:lintDebug
+      - name: Build production-signed LSPosed APK
+        if: needs.validate.outputs.channel == 'production'
+        env:
+          SIGNING_STORE_BASE64: ${{ secrets.LONGVC_ANDROID_KEYSTORE_BASE64 }}
+          LONGVC_SIGNING_STORE_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEYSTORE_PASSWORD }}
+          LONGVC_SIGNING_KEY_ALIAS: ${{ secrets.LONGVC_ANDROID_KEY_ALIAS }}
+          LONGVC_SIGNING_KEY_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export LONGVC_VERSION_NAME="${RELEASE_VERSION#v}"
+          export LONGVC_SIGNING_STORE_FILE
+          LONGVC_SIGNING_STORE_FILE=$(mktemp "$RUNNER_TEMP/longvc-release.XXXXXX")
+          trap 'rm -f -- "$LONGVC_SIGNING_STORE_FILE"' EXIT
+          printf '%s' "$SIGNING_STORE_BASE64" | base64 --decode > "$LONGVC_SIGNING_STORE_FILE"
+          unset SIGNING_STORE_BASE64
+          test -s "$LONGVC_SIGNING_STORE_FILE"
+          chmod +x lsposed-module/gradlew
+          lsposed-module/gradlew --no-daemon -p lsposed-module \
+            :app:assembleRelease :app:lintRelease
+      - name: Verify APK and stage artifact
+        env:
+          APK_CHANNEL: ${{ needs.validate.outputs.channel }}
+          ARTIFACT_NAME: ${{ needs.validate.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          if [[ "$APK_CHANNEL" == production ]]; then
+            variant=release
+          else
+            variant=debug
+          fi
+          source_apk="lsposed-module/app/build/outputs/apk/$variant/app-$variant.apk"
+          test -s "$source_apk"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose "$source_apk"
+          python3 tests/verify_apk.py "$source_apk"
+          test "$(unzip -p "$source_apk" META-INF/xposed/scope.list | tr -d '\r\n')" = system
+          mkdir -p dist
+          apk="$ARTIFACT_NAME.apk"
+          cp "$source_apk" "dist/$apk"
+          (cd dist && sha256sum "$apk" > "$apk.sha256")
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ needs.validate.outputs.artifact }}
+          path: |
+            dist/*.apk
+            dist/*.apk.sha256
+          if-no-files-found: error
+          retention-days: 30

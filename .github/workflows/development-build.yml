@@ -1,0 +1,20 @@
+name: Build development APK
+run-name: Build development APK ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Development build version (vMAJOR.MINOR.PATCH)
+        required: true
+        default: v2.0.5
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-android-apk.yml
+    with:
+      version: ${{ inputs.version }}

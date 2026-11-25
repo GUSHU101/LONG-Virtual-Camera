@@ -179,6 +179,19 @@ class LsposedModuleContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse((ROOT / path).exists())
 
+    def test_development_workflow_cannot_request_production_signing(self) -> None:
+        workflows = ROOT / ".github/workflows"
+        development = (workflows / "development-build.yml").read_text(encoding="utf-8")
+        release = (workflows / "release-build.yml").read_text(encoding="utf-8")
+        shared = (workflows / "build-android-apk.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", development)
+        self.assertIn("uses: ./.github/workflows/build-android-apk.yml", development)
+        self.assertNotIn("production:", development)
+        self.assertNotIn("secrets:", development)
+        self.assertIn("production: true", release)
+        self.assertIn("production:\n        default: false", shared)
+        self.assertNotIn("contents: write", shared)
+
     def test_status_excludes_obs_key_and_default_is_loopback(self) -> None:
         script = (MODULE / "payload/longvc-control.sh").read_text(encoding="utf-8")
         self.assertNotIn('say "obs_stream_key=', script)
