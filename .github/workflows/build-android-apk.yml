@@ -10,6 +10,10 @@ on:
         default: false
         type: boolean
     secrets:
+      LONGVC_DEVELOPMENT_KEYSTORE_BASE64:
+        required: false
+      LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD:
+        required: false
       LONGVC_ANDROID_KEYSTORE_BASE64:
         required: false
       LONGVC_ANDROID_KEYSTORE_PASSWORD:
@@ -67,25 +71,34 @@ jobs:
           fi
           printf 'value=%s\ncode=%s\nchannel=%s\nartifact=%s\n' \
             "$REQUESTED_VERSION" "$code" "$channel" "$artifact" >> "$GITHUB_OUTPUT"
-      - name: Check production signing secrets
-        if: steps.version.outputs.channel == 'production'
+      - name: Check APK signing secrets
         env:
+          APK_CHANNEL: ${{ steps.version.outputs.channel }}
+          LONGVC_DEVELOPMENT_KEYSTORE_BASE64: ${{ secrets.LONGVC_DEVELOPMENT_KEYSTORE_BASE64 }}
+          LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD: ${{ secrets.LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD }}
           LONGVC_ANDROID_KEYSTORE_BASE64: ${{ secrets.LONGVC_ANDROID_KEYSTORE_BASE64 }}
           LONGVC_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEYSTORE_PASSWORD }}
           LONGVC_ANDROID_KEY_ALIAS: ${{ secrets.LONGVC_ANDROID_KEY_ALIAS }}
           LONGVC_ANDROID_KEY_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          if [[ "$APK_CHANNEL" == production ]]; then
+            required=(LONGVC_ANDROID_KEYSTORE_BASE64 LONGVC_ANDROID_KEYSTORE_PASSWORD
+                      LONGVC_ANDROID_KEY_ALIAS LONGVC_ANDROID_KEY_PASSWORD)
+          else
+            required=(LONGVC_DEVELOPMENT_KEYSTORE_BASE64 LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD)
+          fi
           missing=0
-          for name in LONGVC_ANDROID_KEYSTORE_BASE64 LONGVC_ANDROID_KEYSTORE_PASSWORD \
-                      LONGVC_ANDROID_KEY_ALIAS LONGVC_ANDROID_KEY_PASSWORD; do
+          for name in "${required[@]}"; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing repository Actions secret $name"
               missing=1
             fi
           done
           if (( missing )); then
-            echo 'To build an installable test APK, run the Build development APK workflow.' >&2
+            if [[ "$APK_CHANNEL" == production ]]; then
+              echo 'To build a development APK, run the Build development APK workflow.' >&2
+            fi
             exit 1
           fi
 
@@ -124,9 +137,18 @@ jobs:
           done
       - name: Build development LSPosed APK
         if: needs.validate.outputs.channel == 'development'
+        env:
+          DEVELOPMENT_STORE_BASE64: ${{ secrets.LONGVC_DEVELOPMENT_KEYSTORE_BASE64 }}
+          LONGVC_DEVELOPMENT_STORE_PASSWORD: ${{ secrets.LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD }}
         run: |
           set -euo pipefail
           export LONGVC_VERSION_NAME="${RELEASE_VERSION#v}"
+          export LONGVC_DEVELOPMENT_STORE_FILE
+          LONGVC_DEVELOPMENT_STORE_FILE=$(mktemp "$RUNNER_TEMP/longvc-development.XXXXXX.p12")
+          trap 'rm -f -- "$LONGVC_DEVELOPMENT_STORE_FILE"' EXIT
+          printf '%s' "$DEVELOPMENT_STORE_BASE64" | base64 --decode > "$LONGVC_DEVELOPMENT_STORE_FILE"
+          unset DEVELOPMENT_STORE_BASE64
+          test -s "$LONGVC_DEVELOPMENT_STORE_FILE"
           chmod +x lsposed-module/gradlew
           lsposed-module/gradlew --no-daemon -p lsposed-module \
             :app:assembleDebug :app:lintDebug
@@ -162,7 +184,16 @@ jobs:
           fi
           source_apk="lsposed-module/app/build/outputs/apk/$variant/app-$variant.apk"
           test -s "$source_apk"
-          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose "$source_apk"
+          signing_report=$("$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose --print-certs "$source_apk")
+          printf '%s\n' "$signing_report"
+          if [[ "$APK_CHANNEL" == development ]]; then
+            actual=$(awk '/certificate SHA-256 digest:/ { print $NF }' <<< "$signing_report")
+            expected=$(<.github/development-cert.sha256)
+            if [[ "$actual" != "$expected" ]]; then
+              echo '::error::Development APK signing certificate differs from the pinned certificate'
+              exit 1
+            fi
+          fi
           python3 tests/verify_apk.py "$source_apk"
           test "$(unzip -p "$source_apk" META-INF/xposed/scope.list | tr -d '\r\n')" = system
           mkdir -p dist

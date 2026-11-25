@@ -20,6 +20,11 @@ def signingStorePath = providers.environmentVariable("LONGVC_SIGNING_STORE_FILE"
 def signingStorePassword = providers.environmentVariable("LONGVC_SIGNING_STORE_PASSWORD").orNull
 def signingKeyAlias = providers.environmentVariable("LONGVC_SIGNING_KEY_ALIAS").orNull
 def signingKeyPassword = providers.environmentVariable("LONGVC_SIGNING_KEY_PASSWORD").orNull
+def developmentStorePath = providers.environmentVariable("LONGVC_DEVELOPMENT_STORE_FILE").orNull
+def developmentStorePassword = providers.environmentVariable("LONGVC_DEVELOPMENT_STORE_PASSWORD").orNull
+if ((developmentStorePath == null) != (developmentStorePassword == null)) {
+    throw new GradleException("Both LONGVC_DEVELOPMENT_STORE_FILE and LONGVC_DEVELOPMENT_STORE_PASSWORD are required")
+}
 def controlScript = layout.projectDirectory.file("src/main/payload/longvc-control.sh")
 def generatedAssetsDir = layout.buildDirectory.dir("generated/payloadAssets").get().asFile
 
@@ -99,6 +104,15 @@ android {
     }
 
     signingConfigs {
+        if (developmentStorePath != null) {
+            development {
+                storeFile = file(developmentStorePath)
+                storeType = "PKCS12"
+                storePassword = developmentStorePassword
+                keyAlias = "longvc-development"
+                keyPassword = developmentStorePassword
+            }
+        }
         if (signingStorePath != null) {
             if ([signingStorePassword, signingKeyAlias, signingKeyPassword].any { it == null }) {
                 throw new GradleException("All LONGVC_SIGNING_* values are required when LONGVC_SIGNING_STORE_FILE is set")
@@ -117,6 +131,9 @@ android {
             applicationIdSuffix = providers.gradleProperty("longvc.debugApplicationIdSuffix")
                     .getOrElse(".debug")
             versionNameSuffix = "-debug"
+            if (developmentStorePath != null) {
+                signingConfig = signingConfigs.development
+            }
         }
         release {
             minifyEnabled = true

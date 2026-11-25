@@ -146,8 +146,3 @@ jobs:
           for file in cr_injector cr_feed_proc libcr_hooks.so longvc-control.sh payload.sha256; do
             unzip -l "$apk" "assets/payload/arm64-v8a/$file" | grep -F "$file"
           done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: LONG-Virtual-Camera-LSPosed-arm64-development
-          path: lsposed-module/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
