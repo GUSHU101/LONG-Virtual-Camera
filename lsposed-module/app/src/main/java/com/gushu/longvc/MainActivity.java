@@ -534,18 +534,34 @@ public final class MainActivity extends Activity
     private static String cameraOutputSummary(RuntimeState state) {
         if ((!state.cameraEnabled && !state.photoEnabled) || !state.cameraHookReady)
             return "";
-        if (!state.hasCameraOutputStats())
+        boolean direct = state.hasCameraOutputStats();
+        boolean preview = state.hasCameraPreviewStats();
+        if (!direct && !preview)
             return "\n\n尚无相机输出记录。打开相机后返回刷新状态。";
-        String queued = state.hasCameraQueueStats()
-                ? "\n系统队列累计接受：YUV " + state.cameraQueuedYuv
-                    + " 帧，JPEG " + state.cameraQueuedJpeg
-                    + " 张。队列失败 " + state.cameraQueueErrors + " 次。"
-                : "\n当前载荷暂无系统队列统计。";
-        return "\n\n当前相机服务累计写入：YUV " + state.cameraWrittenYuv
-                + " 帧，JPEG " + state.cameraWrittenJpeg + " 张。" + queued
-                + "\n格式不支持而保留原画面：" + state.cameraUnsupported
-                + " 次（RAW10 " + state.cameraRawTen + " 次）。"
-                + "\n客户端最终显示的画面以实际输出为准。";
+        StringBuilder summary = new StringBuilder("\n");
+        if (direct) {
+            summary.append("\n直接输出写入：YUV ").append(state.cameraWrittenYuv)
+                    .append(" 帧，JPEG ").append(state.cameraWrittenJpeg).append(" 张。");
+            if (state.hasCameraQueueStats()) {
+                summary.append("\n系统队列接受：YUV ").append(state.cameraQueuedYuv)
+                        .append(" 帧，JPEG ").append(state.cameraQueuedJpeg)
+                        .append(" 张。提交失败 ").append(state.cameraQueueErrors).append(" 次。");
+            }
+            if (state.cameraRawTen > 0) {
+                summary.append("\nRAW10 传感器帧直通 ").append(state.cameraRawTen)
+                        .append(" 次。照片替换开关只处理 JPEG 输出。");
+            }
+            long otherFormats = state.cameraUnsupported - state.cameraRawTen;
+            if (otherFormats > 0) {
+                summary.append("\n其他不支持格式直通 ").append(otherFormats).append(" 次。");
+            }
+        }
+        if (preview) {
+            summary.append("\n取景缓冲接收 ").append(state.cameraPreviewStaged)
+                    .append(" 帧（共 ").append(state.cameraPreviewSeen).append(" 次回调，提交失败 ")
+                    .append(state.cameraPreviewErrors).append(" 次）。");
+        }
+        return summary.toString();
     }
 
     private static String microphoneState(RuntimeState state) {

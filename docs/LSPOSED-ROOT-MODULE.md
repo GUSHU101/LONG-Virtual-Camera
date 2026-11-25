@@ -13,7 +13,7 @@ LSPosed 在 `system_server` 激活模块入口。Root 控制器把相机载荷�
 
 新版载荷安装到 Root 所有的受保护目录 `/data/cr/payload`。更新时会识别旧路径下已经运行的 feeder 并停止它。此前选择的媒体仍可读取，新导入的文件写入 `/data/cr/media`。
 
-打开相机后回到面板刷新，可以查看当前 `cameraserver` 进程累计写入、系统队列接受和格式直通的数量。应用在同一次相机会话中可以请求多种格式，并自行选择用于显示或合成照片的一路输出。Pixel 5 的 Google 相机请求了 `PRIVATE`、`YUV_420_888` 和 `RAW10`。RAW10 保留原始传感器数据，照片开关只处理带有效 JPEG 尾标的 Camera3 BLOB。
+打开相机后回到面板刷新，可以查看当前 `cameraserver` 的直接提交和取景缓冲记录。Android 14 上的 Pixel 5 会用 `PreviewFrameSpacer` 调度 Google 相机的 `PRIVATE` 取景流，同时直接提交 `YUV_420_888` 和 `RAW10`。取景缓冲接收数记录已替换帧进入待显示队列的次数，画面由相机客户端随后渲染。RAW10 保留原始传感器数据，照片开关只处理带有效 JPEG 尾标的 Camera3 BLOB。
 
 开发签名 APK 由 CI 生成，正式发布需使用稳定签名。旧桌面产物由对应历史版本维护。模块涉及系统服务，固件适配请在授权设备验证。
 

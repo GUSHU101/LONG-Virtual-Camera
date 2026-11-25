@@ -32,6 +32,9 @@ final class RuntimeState {
     final long cameraQueuedYuv;
     final long cameraQueuedJpeg;
     final long cameraQueueErrors;
+    final long cameraPreviewSeen;
+    final long cameraPreviewStaged;
+    final long cameraPreviewErrors;
     final long cameraRawTen;
     final long cameraUnsupported;
     final String abi;
@@ -68,6 +71,9 @@ final class RuntimeState {
         this.cameraQueuedYuv = counter(values, "camera_queued_yuv");
         this.cameraQueuedJpeg = counter(values, "camera_queued_jpeg");
         this.cameraQueueErrors = counter(values, "camera_queue_errors");
+        this.cameraPreviewSeen = counter(values, "camera_preview_seen");
+        this.cameraPreviewStaged = counter(values, "camera_preview_staged");
+        this.cameraPreviewErrors = counter(values, "camera_preview_errors");
         this.cameraRawTen = counter(values, "camera_raw_ten");
         this.cameraUnsupported = counter(values, "camera_unsupported");
         this.abi = values.getOrDefault("abi", "unknown");
@@ -128,6 +134,11 @@ final class RuntimeState {
     boolean hasCameraQueueStats() {
         return hasCameraOutputStats() && cameraQueuedYuv >= 0 && cameraQueuedJpeg >= 0
                 && cameraQueueErrors >= 0;
+    }
+
+    boolean hasCameraPreviewStats() {
+        return cameraHookReady && cameraPreviewSeen >= 0 && cameraPreviewStaged >= 0
+                && cameraPreviewErrors >= 0;
     }
 
     boolean micHealthy() {

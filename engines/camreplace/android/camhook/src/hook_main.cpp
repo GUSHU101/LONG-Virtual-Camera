@@ -1067,7 +1067,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   return true;
 }
 
-static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
+static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence, bool deferred)
 {
   ANWBInfo bi;
   if (!inspect_anwb(anb, bi))
@@ -1123,6 +1123,8 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
 
   if (fmt == 0x21)
   {
+    if (deferred)
+      return cr::camhook::ReplacementOutcome::PassThrough;
     const bool photo_on = refresh_photo_mode_();
     static std::atomic<int> blob_seen{0};
     int bn = ++blob_seen;
@@ -1216,7 +1218,7 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence)
   }
 
   replaced = unlock(handle, ahb, view) && replaced;
-  if (replaced)
+  if (replaced && !deferred)
     ++g_stat_blit_ok;
   return replaced ? cr::camhook::ReplacementOutcome::YuvWritten
                   : cr::camhook::ReplacementOutcome::AttemptedFailed;
@@ -1226,10 +1228,16 @@ using qbtc_surfaces_t = std::int32_t (*)(void* thiz, void* consumer, ANWB* anb,
                                         int fence, const std::vector<std::size_t>& surface_ids);
 using qbtc_legacy_t = std::int32_t (*)(void* thiz, void* consumer, ANWB* anb,
                                       int fence);
+using preview_spacer_t = std::int32_t (*)(void* thiz, std::int64_t timestamp,
+                                         std::int64_t readout_timestamp, std::int32_t transform,
+                                         ANWB* anb, int fence);
 
 static void* g_orig_qbtc_surfaces = nullptr;
 static void* g_orig_qbtc_legacy = nullptr;
+static void* g_orig_preview_spacer = nullptr;
+static void* g_preview_spacer_stub = nullptr;
 static cr::camhook::HookCounters g_hook_counters;
+static cr::camhook::HookCounters g_preview_counters;
 
 static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
 {
@@ -1244,7 +1252,7 @@ static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
          layout_ok ? bi.format : -1, layout_ok ? bi.handle : nullptr);
   }
 
-  return overwrite_nv21(anb, fence);
+  return overwrite_nv21(anb, fence, false);
 }
 
 static void report_queue_stats() noexcept
@@ -1303,6 +1311,44 @@ static std::int32_t proxy_qbtc_legacy(void* thiz, void* consumer, ANWB* anb,
       thiz, consumer, anb, fence);
   report_queue_stats();
   return status;
+}
+
+static std::int32_t proxy_preview_spacer(void* thiz, std::int64_t timestamp,
+                                        std::int64_t readout_timestamp, std::int32_t transform,
+                                        ANWB* anb, int fence)
+{
+  const auto status = cr::camhook::dispatch_queue(
+      g_preview_counters, [=] { return overwrite_nv21(anb, fence, true); },
+      reinterpret_cast<preview_spacer_t>(__atomic_load_n(&g_orig_preview_spacer, __ATOMIC_ACQUIRE)),
+      thiz, timestamp, readout_timestamp, transform, anb, fence);
+  // A successful return acknowledges the spacer's pending queue. Its worker
+  // submits the buffer to the preview consumer asynchronously.
+  const auto seen = g_preview_counters.callback_seen.load(std::memory_order_relaxed);
+  if (seen <= 5 || (seen % 30) == 0)
+    LOGI("camera_preview v1 seen=%llu staged=%llu queue_error=%llu",
+         (unsigned long long) seen,
+         (unsigned long long) g_preview_counters.yuv_queued.load(std::memory_order_relaxed),
+         (unsigned long long) g_preview_counters.original_queue_failed.load(std::memory_order_relaxed));
+  return status;
+}
+
+static void try_hook_preview_spacer()
+{
+  // Use the exact two-timestamp Android 14 arm64 signature verified on Pixel 5.
+  auto symbol = OBF("_ZN7android7camera318PreviewFrameSpacer18queuePreviewBufferElliP19ANativeWindowBufferi");
+  __atomic_store_n(&g_orig_preview_spacer, nullptr, __ATOMIC_RELAXED);
+  void* stub = shadowhook_hook_sym_name("libcameraservice.so", symbol.c_str(),
+                                        reinterpret_cast<void*>(proxy_preview_spacer),
+                                        &g_orig_preview_spacer);
+  if (stub && __atomic_load_n(&g_orig_preview_spacer, __ATOMIC_ACQUIRE))
+  {
+    g_preview_spacer_stub = stub;
+    LOGI("hook installed on PreviewFrameSpacer");
+    return;
+  }
+  if (stub)
+    shadowhook_unhook(stub);
+  LOGW("PreviewFrameSpacer ABI unavailable");
 }
 
 static int try_hook_primary()
@@ -1409,6 +1455,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
   int hook_rc = -1;
   if (try_hook_primary() == 0)
   {
+    try_hook_preview_spacer();
     hook_rc = 0;
   }
   else
@@ -1453,6 +1500,11 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_sh
 {
   if (!g_installed.exchange(false))
     return 0;
+  if (g_preview_spacer_stub)
+  {
+    shadowhook_unhook(g_preview_spacer_stub);
+    g_preview_spacer_stub = nullptr;
+  }
   if (g_hook_stub)
   {
     shadowhook_unhook(g_hook_stub);

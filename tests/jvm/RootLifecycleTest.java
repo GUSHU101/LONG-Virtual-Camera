@@ -118,6 +118,13 @@ public final class RootLifecycleTest {
                 true, true);
         check(queued.hasCameraQueueStats() && queued.cameraQueuedYuv == 57
                 && queued.cameraQueueErrors == 2, "queue failures must remain distinct from writes");
+        RuntimeState preview = RuntimeState.parseController(raw
+                + "camera_preview_seen=90\ncamera_preview_staged=88\ncamera_preview_errors=1\n",
+                true, true);
+        check(preview.hasCameraPreviewStats() && preview.cameraPreviewSeen == 90
+                && preview.cameraPreviewStaged == 88 && preview.cameraPreviewErrors == 1
+                && !preview.hasCameraQueueStats(),
+                "deferred preview staging has its own acknowledgement");
         check(!RuntimeState.parseController(raw + counters.replace("=60\n", "=-1\n"),
                 true, true).hasCameraOutputStats(), "invalid counters must be absent");
     }
