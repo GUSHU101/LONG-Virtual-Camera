@@ -12,6 +12,21 @@ int main()
   assert(window.offset == 16 && window.bytes == 1024);
   assert(!cr::media::valid_codec_window(4096, -1, 10, window));
   assert(!cr::media::valid_codec_window(4096, 4000, 100, window));
+  assert(!cr::media::valid_codec_window(4096, 0, INT64_C(4294967296), window));
+  assert(!cr::media::valid_codec_window(4096, INT64_C(4294967296), 0, window));
+
+  cr::media::Yuv420Crop crop;
+  assert(cr::media::padded_yuv420_crop(672, 512, 16, 8, 655, 487,
+                                       672u * 512u * 3u / 2u, crop));
+  assert(crop.width == 640 && crop.height == 480);
+  assert(crop.storage_bytes == 672u * 512u * 3u / 2u);
+  assert(!cr::media::padded_yuv420_crop(672, 512, INT32_MIN, 0,
+                                        INT32_MAX, 479, 4096, crop));
+  assert(!cr::media::padded_yuv420_crop(672, 512, 0, 0, 672, 479, 4096, crop));
+  assert(!cr::media::padded_yuv420_crop(640, 480, 1, 0, 638, 479, 4096, crop));
+  assert(!cr::media::padded_yuv420_crop(INT32_MAX - 1, INT32_MAX - 1,
+                                        0, 0, 639, 479, 96u << 20, crop));
+  assert(crop.storage_bytes == 0);
 
   cr::media::Yuv420Layout layout;
   const std::size_t nv12_bytes = 640u * 480u * 3u / 2u;

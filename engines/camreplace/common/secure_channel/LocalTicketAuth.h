@@ -10,6 +10,8 @@ namespace cr::secure_channel::v2
 // the canonical ticket with the derived shared secret. This protects the
 // complete handshake transcript from tampering and rejects the historical
 // all-zero placeholder signature.
+// The proof is possession of an ephemeral key. Treat peer identity and
+// authorization as separate properties provided by the surrounding transport.
 // Signing serializes the canonical ticket but translates allocation failure
 // into Status so transport workers never terminate at a noexcept boundary.
 [[nodiscard]] Status sign_local_ticket(Ticket& ticket, Bytes shared_secret) noexcept;

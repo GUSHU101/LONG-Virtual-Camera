@@ -19,6 +19,8 @@ public:
   [[nodiscard]] Status initialize(Role role, Bytes local_x25519_private, Bytes ticket_bytes, StreamKind expected_stream, std::uint64_t now_ms) noexcept;
 
   [[nodiscard]] Status seal(RecordType type, Bytes plaintext, std::vector<std::uint8_t>& record) noexcept;
+  // A failed record is wiped from the plaintext output and does not change
+  // the output type, handshake state, or receive sequence window.
   [[nodiscard]] Status open(Bytes record, std::vector<std::uint8_t>& plaintext, RecordType& type) noexcept;
 
   [[nodiscard]] Status make_finished(std::vector<std::uint8_t>& record) noexcept;

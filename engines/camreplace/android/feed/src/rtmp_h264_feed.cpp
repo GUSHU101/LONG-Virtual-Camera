@@ -109,7 +109,7 @@ bool send_all(int s, const void* buf, size_t n)
   const uint8_t* p = (const uint8_t*) buf;
   while (n > 0)
   {
-    ssize_t w = ::send(s, p, n > (1u << 20) ? (1u << 20) : n, 0);
+    ssize_t w = ::send(s, p, n > (1u << 20) ? (1u << 20) : n, MSG_NOSIGNAL);
     if (w <= 0)
     {
       if (errno == EINTR)

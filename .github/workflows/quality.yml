@@ -70,6 +70,13 @@ jobs:
             engines/camreplace/android/camhook/src/nv21_blit.c \
             -o /tmp/nv21_blit_test
           /tmp/nv21_blit_test
+      - name: Interruptible network listener
+        run: |
+          set -euo pipefail
+          g++ -std=c++20 -Wall -Wextra -Werror -pthread \
+            -Iengines/camreplace/android/feed/src tests/native/interruptible_socket_test.cpp \
+            -o /tmp/interruptible_socket_test
+          timeout 5s /tmp/interruptible_socket_test
       - name: Authenticated channel tests
         run: |
           set -euo pipefail

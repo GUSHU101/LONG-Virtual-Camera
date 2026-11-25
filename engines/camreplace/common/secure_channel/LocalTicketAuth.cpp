@@ -61,6 +61,8 @@ Status sign_local_ticket(Ticket& ticket, Bytes shared_secret) noexcept
 Status verify_local_ticket(const TicketView& ticket, Bytes shared_secret) noexcept
 {
   std::array<std::uint8_t, 64> expected{};
+  if (!ticket.signature.valid() || ticket.signature.size != expected.size())
+    return Status::failure(Error::InvalidField);
   const Status status = compute_mac(expected, ticket.unsigned_bytes, shared_secret);
   if (!status)
     return status;

@@ -178,20 +178,39 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ needs.validate.outputs.artifact }}
           path: dist
-      - name: Create or update GitHub release
+      - name: Publish a new GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
+          (cd dist && sha256sum --check ./*.apk.sha256)
           if gh release view "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_VERSION" dist/* --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$RELEASE_VERSION" dist/* \
-              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "LONG Virtual Camera $RELEASE_VERSION" --generate-notes
+            echo "::error::Release $RELEASE_VERSION already exists. Use a new version to publish new assets."
+            exit 1
           fi
+          tag_ref="refs/tags/$RELEASE_VERSION"
+          refs=$(git ls-remote --tags origin "$tag_ref" "$tag_ref^{}")
+          target=$(awk -v tag="$tag_ref" '
+            $2 == tag { direct = $1 }
+            $2 == tag "^{}" { peeled = $1 }
+            END { print peeled ? peeled : direct }
+          ' <<< "$refs")
+          tag_args=()
+          if [[ -n "$target" ]]; then
+            if [[ "$target" != "$GITHUB_SHA" ]]; then
+              echo "::error::Existing tag $RELEASE_VERSION points to $target rather than the APK build commit $GITHUB_SHA."
+              exit 1
+            fi
+            tag_args+=(--verify-tag)
+          else
+            tag_args+=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$RELEASE_VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" "${tag_args[@]}" \
+            --title "LONG Virtual Camera $RELEASE_VERSION" --generate-notes

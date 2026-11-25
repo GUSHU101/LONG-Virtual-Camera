@@ -39,6 +39,8 @@ Windows 开发机可用 `lsposed-module\gradlew.bat` 执行相同 Gradle 任务�
 
 勾选 `publish` 或推送版本标签会走正式发布。提前在仓库的 **Settings → Secrets and variables → Actions** 配置 `LONGVC_ANDROID_KEYSTORE_BASE64`、`LONGVC_ANDROID_KEYSTORE_PASSWORD`、`LONGVC_ANDROID_KEY_ALIAS`、`LONGVC_ANDROID_KEY_PASSWORD`。正式版更新必须继续使用同一签名密钥。
 
+每个正式版本只发布一次。工作流会在上传前校验 APK 的 SHA-256，并校验已存在的版本标签是否指向 APK 的构建提交。发布新版 APK 时使用新的版本号。
+
 当前测试覆盖桌面端移除、APK 契约、恢复故障注入和原生像素布局。设备上的相机、麦克风以及 OBS 全链路仍需在对应固件实测。
 
 [模块操作说明](docs/LSPOSED-ROOT-MODULE.md) · [架构](docs/ARCHITECTURE.md) · [上游代码审计](docs/UPSTREAM-CODE-AUDIT.md) · [许可证及来源](NOTICE)

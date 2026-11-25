@@ -32,11 +32,13 @@
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
 #include "util/Obf.h"
 #include "media/AdaptiveGeometry.h"
+#include "media/FrameLayout.h"
 
 #define TAG "cr_feed"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -54,6 +56,9 @@ constexpr int32_t kColorYuv420SemiPlanar = 21;
 constexpr int32_t kColorYuv420PackedSemiPlanar = 39;
 constexpr uint32_t kImageMagic = 0x31564e4cu; // "LNV1" little-endian
 constexpr uint64_t kMaxMediaBytes = 4ull * 1024ull * 1024ull * 1024ull;
+constexpr int32_t kMaxDecoderDimension = 16384;
+// Allow padded 8K YUV420 layouts while bounding each CPU-side frame copy.
+constexpr size_t kMaxDecoderFrameBytes = 96u * 1024u * 1024u;
 
 uint64_t monotonic_us()
 {
@@ -173,8 +178,8 @@ public:
     rotation_ = ((rotation_ % 360) + 360) % 360;
     if (rotation_ != 0 && rotation_ != 90 && rotation_ != 180 && rotation_ != 270)
       rotation_ = 0;
-    if (coded_width_ < 2 || coded_height_ < 2 || coded_width_ > 16384 ||
-        coded_height_ > 16384)
+    if (coded_width_ < 2 || coded_height_ < 2 ||
+        coded_width_ > kMaxDecoderDimension || coded_height_ > kMaxDecoderDimension)
     {
       LOGE(OBF("local video: implausible geometry %dx%d").c_str(),
            coded_width_, coded_height_);
@@ -203,8 +208,8 @@ public:
   void close()
   {
     frame_.clear();
-    frame_ready_ = false;
-    format_ready_ = false;
+    output_layout_ = {};
+    output_format_known_ = false;
     if (codec_)
     {
       AMediaCodec_stop(codec_);
@@ -225,7 +230,6 @@ public:
 
   bool next(VideoFrame& out)
   {
-    frame_ready_ = false;
     for (int attempt = 0; attempt < 96 && !g_stop.load(std::memory_order_relaxed);
          ++attempt)
     {
@@ -240,6 +244,11 @@ public:
           return false;
         const ssize_t count = AMediaExtractor_readSampleData(extractor_, bytes,
                                                               capacity);
+        if (count >= 0 && static_cast<size_t>(count) > capacity)
+        {
+          LOGE(OBF("local video: sample exceeds decoder input buffer").c_str());
+          return false;
+        }
         const int64_t pts = AMediaExtractor_getSampleTime(extractor_);
         input_eos_ = count < 0;
         const media_status_t queued = AMediaCodec_queueInputBuffer(
@@ -266,28 +275,37 @@ public:
       if (output < 0)
         continue;
 
-      if (!format_ready_)
+      if (!output_format_known_)
         update_output_format();
       size_t capacity = 0;
       uint8_t* bytes =
           AMediaCodec_getOutputBuffer(codec_, static_cast<size_t>(output), &capacity);
       bool copied = false;
-      if (bytes && info.offset >= 0 && info.size > 0 &&
-          static_cast<size_t>(info.offset) <= capacity &&
-          static_cast<size_t>(info.size) <=
-              capacity - static_cast<size_t>(info.offset))
+      cr::media::PlaneSpan window;
+      if (bytes && output_layout_.storage_bytes != 0 &&
+          cr::media::valid_codec_window(capacity, info.offset, info.size, window) &&
+          window.bytes >= output_layout_.storage_bytes)
       {
-        frame_.assign(bytes + info.offset, bytes + info.offset + info.size);
-        frame_pts_us_ = info.presentationTimeUs;
-        frame_ready_ = true;
-        copied = describe(out);
+        try
+        {
+          const uint8_t* start = bytes + window.offset;
+          frame_.assign(start, start + output_layout_.storage_bytes);
+          describe(out);
+          copied = true;
+        }
+        catch (const std::bad_alloc&)
+        {
+          AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(output), false);
+          LOGE(OBF("local video: insufficient memory for decoded frame").c_str());
+          return false;
+        }
       }
       AMediaCodec_releaseOutputBuffer(codec_, static_cast<size_t>(output), false);
       if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
         rewind_pending_ = true;
       if (copied)
       {
-        out.pts_us = frame_pts_us_;
+        out.pts_us = info.presentationTimeUs;
         return true;
       }
       if (rewind_pending_)
@@ -321,13 +339,24 @@ public:
 private:
   void update_output_format()
   {
+    output_layout_ = {};
     AMediaFormat* format = AMediaCodec_getOutputFormat(codec_);
+    output_format_known_ = format != nullptr;
     if (!format)
       return;
     int32_t width = coded_width_;
     int32_t height = coded_height_;
     AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_WIDTH, &width);
     AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_HEIGHT, &height);
+    if (width < 2 || height < 2 || width > kMaxDecoderDimension ||
+        height > kMaxDecoderDimension)
+    {
+      LOGW(OBF("local video: rejected decoder dimensions %dx%d").c_str(), width, height);
+      AMediaFormat_delete(format);
+      return;
+    }
+    stride_ = 0;
+    slice_height_ = 0;
     AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_STRIDE, &stride_);
     // The key exists on old releases even though the named NDK constant was
     // only exported in API 28; use its stable wire name for minSdk 27 builds.
@@ -354,30 +383,22 @@ private:
       crop_right_ = right;
       crop_bottom_ = bottom;
     }
-    const int32_t visible_width = crop_right_ - crop_left_ + 1;
-    const int32_t visible_height = crop_bottom_ - crop_top_ + 1;
-    format_ready_ =
-        have_color && visible_width >= 2 && visible_height >= 2 &&
-        (visible_width & 1) == 0 && (visible_height & 1) == 0 &&
-        stride_ >= width && slice_height_ >= height && (stride_ & 1) == 0 &&
-        (slice_height_ & 1) == 0 && crop_left_ >= 0 && crop_top_ >= 0 &&
-        crop_right_ >= crop_left_ && crop_bottom_ >= crop_top_ &&
-        crop_right_ < stride_ && crop_bottom_ < slice_height_ &&
-        (crop_left_ & 1) == 0 && (crop_top_ & 1) == 0;
-    LOGI(OBF("local video output: color=0x%x stride=%d slice=%d crop=%d,%d-%d,%d").c_str(),
-         color_, stride_, slice_height_, crop_left_, crop_top_, crop_right_,
-         crop_bottom_);
+    const bool supported_color = have_color &&
+        (color_ == kColorYuv420Planar || color_ == kColorYuv420PackedPlanar ||
+         color_ == kColorYuv420SemiPlanar || color_ == kColorYuv420PackedSemiPlanar);
+    const bool valid = supported_color && stride_ >= width && slice_height_ >= height &&
+        cr::media::padded_yuv420_crop(stride_, slice_height_, crop_left_, crop_top_,
+                                    crop_right_, crop_bottom_, kMaxDecoderFrameBytes,
+                                    output_layout_);
+    __android_log_print(valid ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, TAG,
+        OBF("local video output: color=0x%x stride=%d slice=%d crop=%d,%d-%d,%d valid=%d").c_str(),
+        color_, stride_, slice_height_, crop_left_, crop_top_, crop_right_, crop_bottom_, valid);
     AMediaFormat_delete(format);
   }
 
-  bool describe(VideoFrame& out)
+  void describe(VideoFrame& out)
   {
-    if (!frame_ready_ || !format_ready_)
-      return false;
-    const int32_t width = crop_right_ - crop_left_ + 1;
-    const int32_t height = crop_bottom_ - crop_top_ + 1;
     const size_t y_bytes = static_cast<size_t>(stride_) * slice_height_;
-    size_t required = 0;
     size_t u_offset = 0;
     size_t v_offset = 0;
     int32_t chroma_stride = 0;
@@ -388,43 +409,27 @@ private:
       pixel_stride = 1;
       const size_t chroma_bytes =
           static_cast<size_t>(chroma_stride) * (slice_height_ / 2);
-      required = y_bytes + chroma_bytes * 2;
       const size_t crop = static_cast<size_t>(crop_top_ / 2) * chroma_stride +
                           static_cast<size_t>(crop_left_ / 2);
       u_offset = y_bytes + crop;
       v_offset = y_bytes + chroma_bytes + crop;
     }
-    else if (color_ == kColorYuv420SemiPlanar ||
-             color_ == kColorYuv420PackedSemiPlanar)
+    else
     {
       chroma_stride = stride_;
       pixel_stride = 2;
-      required = y_bytes + static_cast<size_t>(stride_) * (slice_height_ / 2);
       const size_t crop = static_cast<size_t>(crop_top_ / 2) * stride_ +
                           static_cast<size_t>(crop_left_);
       u_offset = y_bytes + crop;
       v_offset = u_offset + 1;
     }
-    else
-    {
-      LOGE(OBF("local video: unsupported byte-buffer color format 0x%x").c_str(),
-           color_);
-      return false;
-    }
-    if (frame_.size() < required)
-    {
-      LOGE(OBF("local video: output buffer %zu is smaller than layout %zu").c_str(),
-           frame_.size(), required);
-      return false;
-    }
     const uint8_t* base = frame_.data();
-    out.width = width;
-    out.height = height;
+    out.width = output_layout_.width;
+    out.height = output_layout_.height;
     out.y = {base + static_cast<size_t>(crop_top_) * stride_ + crop_left_,
              stride_, 1};
     out.u = {base + u_offset, chroma_stride, pixel_stride};
     out.v = {base + v_offset, chroma_stride, pixel_stride};
-    return true;
   }
 
   int fd_ = -1;
@@ -442,9 +447,8 @@ private:
   int32_t crop_bottom_ = 0;
   int32_t rotation_ = 0;
   int64_t fallback_interval_us_ = 33333;
-  int64_t frame_pts_us_ = 0;
-  bool frame_ready_ = false;
-  bool format_ready_ = false;
+  cr::media::Yuv420Crop output_layout_;
+  bool output_format_known_ = false;
   bool looped_ = false;
   bool input_eos_ = false;
   bool rewind_pending_ = false;

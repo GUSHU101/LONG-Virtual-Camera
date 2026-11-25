@@ -2,18 +2,24 @@
 
 #include <atomic>
 #include <cerrno>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 namespace cr::feed
 {
 
-// A blocking accept() can survive SIGTERM on Android because signal() may
-// install SA_RESTART. Poll in short bounded intervals so the feed process can
-// observe its stop token without a client ever connecting.
+// Readiness is advisory: the pending connection may be gone by accept().
+// Keep the listening descriptor nonblocking, while accepted sockets retain
+// blocking I/O so existing connection timeouts still apply.
 inline int accept_interruptible(int server,
                                 const std::atomic<bool>& stop) noexcept
 {
+  const int flags = ::fcntl(server, F_GETFL);
+  if (flags == -1 ||
+      ((flags & O_NONBLOCK) == 0 && ::fcntl(server, F_SETFL, flags | O_NONBLOCK) == -1))
+    return -1;
   while (!stop.load(std::memory_order_relaxed))
   {
     pollfd descriptor{};
@@ -30,10 +36,19 @@ inline int accept_interruptible(int server,
     }
     if ((descriptor.revents & POLLIN) != 0)
     {
-      const int client = ::accept(server, nullptr, nullptr);
+      if (stop.load(std::memory_order_relaxed))
+        break;
+      const int client = ::accept4(server, nullptr, nullptr, SOCK_CLOEXEC);
       if (client >= 0)
+      {
+        if (stop.load(std::memory_order_relaxed))
+        {
+          ::close(client);
+          break;
+        }
         return client;
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+      }
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED)
         continue;
       return -1;
     }

@@ -105,6 +105,13 @@ CR_NOINLINE Status verify_finished_marker(const std::vector<std::uint8_t>& plain
   }
   return {};
 }
+
+void wipe_and_clear(std::vector<std::uint8_t>& bytes) noexcept
+{
+  if (!bytes.empty())
+    crypto_wipe(bytes.data(), bytes.size());
+  bytes.clear();
+}
 } // namespace
 
 SecureSession::~SecureSession()
@@ -115,7 +122,8 @@ SecureSession::~SecureSession()
 Status SecureSession::initialize(Role role, Bytes local_private, Bytes ticket_bytes, StreamKind expected_stream, std::uint64_t now_ms) noexcept
 {
   wipe();
-  if (!local_private.valid() || local_private.size != kKeyBytes)
+  if ((role != Role::Host && role != Role::Phone) ||
+      !local_private.valid() || local_private.size != kKeyBytes)
   {
     return Status::failure(Error::InvalidField);
   }
@@ -202,76 +210,95 @@ Status SecureSession::nonce_for(const std::array<std::uint8_t, kNonceBytes>& bas
   return {};
 }
 
-Status SecureSession::seal(RecordType type, Bytes plaintext, std::vector<std::uint8_t>& record) noexcept
+Status SecureSession::seal(RecordType type, Bytes plaintext, std::vector<std::uint8_t>& record) noexcept try
 {
-  try
-  {
-  if (!initialized_ || !plaintext.valid() || plaintext.size > kMaxCiphertextBytes || (type == RecordType::Application && !established()))
-    return Status::failure(Error::InvalidState);
-  if (send_sequence_ == UINT64_MAX)
-    return Status::failure(Error::SequenceTooOld);
-  RecordHeader header{type, 0, session_id_, send_sequence_++, static_cast<std::uint32_t>(plaintext.size)};
-  std::vector<std::uint8_t> aad;
-  if (Status status = encode_record_header(header, aad); !status)
-    return status;
-  std::array<std::uint8_t, kNonceBytes> nonce{};
-  if (Status status = nonce_for(send_nonce_base_, header.sequence, nonce); !status)
-    return status;
-  record.resize(aad.size() + plaintext.size + kTagBytes);
-  std::memcpy(record.data(), aad.data(), aad.size());
-  crypto_aead_lock(record.data() + aad.size(), record.data() + aad.size() + plaintext.size, send_key_.data(), nonce.data(), aad.data(), aad.size(), plaintext.data, plaintext.size);
-  crypto_wipe(nonce.data(), nonce.size());
-  return {};
-  }
-  catch (const std::bad_alloc&)
+  if (!initialized_ || !plaintext.valid() || plaintext.size > kMaxCiphertextBytes ||
+      (type == RecordType::Application && !established()))
   {
     record.clear();
-    return Status::failure(Error::ResourceExhausted);
+    return Status::failure(Error::InvalidState);
   }
+  if (send_sequence_ == UINT64_MAX)
+  {
+    record.clear();
+    return Status::failure(Error::SequenceTooOld);
+  }
+  RecordHeader header{type, 0, session_id_, send_sequence_, static_cast<std::uint32_t>(plaintext.size)};
+  std::vector<std::uint8_t> encoded;
+  if (Status status = encode_record_header(header, encoded); !status)
+  {
+    record.clear();
+    return status;
+  }
+  encoded.resize(kRecordHeaderBytes + plaintext.size + kTagBytes);
+  std::array<std::uint8_t, kNonceBytes> nonce{};
+  if (Status status = nonce_for(send_nonce_base_, header.sequence, nonce); !status)
+  {
+    record.clear();
+    return status;
+  }
+  auto* ciphertext = encoded.data() + kRecordHeaderBytes;
+  crypto_aead_lock(ciphertext, ciphertext + plaintext.size, send_key_.data(), nonce.data(),
+                   encoded.data(), kRecordHeaderBytes, plaintext.data, plaintext.size);
+  crypto_wipe(nonce.data(), nonce.size());
+  record.swap(encoded);
+  ++send_sequence_;
+  return {};
+}
+catch (const std::bad_alloc&)
+{
+  record.clear();
+  return Status::failure(Error::ResourceExhausted);
 }
 
-Status SecureSession::open(Bytes encoded, std::vector<std::uint8_t>& plaintext, RecordType& type) noexcept
+Status SecureSession::open(Bytes encoded, std::vector<std::uint8_t>& plaintext, RecordType& type) noexcept try
 {
-  try
+  const auto reject = [&plaintext](Status status)
   {
+    wipe_and_clear(plaintext);
+    return status;
+  };
   if (!initialized_)
-    return Status::failure(Error::InvalidState);
+    return reject(Status::failure(Error::InvalidState));
   RecordView record;
   if (Status status = parse_record(encoded, record); !status)
-    return status;
+    return reject(status);
   if (!equal(record.header.session_id.data(), session_id_.data(), session_id_.size()))
-    return Status::failure(Error::AuthenticationFailed);
+    return reject(Status::failure(Error::AuthenticationFailed));
   if (record.header.type == RecordType::Application && !established())
-    return Status::failure(Error::InvalidState);
-  if (receive_initialized_)
+    return reject(Status::failure(Error::InvalidState));
+  if (receive_initialized_ && record.header.sequence <= receive_highest_)
   {
-    if (record.header.sequence > receive_highest_)
-    { /* accepted after auth */
-    }
-    else
-    {
-      const std::uint64_t distance = receive_highest_ - record.header.sequence;
-      if (distance >= 64)
-        return Status::failure(Error::SequenceTooOld);
-      if ((receive_seen_ & (std::uint64_t{1} << distance)) != 0)
-        return Status::failure(Error::ReplayDetected);
-    }
+    const std::uint64_t distance = receive_highest_ - record.header.sequence;
+    if (distance >= 64)
+      return reject(Status::failure(Error::SequenceTooOld));
+    if ((receive_seen_ & (std::uint64_t{1} << distance)) != 0)
+      return reject(Status::failure(Error::ReplayDetected));
   }
-  std::vector<std::uint8_t> aad;
-  if (Status status = encode_record_header(record.header, aad); !status)
-    return status;
+  std::vector<std::uint8_t> decoded(record.ciphertext.size);
   std::array<std::uint8_t, kNonceBytes> nonce{};
   if (Status status = nonce_for(receive_nonce_base_, record.header.sequence, nonce); !status)
-    return status;
-  plaintext.resize(record.ciphertext.size);
-  if (crypto_aead_unlock(plaintext.data(), record.tag.data, receive_key_.data(), nonce.data(), aad.data(), aad.size(), record.ciphertext.data, record.ciphertext.size) != 0)
-  {
-    crypto_wipe(plaintext.data(), plaintext.size());
-    plaintext.clear();
-    crypto_wipe(nonce.data(), nonce.size());
-    return Status::failure(Error::AuthenticationFailed);
-  }
+    return reject(status);
+  const int authenticated = crypto_aead_unlock(decoded.data(), record.tag.data,
+      receive_key_.data(), nonce.data(), encoded.data, kRecordHeaderBytes,
+      record.ciphertext.data, record.ciphertext.size);
   crypto_wipe(nonce.data(), nonce.size());
+  if (authenticated != 0)
+    return reject(Status::failure(Error::AuthenticationFailed));
+
+  if (record.header.type == RecordType::Finished)
+  {
+    std::array<std::uint8_t, 32> expected{};
+    const Status status = finished(expected);
+    const Status verified = status ? verify_finished_marker(decoded, expected) : status;
+    crypto_wipe(expected.data(), expected.size());
+    if (!verified)
+    {
+      wipe_and_clear(decoded);
+      return reject(verified);
+    }
+    received_finished_ = true;
+  }
   if (!receive_initialized_)
   {
     receive_initialized_ = true;
@@ -287,31 +314,14 @@ Status SecureSession::open(Bytes encoded, std::vector<std::uint8_t>& plaintext, 
   else
     receive_seen_ |= std::uint64_t{1} << (receive_highest_ - record.header.sequence);
   type = record.header.type;
-  if (type == RecordType::Finished)
-  {
-    std::array<std::uint8_t, 32> expected{};
-    if (Status status = finished(expected); !status)
-    {
-      crypto_wipe(expected.data(), expected.size());
-      return Status::failure(Error::FinishedMismatch);
-    }
-    if (Status status = verify_finished_marker(plaintext, expected); !status)
-    {
-      crypto_wipe(expected.data(), expected.size());
-      return status;
-    }
-    crypto_wipe(expected.data(), expected.size());
-    received_finished_ = true;
-  }
+  wipe_and_clear(plaintext);
+  plaintext.swap(decoded);
   return {};
-  }
-  catch (const std::bad_alloc&)
-  {
-    if (!plaintext.empty())
-      crypto_wipe(plaintext.data(), plaintext.size());
-    plaintext.clear();
-    return Status::failure(Error::ResourceExhausted);
-  }
+}
+catch (const std::bad_alloc&)
+{
+  wipe_and_clear(plaintext);
+  return Status::failure(Error::ResourceExhausted);
 }
 
 Status SecureSession::finished(std::array<std::uint8_t, 32>& output) const noexcept
@@ -329,7 +339,10 @@ Status SecureSession::finished(std::array<std::uint8_t, 32>& output) const noexc
 CR_NOINLINE Status SecureSession::make_finished(std::vector<std::uint8_t>& record) noexcept
 {
   if (!initialized_ || sent_finished_)
+  {
+    record.clear();
     return Status::failure(Error::InvalidState);
+  }
   std::array<std::uint8_t, 32> digest{};
   if (Status status = finished(digest); !status)
     return status;

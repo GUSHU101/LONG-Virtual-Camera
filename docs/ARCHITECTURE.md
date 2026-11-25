@@ -11,3 +11,5 @@ Media files are written under content-addressed names, verified by length and SH
 Emergency recovery runs separately from ordinary app operations. The controller attempts all cleanup steps, verifies feeder exit and service recovery, and reports error if any step fails. Root process cleanup and the device-side wait remain bounded. The platform and root manager determine whether subordinate processes can be fully cleaned up after a forced interruption.
 
 Quality CI runs Python contract checks, controller fault injection, native geometry and ring tests, APK lint, signing checks and packaged payload verification. Official release builds require signing secrets. Testing Android vendor buffer access, concurrent camera clients, microphone restoration, stream reconnect and long-running stability requires a device.
+
+See the [global code audit](GLOBAL-CODE-AUDIT.md) for confirmed defects, fixes and remaining verification coverage.

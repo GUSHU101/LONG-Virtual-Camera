@@ -149,7 +149,7 @@ public:
   {
     if (!in_.valid() || n > in_.size - pos_)
       return Status::failure(Error::Truncated, pos_);
-    v = {in_.data + pos_, n};
+    v = {in_.data ? in_.data + pos_ : nullptr, n};
     pos_ += n;
     return {};
   }
@@ -189,7 +189,8 @@ inline bool valid_type(std::uint8_t v) noexcept
 // are literal ASCII. The signature is always over the first 128 bytes.
 [[nodiscard]] inline Status encode_ticket(const Ticket& ticket, std::vector<std::uint8_t>& out)
 {
-  if (ticket.expires_at_ms <= ticket.issued_at_ms)
+  if (!detail::valid_stream(static_cast<std::uint8_t>(ticket.stream)) ||
+      ticket.expires_at_ms <= ticket.issued_at_ms)
     return Status::failure(Error::InvalidField);
   out.clear();
   out.reserve(kTicketBytes);

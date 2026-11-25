@@ -40,13 +40,40 @@ struct Yuv420Layout
 inline bool valid_codec_window(std::size_t capacity, std::int64_t offset,
                                std::int64_t size, PlaneSpan& window) noexcept
 {
-  if (offset < 0 || size < 0)
+  if (offset < 0 || size < 0 ||
+      static_cast<std::uint64_t>(offset) > capacity ||
+      static_cast<std::uint64_t>(size) > capacity - static_cast<std::size_t>(offset))
     return false;
-  const auto off = static_cast<std::size_t>(offset);
-  const auto len = static_cast<std::size_t>(size);
-  if (off > capacity || len > capacity - off)
+  window = {static_cast<std::size_t>(offset), static_cast<std::size_t>(size)};
+  return true;
+}
+
+struct Yuv420Crop
+{
+  std::int32_t width = 0;
+  std::int32_t height = 0;
+  std::size_t storage_bytes = 0;
+};
+
+inline bool padded_yuv420_crop(std::int32_t stride, std::int32_t slice_height,
+                               std::int32_t left, std::int32_t top,
+                               std::int32_t right, std::int32_t bottom,
+                               std::size_t storage_limit, Yuv420Crop& out) noexcept
+{
+  out = {};
+  if (stride < 2 || slice_height < 2 || (stride & 1) || (slice_height & 1) ||
+      left < 0 || top < 0 || (left & 1) || (top & 1) ||
+      right < left || bottom < top || right >= stride || bottom >= slice_height)
     return false;
-  window = {off, len};
+  const std::int32_t width = right - left + 1;
+  const std::int32_t height = bottom - top + 1;
+  std::size_t luma = 0;
+  std::size_t storage = 0;
+  if ((width & 1) || (height & 1) ||
+      !checked_mul(stride, slice_height, luma) ||
+      !checked_add(luma, luma / 2, storage) || storage > storage_limit)
+    return false;
+  out = {width, height, storage};
   return true;
 }
 
