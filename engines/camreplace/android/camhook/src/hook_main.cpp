@@ -1113,8 +1113,8 @@ struct Raw10Layout
 {
   int width, height, stride;
 };
-static constexpr std::array<Raw10Layout, 2> kPixel5RawLayouts{{
-    {4032, 3024, 5056}, {4656, 3496, 5824}}};
+static constexpr std::array<Raw10Layout, 3> kPixel5RawLayouts{{
+    {4032, 3024, 5056}, {4656, 3496, 5824}, {3280, 2464, 4160}}};
 static bool g_pixel5_raw10 = false;
 static std::atomic<unsigned> g_raw10_written{0};
 static std::atomic<unsigned> g_raw10_lock_failed{0};
@@ -1194,13 +1194,18 @@ private:
       uint32_t generation;
       {
         std::unique_lock lock(mutex_);
-        changed_.wait(lock, [this] { return !enabled_ || slots_[0].pending || slots_[1].pending; });
+        const auto has_pending = [](const Slot& slot) { return slot.pending; };
+        changed_.wait(lock, [&] {
+          return !enabled_ || std::any_of(slots_.begin(), slots_.end(), has_pending);
+        });
         if (!enabled_)
           return;
-        profile = slots_[next_].pending ? next_ : 1 - next_;
+        profile = next_;
+        while (!slots_[profile].pending)
+          profile = (profile + 1) % slots_.size();
         slots_[profile].pending = false;
         generation = slots_[profile].generation;
-        next_ = 1 - profile;
+        next_ = (profile + 1) % slots_.size();
       }
       try
       {
@@ -1232,7 +1237,7 @@ private:
 
   std::mutex mutex_;
   std::condition_variable changed_;
-  std::array<Slot, 2> slots_{};
+  std::array<Slot, kPixel5RawLayouts.size()> slots_{};
   std::thread worker_;
   size_t next_ = 0;
   bool enabled_ = false;
@@ -1240,7 +1245,7 @@ private:
 
 static Raw10Cache g_raw10_cache;
 
-static bool pixel5_raw10_profile()
+static bool pixel5_stock_android14()
 {
   char product[PROP_VALUE_MAX]{}, build[PROP_VALUE_MAX]{}, incremental[PROP_VALUE_MAX]{};
   __system_property_get("ro.product.device", product);
@@ -1491,6 +1496,8 @@ static void* g_video_encoder_usage_stub = nullptr;
 static void* g_orig_video_encoder_usage = nullptr;
 static void* g_video_encoder_format_stub = nullptr;
 static void* g_orig_video_encoder_format = nullptr;
+static void* g_display_usage_stub = nullptr;
+static void* g_orig_display_usage = nullptr;
 using SurfaceConsumerUsage = int32_t (*)(const void*, uint64_t*);
 static SurfaceConsumerUsage g_surface_consumer_usage = nullptr;
 static cr::camhook::HookCounters g_hook_counters;
@@ -1670,6 +1677,30 @@ static int32_t proxy_video_encoder_format(void* surface, int32_t format)
   return original(surface, format);
 }
 
+static int32_t proxy_camera_display_usage(void* surface, uint64_t usage)
+{
+  using SetUsage = int32_t (*)(void*, uint64_t);
+  const auto original = reinterpret_cast<SetUsage>(
+      __atomic_load_n(&g_orig_display_usage, __ATOMIC_ACQUIRE));
+  if (!original)
+    return -ENOSYS;
+  constexpr uint64_t kCameraOutput = uint64_t{1} << 17;
+  constexpr uint64_t kDisplay = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                                AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+  uint64_t consumer = 0;
+  if ((usage & (kQtiUbwcUsage | kCameraOutput | AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT)) ==
+          (kQtiUbwcUsage | kCameraOutput) &&
+      access("/data/cr/video_mode", R_OK) == 0 &&
+      g_surface_consumer_usage(surface, &consumer) == 0 && consumer == kDisplay)
+  {
+    // Keep the stream's PRIVATE format and the HAL's negotiated usage.
+    // Only change the display BufferQueue's producer allocation request.
+    LOGI("camera display requested CPU-writable allocation");
+    usage = (usage & ~kQtiUbwcUsage) | kAhbUsageCpuRW;
+  }
+  return original(surface, usage);
+}
+
 static void try_hook_video_encoder_buffers()
 {
   char device[PROP_VALUE_MAX] = {};
@@ -1687,6 +1718,17 @@ static void try_hook_video_encoder_buffers()
   dlclose(gui);
   if (!g_surface_consumer_usage)
     return;
+
+  if (pixel5_stock_android14())
+  {
+    __atomic_store_n(&g_orig_display_usage, nullptr, __ATOMIC_RELAXED);
+    void* display_hook = shadowhook_hook_sym_name("libgui.so", "_ZN7android7Surface8setUsageEm",
+        reinterpret_cast<void*>(proxy_camera_display_usage), &g_orig_display_usage);
+    if (display_hook && __atomic_load_n(&g_orig_display_usage, __ATOMIC_ACQUIRE))
+      g_display_usage_stub = display_hook;
+    else if (display_hook)
+      shadowhook_unhook(display_hook);
+  }
 
   __atomic_store_n(&g_orig_video_encoder_format, nullptr, __ATOMIC_RELAXED);
   void* format_hook = shadowhook_hook_sym_name("libgui.so",
@@ -1812,7 +1854,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
 
   resolve_scaler();
   resolve_photo_mode();
-  g_pixel5_raw10 = pixel5_raw10_profile();
+  g_pixel5_raw10 = pixel5_stock_android14();
   if (g_pixel5_raw10)
     g_raw10_cache.enable();
   open_shm();
@@ -1867,6 +1909,11 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_sh
   if (!g_installed.exchange(false))
     return 0;
   g_raw10_cache.stop();
+  if (g_display_usage_stub)
+  {
+    shadowhook_unhook(g_display_usage_stub);
+    g_display_usage_stub = nullptr;
+  }
   if (g_preview_spacer_stub)
   {
     shadowhook_unhook(g_preview_spacer_stub);

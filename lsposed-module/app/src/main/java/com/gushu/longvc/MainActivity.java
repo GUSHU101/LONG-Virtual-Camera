@@ -502,6 +502,9 @@ public final class MainActivity extends Activity
     }
 
     private static String photoState(RuntimeState state) {
+        if (!state.photoEnabled && state.cameraEnabled) {
+            return "关闭，预览可替换，照片仍使用原生相机";
+        }
         if (!state.photoEnabled || !state.cameraHookReady || !state.videoChannelReady) {
             return cameraState(state, state.photoEnabled);
         }

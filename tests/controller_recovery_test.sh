@@ -139,6 +139,15 @@ reconcile_mode_pair "$CONTROL/photo.lease" "$DATA/photo_mode"
 reconcile_mode_pair "$CONTROL/camera.lease" "$DATA/video_mode"
 [[ ! -e "$CONTROL/photo.lease" && ! -e "$DATA/video_mode" ]]
 
+(
+  ensure_video() { [[ ! -e "$DATA/video_mode" ]]; }
+  install_camera_flag() { : > "$1"; }
+  ensure_camera_hook() { [[ -f "$DATA/video_mode" ]]; }
+  arm_camera
+  [[ -f "$CONTROL/camera.lease" && -f "$DATA/video_mode" ]]
+  rm -f "$CONTROL/camera.lease" "$DATA/video_mode"
+)
+
 if command -v flock >/dev/null 2>&1; then
   BASE=$fixture
   LOCK=$fixture/controller

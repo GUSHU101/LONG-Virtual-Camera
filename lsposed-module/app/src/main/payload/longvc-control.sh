@@ -601,7 +601,6 @@ ensure_video() {
     video_url=$(local_visual_url) || return 1
     start_feeder "$video_url" video video "$VIDEO_LOG" || return 1
   fi
-  ensure_camera_hook
 }
 
 ensure_audio() {
@@ -754,7 +753,7 @@ arm_visual() {
   visual_already_active=0
   [ ! -e "$visual_lease" ] || [ ! -f "$visual_flag" ] || visual_already_active=1
   if (umask 077; : > "$visual_lease") && chmod 0600 "$visual_lease" &&
-     ensure_video && install_camera_flag "$visual_flag"; then
+     ensure_video && install_camera_flag "$visual_flag" && ensure_camera_hook; then
     return 0
   fi
   [ "$visual_already_active" = 0 ] || return 1
