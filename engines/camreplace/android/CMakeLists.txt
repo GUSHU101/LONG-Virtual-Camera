@@ -101,7 +101,7 @@ target_compile_options(cr_secure_channel PRIVATE -fexceptions)
 # variants remain buildable for compatibility/regression work, but are not a
 # second product engine or user-selectable runtime.
 option(CR_FEED_ENABLE_RTMP_DIRECT
-       "Build the phone-side authenticated OBS RTMP listener" ON)
+       "Build the phone-side OBS RTMP playback client" ON)
 option(CR_FEED_USE_THREADED
        "Use the upstream experimental threaded tcp_h264 receiver" OFF)
 

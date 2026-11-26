@@ -71,7 +71,7 @@ public final class RootLifecycleTest {
                 + "camera_enabled=0\nphoto_enabled=0\nmic_enabled=0\n"
                 + "camera_hook_ready=0\naudio_hook_ready=0\nvideo_feeder_ready=0\n"
                 + "audio_feeder_ready=0\nvideo_channel_ready=0\naudio_channel_ready=0\n"
-                + "visual_source_ready=1\naudio_source_ready=0\nobs_listener_ready=0\n";
+                + "visual_source_ready=1\naudio_source_ready=0\nobs_pull_running=0\n";
     }
 
     private static void verifiesRecoveryResult() throws Exception {

@@ -12,6 +12,8 @@ static std::vector<std::uint8_t> config(std::uint8_t length_size_minus_one)
           0xe1, 0, 3, 0x67, 0x64, 0x1f, 1, 0, 2, 0x68, 0xee};
 }
 
+#include "media/RtmpAddress.h"
+
 int main()
 {
   const std::vector<std::uint8_t> sps_1280x720{
@@ -58,5 +60,18 @@ int main()
   assert(out == saved); // malformed input is transactional, never partial.
   assert(!cr::media::avcc_access_unit_to_annexb({}, 4, out));
   assert(!cr::media::avcc_access_unit_to_annexb(zero, 1, out));
+  cr::media::RtmpAddress address;
+  assert(cr::media::parse_rtmp_address("rtmp://relay.local/longvc", address));
+  assert(address.host == "relay.local" && address.port == "1935" && address.app.empty());
+  assert(address.tc_url == "rtmp://relay.local" && address.stream == "longvc");
+  assert(cr::media::parse_rtmp_address(
+      "rtmp://[2001:db8::1]:31935/live/studio?user=example&pass=example", address));
+  assert(address.host == "2001:db8::1" && address.port == "31935" && address.app == "live");
+  assert(address.tc_url == "rtmp://[2001:db8::1]:31935/live");
+  assert(address.stream == "studio?user=example&pass=example");
+  for (auto url : {"rtmp://localhost:", "rtmp://localhost:/live", "rtmp://localhost:0/live",
+                   "rtmp://localhost:65536/live", "rtmp://@localhost/live", "rtmp://localhost/",
+                   "rtmps://localhost/live", "rtmp://localhost/live/#fragment"})
+    assert(!cr::media::parse_rtmp_address(url, address));
   return 0;
 }

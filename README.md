@@ -14,9 +14,13 @@ LONG Virtual Camera 是面向自有或明确授权测试设备的 Android ARM64 
 
 ## OBS 与画面分辨率
 
-手机端 APK 在 1935 端口运行 RTMP 接收器。另一台手机或其他设备上的 RTMP 推流器接入时，在手机面板开启可信局域网接收，保存后按需打开相机或照片开关。在推流器中填入面板显示的手机服务器地址和推流密钥，视频编码选 H.264。局域网接收无需 ADB 或 LONG 桌面程序。
+1. 在电脑运行 [MediaMTX](https://mediamtx.org/docs/kickoff/install)，保留 RTMP 默认端口 1935。
+2. 在同一台电脑的 OBS 打开「设置 → 直播」，选择「自定义」，服务器填 `rtmp://127.0.0.1:1935/longvc`，推流码留空。视频编码选 H.264，然后开始推流。 [OBS 推流示例](https://mediamtx.org/docs/publish/obs-studio)
+3. 手机与电脑在同一局域网时，在 APK 的「电脑 OBS 拉流」填写 `rtmp://<电脑局域网 IP>:1935/longvc`。保存后打开「全局摄像头」或「照片输出替换」。使用 USB 时，在电脑执行 `adb reverse tcp:1935 tcp:1935`，手机地址填 `rtmp://127.0.0.1:1935/longvc`。
 
-局域网默认关闭，手机本机推流可用 `rtmp://127.0.0.1:1935/live`。电脑 OBS 经 USB 接入可选用 `adb forward tcp:1935 tcp:1935`。RTMP 不加密，局域网接收仅用于可信网络。推流密钥可在面板按需查看，重复保存会保留密钥。使用 AAC 需要另选 OBS 音频并打开虚拟麦克风。切换共享推流会话的视频或音频轨道时，推流器可能需要重连。
+电脑与手机通过局域网连接时，需要让手机能访问电脑上的 TCP 1935。明文 RTMP 适用于可信网络。启用 MediaMTX 读取认证时，可在手机地址中加 `?user=用户名&pass=密码`，面板状态隐藏查询参数。需要 OBS 音频时，选中 OBS AAC 并打开虚拟麦克风。 [读取认证配置](https://mediamtx.org/docs/features/authentication)
+
+低延迟可先用 H.264、30 fps 和 1 秒关键帧间隔。连接稳定时，可用 720p 约 8 Mbps 或 1080p 约 14 Mbps 的 CBR 测试清晰度。OBS 的「视频」中将输出分辨率设为目标尺寸，并检查源素材是否有足够的原始分辨率。使用 x264 时可选 `zerolatency`。使用 NVENC 时可选低延迟调优、关闭 Look-ahead 并设 B 帧为 0。网络持续丢帧时，先降到 720p 并检查 Wi-Fi 或切换 USB。 [OBS 丢帧排查](https://obsproject.com/kb/stream-connection-troubleshooting) [H.264 码率参考](https://support.google.com/youtube/answer/2853702)
 
 本地视频和 OBS 共用一套 NV21 发布及相机输出管线。ReCam 的按比例适配方式用于中心裁剪，预览目标按实际请求尺寸生成。输入和输出比例不同时会裁掉部分边缘画面以保持比例。共享帧有 1920 × 1080 的像素预算，也允许 1080 × 1920 的竖屏方向。实际解码分辨率受设备 MediaCodec 限制。
 

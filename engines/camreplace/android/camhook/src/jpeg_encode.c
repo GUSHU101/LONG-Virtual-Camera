@@ -154,6 +154,70 @@ static int has_jpeg_markers(const uint8_t* data, size_t size)
          data[size - 2] == 0xff && data[size - 1] == 0xd9;
 }
 
+static uint16_t exif_u16(const uint8_t* data, int little_endian)
+{
+  const size_t high = little_endian ? 1 : 0;
+  return (uint16_t) ((data[high] << 8) | data[1 - high]);
+}
+
+static uint32_t exif_u32(const uint8_t* data, int little_endian)
+{
+  const size_t high = little_endian ? 2 : 0;
+  return ((uint32_t) exif_u16(data + high, little_endian) << 16) |
+         exif_u16(data + 2 - high, little_endian);
+}
+
+static uint8_t tiff_orientation(const uint8_t* tiff, size_t size)
+{
+  if (size < 8)
+    return 0;
+  const int little_endian = tiff[0] == 'I' && tiff[1] == 'I';
+  if ((!little_endian && (tiff[0] != 'M' || tiff[1] != 'M')) ||
+      exif_u16(tiff + 2, little_endian) != 42)
+    return 0;
+  const uint32_t offset = exif_u32(tiff + 4, little_endian);
+  if (offset < 8 || offset > size - 2)
+    return 0;
+  const uint16_t count = exif_u16(tiff + offset, little_endian);
+  const uint8_t* entry = tiff + offset + 2;
+  if (count > (size - offset - 2) / 12)
+    return 0;
+  for (uint16_t i = 0; i < count; ++i, entry += 12)
+  {
+    if (exif_u16(entry, little_endian) != 0x0112 ||
+        exif_u16(entry + 2, little_endian) != 3 ||
+        exif_u32(entry + 4, little_endian) != 1)
+      continue;
+    const uint16_t orientation = exif_u16(entry + 8, little_endian);
+    return orientation >= 1 && orientation <= 8 ? (uint8_t) orientation : 0;
+  }
+  return 0;
+}
+
+static uint8_t camera_jpeg_orientation(const uint8_t* jpeg, size_t size)
+{
+  size_t position = 2;
+  while (position < size && jpeg[position] == 0xff)
+  {
+    while (position < size && jpeg[position] == 0xff)
+      ++position;
+    if (size - position < 3 || jpeg[position] == 0xda || jpeg[position] == 0xd9)
+      break;
+    const uint8_t marker = jpeg[position++];
+    const size_t length = exif_u16(jpeg + position, 0);
+    if (length < 2 || length > size - position)
+      break;
+    if (marker == 0xe1 && length >= 8 && memcmp(jpeg + position + 2, "Exif\0\0", 6) == 0)
+    {
+      const uint8_t orientation = tiff_orientation(jpeg + position + 8, length - 8);
+      if (orientation != 0)
+        return orientation;
+    }
+    position += length;
+  }
+  return 1;
+}
+
 int cr_replace_camera_jpeg(uint8_t* dst, size_t dst_size,
                            const uint8_t* jpeg, size_t jpeg_size)
 {
@@ -170,8 +234,25 @@ int cr_replace_camera_jpeg(uint8_t* dst, size_t dst_size,
       previous.size < 2 || dst[0] != 0xff || dst[1] != 0xd8)
     return -1;
 
-  const struct CameraJpegTrailer replacement = {jpeg_id, 0, (uint32_t) jpeg_size};
-  memcpy(dst, jpeg, jpeg_size);
+  const uint8_t orientation = camera_jpeg_orientation(dst, previous.size);
+  const uint8_t exif[] = {
+      0xff, 0xe1, 0x00, 0x22, 'E', 'x', 'i', 'f', 0, 0,
+      'I', 'I', 42, 0, 8, 0, 0, 0,
+      1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, orientation, 0, 0, 0,
+      0, 0, 0, 0};
+  const size_t new_size = jpeg_size + (orientation == 1 ? 0 : sizeof(exif));
+  if (new_size > capacity || new_size > UINT32_MAX || new_size < jpeg_size)
+    return -1;
+  if (orientation != 1)
+  {
+    // Retain the capture's orientation without carrying sensor metadata or location.
+    memcpy(dst, jpeg, 2);
+    memcpy(dst + 2, exif, sizeof(exif));
+    memcpy(dst + 2 + sizeof(exif), jpeg + 2, jpeg_size - 2);
+  }
+  else
+    memcpy(dst, jpeg, jpeg_size);
+  const struct CameraJpegTrailer replacement = {jpeg_id, 0, (uint32_t) new_size};
   memcpy(dst + capacity, &replacement, sizeof(replacement));
   return 0;
 }

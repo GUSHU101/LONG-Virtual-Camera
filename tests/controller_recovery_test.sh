@@ -18,7 +18,7 @@ verify_steps() {
   unload_camera_hook() { steps+=" camera"; [[ $fail_step != camera ]]; }
   unload_audio_hook() { steps+=" audio"; [[ $fail_step != audio ]]; }
   stop_all || rc=$?
-  [[ $steps == " revoke revoke feeder revoke revoke camera audio" ]]
+  [[ $steps == " feeder revoke revoke revoke revoke camera audio" ]]
   [[ $rc == "$expected_rc" ]]
   [[ ! -e "$MIC_MODE" ]]
 }
@@ -56,6 +56,20 @@ camera_dump=$'Active Camera Clients:\n[]\nAllowed user IDs: 0\n'"$camera_history
 [[ -z $(camera_packages) ]]
 camera_dump=$'Active Camera Clients:\n[\n(Camera ID: 0, Client Package Name: com.example.active, Conflicting Client Devices: {})\n]\n'"$camera_history"
 [[ $(camera_packages) == com.example.active ]]
+
+(
+  stops=0
+  stop_video_passthrough() { stops=$((stops + 1)); }
+  unload_camera_hook() { exit 7; }
+  touch "$CONTROL/camera.lease" "$DATA/video_mode" "$CONTROL/photo.lease" "$DATA/photo_mode"
+  disarm_camera
+  [[ $stops == 0 && ! -e "$DATA/video_mode" && -e "$DATA/photo_mode" ]]
+  disarm_photo
+  [[ $stops == 1 && ! -e "$DATA/photo_mode" ]]
+  touch "$CONTROL/camera.lease" "$DATA/video_mode"
+  disarm_camera
+  [[ $stops == 2 && ! -e "$DATA/video_mode" ]]
+)
 
 (
   BASE=$fixture

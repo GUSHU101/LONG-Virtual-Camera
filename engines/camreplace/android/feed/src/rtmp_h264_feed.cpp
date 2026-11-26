@@ -1,37 +1,16 @@
-// RTMP H.264 feed mode (sprint B).
-// Why this exists:
-//   The legacy path was OBS → PC RtmpServer → PC parses chunks → PC packs
-//   each NAL into a 16-byte-prefixed TCP frame → cr_feed_proc on phone
-//   reads frames → MediaCodec.
-//   The PC-side parser was an extra place latency (and bugs) could land.
-//   This file moves the RTMP listener onto the phone itself. OBS can publish
-//   over an authorized LAN or through a standard adb forward; no LONG VC
-//   desktop companion is required. A per-configuration stream key is mandatory
-//   before any media message is accepted.
-// Wire compatibility:
-//   We accept the same simple RTMP 1.0 handshake + chunk-stream + AMF0
-//   command set the host-side server already supported:
-//     connect / releaseStream / FCPublish / createStream / publish
-//   And the same FLV-tag types:
-//     0x09 video  (AVC sequence header + coded frames)
-//     0x12 data   (onMetaData / @setDataFrame for resolution/fps hint)
-//   Audio tags (AAC) are decoded into the same opt-in microphone shared
-//   memory used by the local-media source.
-// Code lineage:
-//   This is a near-line-for-line port of host/src/source/RtmpServer.cpp.
-//   Original PC source is preserved verbatim under
-//   .backup_20260426_ABCE/ if a side-by-side diff is ever needed.
-
-#include "../include/cr_feed.h"
+// Phone-side RTMP playback from the configured desktop media server.
+// The existing RTMP chunk/FLV parser feeds the shared H.264 and optional AAC decoders.
 #include "h264_decode_pipe.h"
 #include "aac_decode_pipe.h"
 #include "interruptible_socket.h"
 #include "media/Avcc.h"
+#include "media/RtmpAddress.h"
 
 #include <android/log.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
@@ -42,10 +21,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <new>
 #include <random>
 #include <string>
 #include <string_view>
@@ -67,19 +49,10 @@ constexpr size_t kMaxBufferedRtmpBytes = 24u * 1024u * 1024u;
 constexpr size_t kMaxChunkStreams = 64u;
 constexpr uint32_t kMaxInboundChunkBytes = 1024u * 1024u;
 constexpr unsigned kMaxAmfDepth = 16u;
-constexpr size_t kMaxPreAuthBytes = 1024u * 1024u;
-constexpr auto kPublishAuthDeadline = std::chrono::seconds(12);
-
-bool constant_time_equal(std::string_view left, std::string_view right)
-{
-  if (left.size() != right.size())
-    return false;
-  unsigned difference = 0;
-  for (size_t i = 0; i < left.size(); ++i)
-    difference |= static_cast<unsigned char>(left[i]) ^
-                  static_cast<unsigned char>(right[i]);
-  return difference == 0;
-}
+constexpr size_t kMaxStartupBytes = 1024u * 1024u;
+constexpr auto kStartupTimeout = std::chrono::seconds(12);
+constexpr auto kLiveIoTimeout = std::chrono::seconds(3);
+constexpr auto kVideoFrameTimeout = std::chrono::seconds(2);
 
 inline uint32_t be24(const uint8_t* p)
 {
@@ -292,46 +265,59 @@ void build_rtmp_message(std::vector<uint8_t>& out, uint8_t cs_id, uint32_t times
   }
 }
 
-// Per-connection RTMP session: handshake → chunks → FLV → push into pipe.
-bool serve_client(int client, const std::string& expected_stream_key,
+bool send_message(cr::feed::DeadlineSocket& connection, uint8_t type, uint32_t stream,
+                  const uint8_t* bytes, size_t count)
+{
+  std::vector<uint8_t> message;
+  build_rtmp_message(message, type == 0x14 ? 3 : 2, 0, type, stream, bytes, count, 128);
+  return connection.send(message.data(), message.size());
+}
+
+bool send_command(cr::feed::DeadlineSocket& connection, uint32_t stream,
+                  const std::vector<uint8_t>& command)
+{
+  return send_message(connection, 0x14, stream, command.data(), command.size());
+}
+
+bool play_session(int socket, const cr::media::RtmpAddress& address,
                   bool enable_video, bool enable_audio)
 {
-  int no_delay = 1;
-  setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
-  const auto auth_deadline =
-      cr::feed::DeadlineSocket::Clock::now() + kPublishAuthDeadline;
-  cr::feed::DeadlineSocket connection(client, g_stop, std::chrono::seconds(10),
-                                      auth_deadline);
+  int one = 1;
+  setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  const auto startup_deadline = cr::feed::DeadlineSocket::Clock::now() + kStartupTimeout;
+  cr::feed::DeadlineSocket connection(socket, g_stop, std::chrono::seconds(10), startup_deadline);
+  std::array<uint8_t, 1537> c0c1{};
+  c0c1[0] = 3;
+  std::random_device random;
+  for (size_t n = 9; n < c0c1.size(); ++n)
+    c0c1[n] = static_cast<uint8_t>(random());
 
-  // ---- Handshake (simple, no digest) -----------------------------------
-  uint8_t c0c1[1 + 1536];
-  if (!connection.receive(c0c1, sizeof(c0c1)))
-    return false;
-  if (c0c1[0] != 0x03)
-  {
-    LOGW(OBF("rtmp: unexpected C0 version=0x%02x").c_str(), (unsigned) c0c1[0]);
-    return false;
-  }
-  std::vector<uint8_t> s0s1s2;
-  s0s1s2.reserve(1 + 1536 + 1536);
-  s0s1s2.push_back(0x03);
-  uint8_t s1[1536] = {0};
-  std::random_device rd;
-  for (int i = 8; i < 1536; ++i)
-    s1[i] = (uint8_t) rd();
-  s0s1s2.insert(s0s1s2.end(), s1, s1 + 1536);
-  s0s1s2.insert(s0s1s2.end(), c0c1 + 1, c0c1 + 1 + 1536);
-  if (!connection.send(s0s1s2.data(), s0s1s2.size()))
+  std::array<uint8_t, 3073> response{};
+  if (!connection.send(c0c1.data(), c0c1.size()) ||
+      !connection.receive(response.data(), response.size()) || response[0] != 3 ||
+      !connection.send(response.data() + 1, 1536))
     return false;
 
-  uint8_t c2[1536];
-  if (!connection.receive(c2, sizeof(c2)))
+  std::vector<uint8_t> connect;
+  amf_put_string(connect, "connect");
+  amf_put_number(connect, 1);
+  connect.push_back(0x03);
+  amf_put_obj_key(connect, "app");
+  amf_put_string(connect, address.app);
+  amf_put_obj_key(connect, "tcUrl");
+  amf_put_string(connect, address.tc_url);
+  amf_put_obj_key(connect, "flashVer");
+  amf_put_string(connect, "LONG Virtual Camera");
+  amf_put_obj_key(connect, "objectEncoding");
+  amf_put_number(connect, 0);
+  amf_put_obj_end(connect);
+  if (!send_command(connection, 0, connect))
     return false;
-  LOGI(OBF("rtmp: handshake done").c_str());
 
   // ---- Chunk stream loop -----------------------------------------------
   uint32_t in_chunk_size = 128;
-  uint32_t out_chunk_size = 4096;
+  uint32_t ack_window = 0;
+  uint64_t last_ack = 0;
 
   struct MsgHdr
   {
@@ -355,15 +341,26 @@ bool serve_client(int client, const std::string& expected_stream_key,
   bool seen_video_keyframe = false;
   cr_feed::H264DecodePipe pipe;
 
-  // AAC audio sibling. Lazily configured when the first FLV audio
-  // tag arrives with AACPacketType=0 (AudioSpecificConfig). Until
-  // then it stays inert and ignores raw AAC frames. This is what
-  // lets a "Start replace sound" session work with no pre-existing
-  // PC AudioPump in direct-RTMP mode.
+  // Audio decoding begins after an AAC AudioSpecificConfig.
   cr_feed::AacDecodePipe audio_pipe;
   bool audio_pipe_started = false;
-  bool publisher_authorized = false;
-  size_t pre_auth_bytes = 0;
+  bool connection_accepted = false;
+  uint32_t play_stream_id = 0;
+  bool receiving_media = false;
+  size_t startup_bytes = 0;
+  uint64_t last_decoded = 0;
+  auto last_frame = std::chrono::steady_clock::time_point::min();
+  bool video_ready = false;
+
+  auto begin_media = [&]()
+  {
+    if (receiving_media)
+      return;
+    receiving_media = true;
+    connection.finish_startup();
+    connection.set_io_timeout(kLiveIoTimeout);
+    LOGI("rtmp: desktop stream is delivering supported media");
+  };
 
   auto try_start_pipe = [&]()
   {
@@ -394,34 +391,6 @@ bool serve_client(int client, const std::string& expected_stream_key,
     pipe_h = stream_h;
     return true;
   };
-
-  // Initial protocol-control bursts — Window Ack / Peer BW / Set Chunk
-  // Size. Same as PC server.
-  {
-    uint8_t body[4];
-    put_be32(body, 5'000'000);
-    std::vector<uint8_t> msg;
-    build_rtmp_message(msg, 2, 0, 0x05, 0, body, 4, out_chunk_size);
-    if (!connection.send(msg.data(), msg.size()))
-      return false;
-  }
-  {
-    uint8_t body[5];
-    put_be32(body, 5'000'000);
-    body[4] = 2;
-    std::vector<uint8_t> msg;
-    build_rtmp_message(msg, 2, 0, 0x06, 0, body, 5, out_chunk_size);
-    if (!connection.send(msg.data(), msg.size()))
-      return false;
-  }
-  {
-    uint8_t body[4];
-    put_be32(body, out_chunk_size);
-    std::vector<uint8_t> msg;
-    build_rtmp_message(msg, 2, 0, 0x01, 0, body, 4, out_chunk_size);
-    if (!connection.send(msg.data(), msg.size()))
-      return false;
-  }
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
@@ -572,15 +541,25 @@ bool serve_client(int client, const std::string& expected_stream_key,
       if (!connection.receive(buf.data() + old_size, take))
         goto done;
     }
-    if (!publisher_authorized)
+    if (!receiving_media)
     {
-      pre_auth_bytes += take;
-      if (pre_auth_bytes > kMaxPreAuthBytes ||
-          std::chrono::steady_clock::now() > auth_deadline)
+      startup_bytes += take;
+      if (startup_bytes > kMaxStartupBytes ||
+          std::chrono::steady_clock::now() > startup_deadline)
       {
-        LOGW(OBF("rtmp: publisher authentication deadline exceeded").c_str());
+        LOGW(OBF("rtmp: play startup deadline exceeded").c_str());
         return false;
       }
+    }
+
+    const uint64_t received = connection.received();
+    if (ack_window && received - last_ack >= ack_window)
+    {
+      uint8_t ack[4];
+      put_be32(ack, static_cast<uint32_t>(received));
+      if (!send_message(connection, 0x03, 0, ack, sizeof(ack)))
+        goto done;
+      last_ack = received;
     }
 
     if (buf.size() < last.length)
@@ -604,107 +583,56 @@ bool serve_client(int client, const std::string& expected_stream_key,
         }
         break;
       }
-      case 0x03:
       case 0x04:
+        if (body.size() == 6 && body[0] == 0 && body[1] == 6)
+        {
+          body[1] = 7;
+          if (!send_message(connection, 0x04, 0, body.data(), body.size()))
+            goto done;
+        }
+        break;
       case 0x05:
-      case 0x06:
+        if (body.size() == 4 && be32(body.data()) != 0)
+          ack_window = std::max(be32(body.data()), 65536u);
         break;
 
       case 0x11:
       case 0x14:
-      { // AMF command
-        const uint8_t* p0 = body.data();
-        const uint8_t* pe = body.data() + body.size();
-        if (type == 0x11 && p0 < pe)
-          ++p0;
-        Amf0Reader r{p0, pe};
-        std::string cmd;
-        double tid = 0;
-        if (!r.read_string(cmd) || !r.read_double(tid) || !std::isfinite(tid))
+      {
+        const size_t prefix = type == 0x11 ? 1 : 0;
+        if (body.size() <= prefix)
           break;
-
-        if (cmd == OBF("connect").c_str())
+        Amf0Reader r{body.data() + prefix, body.data() + body.size()};
+        std::string name;
+        double transaction = 0;
+        if (!r.read_string(name) || !r.read_double(transaction))
+          break;
+        if (name == "_error")
+          goto done;
+        if (name == "_result" && transaction == 1 && !connection_accepted)
         {
-          std::vector<uint8_t> resp;
-          amf_put_string(resp, OBF("_result").c_str());
-          amf_put_number(resp, tid);
-          resp.push_back(0x03);
-          amf_put_obj_key(resp, OBF("fmsVer").c_str());
-          amf_put_string(resp, OBF("FMS/3,5,3,888").c_str());
-          amf_put_obj_key(resp, OBF("capabilities").c_str());
-          amf_put_number(resp, 31.0);
-          amf_put_obj_key(resp, OBF("mode").c_str());
-          amf_put_number(resp, 1.0);
-          amf_put_obj_end(resp);
-          resp.push_back(0x03);
-          amf_put_obj_key(resp, OBF("level").c_str());
-          amf_put_string(resp, OBF("status").c_str());
-          amf_put_obj_key(resp, OBF("code").c_str());
-          amf_put_string(resp, OBF("NetConnection.Connect.Success").c_str());
-          amf_put_obj_key(resp, OBF("description").c_str());
-          amf_put_string(resp, OBF("Connection succeeded.").c_str());
-          amf_put_obj_key(resp, OBF("objectEncoding").c_str());
-          amf_put_number(resp, 0.0);
-          amf_put_obj_end(resp);
-          std::vector<uint8_t> msg;
-          build_rtmp_message(msg, 3, 0, 0x14, 0, resp.data(), resp.size(), out_chunk_size);
-          if (!connection.send(msg.data(), msg.size()))
+          std::vector<uint8_t> create;
+          amf_put_string(create, "createStream");
+          amf_put_number(create, 2);
+          amf_put_null(create);
+          if (!send_command(connection, 0, create))
             goto done;
+          connection_accepted = true;
         }
-        else if (cmd == OBF("releaseStream").c_str() || cmd == OBF("FCPublish").c_str() || cmd == OBF("FCUnpublish").c_str() || cmd == OBF("deleteStream").c_str())
+        else if (name == "_result" && transaction == 2 && connection_accepted && !play_stream_id)
         {
-          std::vector<uint8_t> resp;
-          amf_put_string(resp, OBF("_result").c_str());
-          amf_put_number(resp, tid);
-          amf_put_null(resp);
-          amf_put_null(resp);
-          std::vector<uint8_t> msg;
-          build_rtmp_message(msg, 3, 0, 0x14, 0, resp.data(), resp.size(), out_chunk_size);
-          if (!connection.send(msg.data(), msg.size()))
+          double id = 0;
+          if (!r.skip_value() || !r.read_double(id) ||
+              !std::isfinite(id) || id < 1 || id > UINT32_MAX || std::floor(id) != id)
             goto done;
-        }
-        else if (cmd == OBF("createStream").c_str())
-        {
-          std::vector<uint8_t> resp;
-          amf_put_string(resp, OBF("_result").c_str());
-          amf_put_number(resp, tid);
-          amf_put_null(resp);
-          amf_put_number(resp, 1.0);
-          std::vector<uint8_t> msg;
-          build_rtmp_message(msg, 3, 0, 0x14, 0, resp.data(), resp.size(), out_chunk_size);
-          if (!connection.send(msg.data(), msg.size()))
-            goto done;
-        }
-        else if (cmd == OBF("publish").c_str())
-        {
-          // publish(null, streamName, "live"). The server is reachable on
-          // the LAN, so accepting an arbitrary stream name would let another
-          // local-network peer replace camera frames. Authenticate before
-          // acknowledging publish or consuming any media.
-          std::string stream_name;
-          if (!r.skip_value() || !r.read_string(stream_name) ||
-              !constant_time_equal(stream_name, expected_stream_key))
-          {
-            LOGW(OBF("rtmp: rejected publisher with invalid stream key").c_str());
-            return false;
-          }
-          publisher_authorized = true;
-          connection.finish_startup();
-          std::vector<uint8_t> resp;
-          amf_put_string(resp, OBF("onStatus").c_str());
-          amf_put_number(resp, 0.0);
-          amf_put_null(resp);
-          resp.push_back(0x03);
-          amf_put_obj_key(resp, OBF("level").c_str());
-          amf_put_string(resp, OBF("status").c_str());
-          amf_put_obj_key(resp, OBF("code").c_str());
-          amf_put_string(resp, OBF("NetStream.Publish.Start").c_str());
-          amf_put_obj_key(resp, OBF("description").c_str());
-          amf_put_string(resp, OBF("Start publishing.").c_str());
-          amf_put_obj_end(resp);
-          std::vector<uint8_t> msg;
-          build_rtmp_message(msg, 4, 0, 0x14, 1, resp.data(), resp.size(), out_chunk_size);
-          if (!connection.send(msg.data(), msg.size()))
+          play_stream_id = static_cast<uint32_t>(id);
+          std::vector<uint8_t> play;
+          amf_put_string(play, "play");
+          amf_put_number(play, 0);
+          amf_put_null(play);
+          amf_put_string(play, address.stream);
+          amf_put_number(play, -1000);
+          if (!send_command(connection, play_stream_id, play))
             goto done;
         }
         break;
@@ -713,7 +641,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
       case 0x12:
       case 0x0f:
       { // AMF data (onMetaData)
-        if (!publisher_authorized)
+        if (play_stream_id == 0 || last.stream_id != play_stream_id || body.empty())
           break;
         const uint8_t* p0 = body.data();
         const uint8_t* pe = body.data() + body.size();
@@ -792,7 +720,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
 
       case 0x08:
       { // audio (FLV)
-        if (!publisher_authorized || !enable_audio)
+        if (play_stream_id == 0 || last.stream_id != play_stream_id || !enable_audio)
           break;
         if (body.size() < 2)
           break;
@@ -800,6 +728,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
         const uint8_t sound_fmt = flv0 >> 4;
         if (sound_fmt != 10)
           break; // only AAC handled
+        begin_media();
         const uint8_t aac_pkt_type = body[1];
         const uint8_t* payload = body.data() + 2;
         size_t pay_len = body.size() - 2;
@@ -820,7 +749,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
 
       case 0x09:
       { // video (H.264 / AVC)
-        if (!publisher_authorized || !enable_video)
+        if (play_stream_id == 0 || last.stream_id != play_stream_id || !enable_video)
           break;
         if (body.size() < 5)
           break;
@@ -828,6 +757,7 @@ bool serve_client(int client, const std::string& expected_stream_key,
         uint8_t codec_id = body[0] & 0x0f;
         if (codec_id != 7)
           break;
+        begin_media();
 
         uint8_t avc_packet_type = body[1];
         int32_t cts_ms = (int32_t) ((body[2] << 16) | (body[3] << 8) | body[4]);
@@ -911,9 +841,24 @@ bool serve_client(int client, const std::string& expected_stream_key,
         break;
       }
     }
+    // Audio or keepalives can outlive the video. Publish unavailable once
+    // until a complete decoded frame has advanced the shared ring again.
+    const auto frame_count = pipe.output_count();
+    if (frame_count != last_decoded)
+    {
+      last_decoded = frame_count;
+      last_frame = std::chrono::steady_clock::now();
+      video_ready = true;
+    }
+    else if (video_ready && std::chrono::steady_clock::now() - last_frame >= kVideoFrameTimeout)
+    {
+      pipe.revoke_frame();
+      video_ready = false;
+      LOGW("rtmp: no decoded video in two seconds, waiting for a fresh frame");
+    }
   }
 done:
-  LOGI(OBF("rtmp: client gone (decoded in=%llu out=%llu, audio=%s)").c_str(), (unsigned long long) pipe.input_count(), (unsigned long long) pipe.output_count(), audio_pipe_started ? "on" : OBF("off").c_str());
+  LOGI(OBF("rtmp: reader disconnected (decoded in=%llu out=%llu, audio=%s)").c_str(), (unsigned long long) pipe.input_count(), (unsigned long long) pipe.output_count(), audio_pipe_started ? "on" : OBF("off").c_str());
   pipe.stop();
   audio_pipe.stop();
   return true;
@@ -921,71 +866,94 @@ done:
 
 } // namespace
 
-extern "C" int cr_feed_run_rtmp(int port, const char* stream_key,
-                                int allow_lan, int enable_video,
-                                int enable_audio);
-
-int cr_feed_run_rtmp(int port, const char* stream_key, int allow_lan,
-                     int enable_video, int enable_audio)
+namespace
 {
-  if (!stream_key || strlen(stream_key) < 24 || strlen(stream_key) > 96 ||
-      (!enable_video && !enable_audio))
-  {
-    LOGE(OBF("rtmp: invalid stream-key policy").c_str());
-    return -1;
-  }
-  const std::string expected_stream_key(stream_key);
-  int srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (srv < 0)
-  {
-    LOGE(OBF("rtmp: socket: %s").c_str(), strerror(errno));
-    return -1;
-  }
-  int one = 1;
-  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons((uint16_t) port);
-  // Loopback/USB is the default. Listening on the LAN is possible only after
-  // an explicit UI opt-in and still requires the random stream key.
-  addr.sin_addr.s_addr = htonl(allow_lan ? INADDR_ANY : INADDR_LOOPBACK);
-
-  if (bind(srv, (sockaddr*) &addr, sizeof(addr)) != 0)
-  {
-    LOGE(OBF("rtmp: bind :%d: %s").c_str(), port, strerror(errno));
-    close(srv);
+int connect_rtmp(const cr::media::RtmpAddress& address)
+{
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+  addrinfo* candidates = nullptr;
+  if (getaddrinfo(address.host.c_str(), address.port.c_str(), &hints, &candidates) != 0)
     return -1;
-  }
-  if (listen(srv, 1) != 0)
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+  int connected = -1;
+  for (auto* candidate = candidates; candidate && !g_stop.load(std::memory_order_relaxed);
+       candidate = candidate->ai_next)
   {
-    LOGE(OBF("rtmp: listen: %s").c_str(), strerror(errno));
-    close(srv);
-    return -1;
-  }
-  LOGI(OBF("rtmp listener on %s:%d (authenticated, video=%d audio=%d)").c_str(),
-       allow_lan ? OBF("0.0.0.0").c_str() : OBF("127.0.0.1").c_str(),
-       port, enable_video, enable_audio);
-
-  while (!g_stop.load(std::memory_order_relaxed))
-  {
-    int client = cr::feed::accept_interruptible(srv, g_stop);
-    if (client < 0)
+    const int fd = socket(candidate->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                          candidate->ai_protocol);
+    if (fd < 0)
+      continue;
+    const int result = connect(fd, candidate->ai_addr, candidate->ai_addrlen);
+    if (result == 0)
     {
-      if (g_stop.load(std::memory_order_relaxed))
-        break;
-      if (errno == EINTR)
-        continue;
-      LOGW(OBF("rtmp: accept: %s").c_str(), strerror(errno));
+      connected = fd;
       break;
     }
-    LOGI(OBF("rtmp: publisher connected").c_str());
-    serve_client(client, expected_stream_key, enable_video != 0,
-                 enable_audio != 0);
-    close(client);
-    LOGI(OBF("rtmp: publisher gone").c_str());
+    if (errno == EINPROGRESS)
+    {
+      while (!g_stop.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < deadline)
+      {
+        pollfd watcher{fd, POLLOUT, 0};
+        const int ready = poll(&watcher, 1, 200);
+        if (ready == 0 || (ready < 0 && errno == EINTR))
+          continue;
+        int error = 0;
+        socklen_t size = sizeof(error);
+        if (ready > 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && error == 0)
+          connected = fd;
+        break;
+      }
+    }
+    if (connected == fd)
+      break;
+    close(fd);
+    if (std::chrono::steady_clock::now() >= deadline)
+      break;
+  }
+  freeaddrinfo(candidates);
+  return connected;
+}
+
+} // namespace
+
+extern "C" int cr_feed_run_rtmp_pull(const char* url, int video_enabled, int audio_enabled)
+{
+  cr::media::RtmpAddress address;
+  if (!url || !cr::media::parse_rtmp_address(url, address) ||
+      (!video_enabled && !audio_enabled))
+  {
+    LOGE("rtmp: invalid desktop playback address");
+    return -1;
   }
 
-  close(srv);
+  unsigned retry = 0;
+  while (!g_stop.load(std::memory_order_relaxed))
+  {
+    const int socket = connect_rtmp(address);
+    if (socket >= 0)
+    {
+      retry = 0;
+      LOGI("rtmp: connected to desktop media server");
+      try
+      {
+        play_session(socket, address, video_enabled != 0, audio_enabled != 0);
+      }
+      catch (const std::bad_alloc&)
+      {
+        LOGW("rtmp: session memory limit reached");
+      }
+      close(socket);
+    }
+    else if (retry++ % 8 == 0)
+    {
+      LOGW("rtmp: desktop media server unreachable, retrying");
+    }
+    for (int i = 0; i < 10 && !g_stop.load(std::memory_order_relaxed); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
   return 0;
 }

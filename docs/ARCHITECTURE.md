@@ -6,7 +6,7 @@ Local video and images publish NV21 through the same triple-buffered file used b
 
 The shared video buffer has a fixed pixel budget. ReCam-derived SPS geometry and aspect-preserving resizing adapt incoming frames before publication. The camera path center-crops to the requested aspect ratio with chroma alignment, then scales or copies for the destination stride. Reader pins protect the slot until the copy or encode completes. A stale video frame eventually passes through to the device camera.
 
-Media files are written under content-addressed names, verified by length and SHA-256, and referenced from a single atomically renamed source manifest. Video and audio selections have separate fields. OBS authenticates with a generated publisher key and listens on loopback by default. The controller gives the feeder the private configuration location implicitly and keeps the key out of ordinary status output.
+Media files are written under content-addressed names, verified by length and SHA-256, and referenced from a single atomically renamed source manifest. Video and audio selections have separate fields. The OBS feeder opens an outbound RTMP playback session to a configured relay. It reads the URL from the protected source manifest. Status output omits any URL query parameters, and the process arguments contain only the requested track combination.
 
 Emergency recovery runs separately from ordinary app operations. The controller attempts all cleanup steps, verifies feeder exit and service recovery, and reports error if any step fails. Root process cleanup and the device-side wait remain bounded. The platform and root manager determine whether subordinate processes can be fully cleaned up after a forced interruption.
 

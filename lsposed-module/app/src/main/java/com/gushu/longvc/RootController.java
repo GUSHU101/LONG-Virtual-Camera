@@ -86,20 +86,10 @@ final class RootController {
         }
     }
 
-    RuntimeState configureObs(boolean allowLan, boolean obsAudio)
+    RuntimeState configureObs(String url, boolean obsAudio)
             throws IOException, InterruptedException {
-        if (mediaSources.obsSettingsMatch(allowLan, obsAudio)) return status();
-        return replaceSource(() -> mediaSources.configureObs(allowLan, obsAudio));
-    }
-
-    RuntimeState revealObsKey() throws IOException, InterruptedException {
-        RuntimeState state = status();
-        if (!state.obsConfigured) throw new IOException("OBS 输入尚未配置");
-        return state.withObsStreamKey(mediaSources.readObsKey());
-    }
-
-    RuntimeState rotateObsKey() throws IOException, InterruptedException {
-        return replaceSource(mediaSources::rotateObsKey);
+        if (mediaSources.obsSettingsMatch(url, obsAudio)) return status();
+        return replaceSource(() -> mediaSources.configureObs(url, obsAudio));
     }
 
     RuntimeState status() throws IOException, InterruptedException {
@@ -116,7 +106,7 @@ final class RootController {
                     + "echo visual_mode=local; echo audio_mode=local; "
                     + "echo visual_kind=none; "
                     + "echo audio_source_ready=0; echo obs_configured=0; "
-                    + "echo obs_listener_ready=0; echo obs_bind=loopback; "
+                    + "echo obs_pull_running=0; echo obs_address=; "
                     + "echo camera_enabled=0; echo photo_enabled=0; echo mic_enabled=0; "
                     + "echo video_feeder_ready=0; echo audio_feeder_ready=0; "
                     + "echo camera_hook_ready=0; echo audio_hook_ready=0; "

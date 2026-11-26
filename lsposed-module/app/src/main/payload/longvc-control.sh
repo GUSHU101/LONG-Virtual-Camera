@@ -183,35 +183,6 @@ stop_feeder() (
   wait_feeders_exit "$@"
 )
 
-feeder_owns_listener() (
-  case "$1" in ''|*[!0-9]*) return 1 ;; esac
-  listener_pid=$1
-  listener_port=$2
-  listener_dir=$PROC_ROOT/$listener_pid
-  listener_started=$(process_start_time "$listener_pid") || return 1
-  set --
-  for listener_table in "$listener_dir/net/tcp" "$listener_dir/net/tcp6"; do
-    [ ! -r "$listener_table" ] || set -- "$@" "$listener_table"
-  done
-  [ "$#" -gt 0 ] || return 1
-  listener_inodes=$(awk -v port="$listener_port" '
-    $4 == "0A" && $10 ~ /^[1-9][0-9]*$/ {
-      split($2, address, ":")
-      if (toupper(address[2]) == port) print $10
-    }' "$@" 2>/dev/null) || return 1
-  [ -n "$listener_inodes" ] || return 1
-  for listener_fd in "$listener_dir"/fd/*; do
-    listener_target=$(readlink "$listener_fd" 2>/dev/null) || continue
-    for listener_inode in $listener_inodes; do
-      if [ "$listener_target" = "socket:[$listener_inode]" ] &&
-         [ "$(process_start_time "$listener_pid")" = "$listener_started" ]; then
-        return 0
-      fi
-    done
-  done
-  return 1
-)
-
 channel_has_header() {
   [ "$(read_u32_hex "$1" 0)" = "$2" ] &&
     [ "$(read_u32_hex "$1" "$3")" = "00000001" ]
@@ -248,7 +219,7 @@ wait_feeder() {
           channel_has_header "$DATA/audio" 55415243 36 && return 0
           ;;
         obs)
-          feeder_owns_listener "$wait_pid" 078F && return 0
+          return 0
           ;;
       esac
     fi
@@ -268,7 +239,7 @@ start_feeder() {
     if wait_feeder "$start_tag" "$start_ready"; then
       return 0
     fi
-    # A live process without its listener can never become READY. Replace it
+    # A local decoder without output can fail its readiness check. Replace it
     # instead of making every later arm attempt fail on the same stale PID.
     stop_feeder "$start_tag" || return 1
   fi
@@ -277,6 +248,13 @@ start_feeder() {
   case "$start_ready" in
     video) revoke_u32 "$DATA/feed" 48 || return 1 ;;
     audio) revoke_u32 "$DATA/audio" 36 || return 1 ;;
+    obs)
+      case "$start_role" in
+        obs-av) revoke_u32 "$DATA/feed" 48 && revoke_u32 "$DATA/audio" 36 || return 1 ;;
+        obs-video) revoke_u32 "$DATA/feed" 48 || return 1 ;;
+        obs-audio) revoke_u32 "$DATA/audio" 36 || return 1 ;;
+      esac
+      ;;
   esac
   rm -f "$start_log"
   if command -v nohup >/dev/null 2>&1; then
@@ -553,35 +531,25 @@ current_source_mode() {
   fi
 }
 
-current_obs_bind() {
-  selected_bind=$(config_value obs_bind 2>/dev/null)
-  case "$selected_bind" in
-    lan) say lan ;;
-    *) say loopback ;;
+current_obs_url() {
+  selected_url=$(config_value obs_url 2>/dev/null)
+  case "$selected_url" in
+    rtmp://*/*) [ "${#selected_url}" -le 512 ] && say "$selected_url" ;;
+    *) return 1 ;;
   esac
-}
-
-valid_obs_token() {
-  token_value=$(config_value obs_token 2>/dev/null)
-  case "$token_value" in
-    ''|*[!A-Za-z0-9_-]*) return 1 ;;
-  esac
-  token_length=${#token_value}
-  [ "$token_length" -ge 24 ] && [ "$token_length" -le 96 ]
 }
 
 ensure_obs_feeder() {
-  valid_obs_token || return 1
+  current_obs_url >/dev/null || return 1
   obs_tracks=$1
   case "$obs_tracks" in video|audio|av) ;; *) return 1 ;; esac
-  obs_bind=$(current_obs_bind)
   obs_role="obs-$obs_tracks"
   if find_feed_pid "--role $obs_role" >/dev/null 2>&1 &&
      wait_feeder "--role $obs_role" obs; then
     return 0
   fi
   stop_feeder "--role obs" || return 1
-  start_feeder "rtmp:listen:1935:config:$obs_bind:$obs_tracks" \
+  start_feeder "rtmp:pull:config:$obs_tracks" \
     "$obs_role" obs "$OBS_LOG"
 }
 
@@ -665,17 +633,13 @@ stop_video_passthrough() {
     else
       ensure_obs_feeder audio || stop_rc=1
     fi
-    revoke_u32 "$DATA/feed" 0 || stop_rc=1
   else
-    if [ -f "$DATA/feed" ]; then
-      revoke_u32 "$DATA/feed" 48 || stop_rc=1
-      sleep 0.35
-    fi
     stop_feeder "--role video" || stop_rc=1
-    revoke_u32 "$DATA/feed" 0 || stop_rc=1
   fi
   # Migration cleanup for payloads launched by the former desktop transport.
   stop_feeder tcp_h264 || stop_rc=1
+  revoke_u32 "$DATA/feed" 48 || stop_rc=1
+  revoke_u32 "$DATA/feed" 0 || stop_rc=1
   return "$stop_rc"
 }
 
@@ -689,12 +653,12 @@ stop_audio_passthrough() {
     else
       ensure_obs_feeder video || stop_rc=1
     fi
-    revoke_u32 "$DATA/audio" 0 || stop_rc=1
   else
     stop_feeder "--role audio" || stop_rc=1
-    revoke_u32 "$DATA/audio" 0 || stop_rc=1
   fi
   stop_feeder tcp_pcm || stop_rc=1
+  revoke_u32 "$DATA/audio" 36 || stop_rc=1
+  revoke_u32 "$DATA/audio" 0 || stop_rc=1
   return "$stop_rc"
 }
 
@@ -776,7 +740,7 @@ arm_camera() {
     return 1
   fi
   if ! ensure_video; then
-    rm -f "$CONTROL/camera.lease"
+    rm -f "$CONTROL/camera.lease" "$DATA/video_mode"
     if [ ! -e "$CONTROL/photo.lease" ]; then
       stop_video_passthrough
       unload_camera_hook
@@ -792,10 +756,7 @@ arm_camera() {
 disarm_camera() {
   rm -f "$CONTROL/camera.lease" "$DATA/video_mode" || return 1
   if [ ! -e "$CONTROL/photo.lease" ]; then
-    disarm_rc=0
-    stop_video_passthrough || disarm_rc=1
-    unload_camera_hook || disarm_rc=1
-    return "$disarm_rc"
+    stop_video_passthrough
   fi
 }
 
@@ -821,10 +782,7 @@ arm_photo() {
 disarm_photo() {
   rm -f "$CONTROL/photo.lease" "$DATA/photo_mode" || return 1
   if [ ! -e "$CONTROL/camera.lease" ]; then
-    disarm_rc=0
-    stop_video_passthrough || disarm_rc=1
-    unload_camera_hook || disarm_rc=1
-    return "$disarm_rc"
+    stop_video_passthrough
   fi
 }
 
@@ -867,9 +825,11 @@ stop_all() {
     "$CONTROL/mic.lease" "$MIC_MODE" "$DATA/photo_mode" "$DATA/video_mode" || stop_all_rc=1
   # A partial transaction can leave a feeder from the previous source.
   # Recovery must cover every owned feeder regardless of the saved plan.
+  # The mode flags gate callbacks immediately. Join the writers before
+  # clearing the headers because each publication sets the channel READY.
+  stop_feeder "" || stop_all_rc=1
   revoke_u32 "$DATA/feed" 48 || stop_all_rc=1
   revoke_u32 "$DATA/audio" 36 || stop_all_rc=1
-  stop_feeder "" || stop_all_rc=1
   revoke_u32 "$DATA/feed" 0 || stop_all_rc=1
   revoke_u32 "$DATA/audio" 0 || stop_all_rc=1
   unload_camera_hook || stop_all_rc=1
@@ -924,23 +884,17 @@ print_status() {
   visual_mode=$(current_visual_mode)
   audio_mode=$(current_audio_mode)
   source_mode=$(current_source_mode)
-  obs_bind=$(current_obs_bind)
   obs_configured=0
-  if { [ "$visual_mode" = obs ] || [ "$audio_mode" = obs ]; } &&
-     valid_obs_token; then
+  if obs_url=$(current_obs_url); then
     obs_configured=1
   fi
-  if obs_pid=$(find_feed_pid "--role obs") && feeder_owns_listener "$obs_pid" 078F; then
-    obs_listener=1
-  else
-    obs_listener=0
-  fi
+  find_feed_pid "--role obs" >/dev/null 2>&1 && obs_pull=1 || obs_pull=0
 
   visual_kind=$(config_value visual_kind 2>/dev/null)
   case "$visual_kind" in video|image) ;; *) visual_kind=none ;; esac
   if [ "$visual_mode" = obs ]; then
     visual_source_ready=$obs_configured
-    if [ "$obs_listener" = "1" ] &&
+    if [ "$obs_pull" = "1" ] &&
        { find_feed_pid "--role obs-video" >/dev/null 2>&1 ||
          find_feed_pid "--role obs-av" >/dev/null 2>&1; }; then
       video_feed=1
@@ -954,7 +908,7 @@ print_status() {
 
   if [ "$audio_mode" = obs ]; then
     audio_source_ready=$obs_configured
-    if [ "$obs_listener" = "1" ] &&
+    if [ "$obs_pull" = "1" ] &&
        { find_feed_pid "--role obs-audio" >/dev/null 2>&1 ||
          find_feed_pid "--role obs-av" >/dev/null 2>&1; }; then
       audio_feed=1
@@ -986,8 +940,8 @@ print_status() {
   say "visual_source_ready=$visual_source_ready"
   say "audio_source_ready=$audio_source_ready"
   say "obs_configured=$obs_configured"
-  say "obs_listener_ready=$obs_listener"
-  say "obs_bind=$obs_bind"
+  say "obs_pull_running=$obs_pull"
+  say "obs_address=${obs_url%%\?*}"
   say "camera_enabled=$camera_enabled"
   say "photo_enabled=$photo_enabled"
   say "mic_enabled=$audio_enabled"

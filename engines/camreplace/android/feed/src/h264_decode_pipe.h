@@ -28,7 +28,7 @@
 
 // Shared H.264 → NV21 → /data/cr/feed pipeline.
 // Both the TCP-frame transport (tcp_h264_feed.cpp) and the legacy opt-in
-// direct-RTMP listener (rtmp_h264_feed.cpp) feed the same decoder/SHM
+// RTMP playback client (rtmp_h264_feed.cpp) feed the same decoder/SHM
 // path: identical AMediaCodec setup, identical NV12→NV21 swap, identical
 // triple-buffered shm publishing.
 // This header exposes a tiny C++ API that wraps that pipeline so the
@@ -208,16 +208,21 @@ struct ShmOut
     cur_wi = next;
   }
 
+  void revoke_frame()
+  {
+    if (map && mapped >= sizeof(cr_feed_header))
+    {
+      auto* hd = static_cast<cr_feed_header*>(map);
+      atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_NONE,
+                            memory_order_release);
+    }
+  }
+
   void shutdown()
   {
     if (map)
     {
-      if (mapped >= sizeof(cr_feed_header))
-      {
-        auto* hd = static_cast<cr_feed_header*>(map);
-        atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_NONE,
-                              memory_order_release);
-      }
+      revoke_frame();
       munmap(map, mapped);
       map = nullptr;
       mapped = 0;
@@ -580,6 +585,7 @@ public:
   {
     return out_count;
   }
+  void revoke_frame() { shm.revoke_frame(); }
 
 private:
   AMediaCodec* dec = nullptr;

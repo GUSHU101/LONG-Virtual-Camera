@@ -121,7 +121,7 @@ class LsposedModuleContractTests(unittest.TestCase):
             for node in root.findall("uses-permission")
         }
         self.assertEqual(
-            {"android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE"},
+            {"android.permission.INTERNET"},
             permissions,
         )
         application = root.find("application")
@@ -200,23 +200,27 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertRegex(fingerprint, r"^[a-f0-9]{64}$")
         self.assertNotIn("upload-artifact", (workflows / "quality.yml").read_text())
 
-    def test_status_excludes_obs_key_and_default_is_loopback(self) -> None:
+    def test_obs_runtime_pulls_without_exposing_uri_credentials(self) -> None:
         script = (MODULE / "payload/longvc-control.sh").read_text(encoding="utf-8")
-        self.assertNotIn('say "obs_stream_key=', script)
-        self.assertIn("rtmp:listen:1935:config:", script)
-        self.assertIn("*) say loopback", script)
+        feed = ROOT / "engines/camreplace/android/feed/src/rtmp_h264_feed.cpp"
+        native = feed.read_text(encoding="utf-8")
+        self.assertIn("rtmp:pull:config:", script)
+        self.assertIn(r'say "obs_address=${obs_url%%\?*}"', script)
+        self.assertIn('say "obs_pull_running=$obs_pull"', script)
+        self.assertNotIn("rtmp:listen:", script)
+        self.assertNotIn("bind(", native)
+        self.assertIn("connect(fd,", native)
 
-    def test_obs_panel_uses_phone_addresses_and_separate_audio_selection(self) -> None:
+    def test_obs_panel_accepts_relay_url_and_separate_audio_selection(self) -> None:
         app = MODULE / "java/com/gushu/longvc"
         activity = (app / "MainActivity.java").read_text(encoding="utf-8")
         controller = (app / "RootController.java").read_text(encoding="utf-8")
         sources = (app / "MediaSourceManager.java").read_text(encoding="utf-8")
-        self.assertNotIn("adb forward", activity)
-        self.assertIn("NetworkCapabilities.TRANSPORT_WIFI", activity)
+        self.assertIn("obsUrlInput.getText()", activity)
         self.assertIn("obsAudioSwitch.isChecked()", activity)
         self.assertIn('useObsAudio ? "obs" : "local"', sources)
-        self.assertIn("obsSettingsMatch(allowLan, obsAudio)", controller)
-        self.assertIn("rootController::revealObsKey", activity)
+        self.assertIn("obsSettingsMatch(url, obsAudio)", controller)
+        self.assertNotIn("obs_token", sources)
 
     def test_camera_hook_targets_only_cameraserver(self) -> None:
         script = (MODULE / "payload/longvc-control.sh").read_text(encoding="utf-8")
@@ -226,6 +230,10 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertIn('hook_pid cameraserver "$CAM_READY"', script)
         self.assertIn('strcmp(process, "cameraserver") != 0', native)
         self.assertIn("Camera3OutputStream21queueBufferToConsumer", native)
+        init = native.split("int cr_camhook_init(const char* feed_url)", 1)[1].split(
+            "int cr_camhook_shutdown()", 1
+        )[0]
+        self.assertNotIn("resolve_runtime_ops", init)
 
     def test_picker_result_is_not_blocked_by_startup_refresh(self) -> None:
         activity = (MODULE / "java/com/gushu/longvc/MainActivity.java").read_text(

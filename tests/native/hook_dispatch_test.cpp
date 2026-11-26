@@ -20,21 +20,21 @@ int main()
 
   calls = 0;
   const auto ok = cr::camhook::dispatch_queue(
-      counters,
+      counters, true,
       [] { return cr::camhook::ReplacementOutcome::YuvWritten; },
       original_ok, 0);
   assert(ok == 0 && calls == 1);
 
   calls = 0;
   const auto bad_value = cr::camhook::dispatch_queue(
-      counters,
+      counters, true,
       [] { return cr::camhook::ReplacementOutcome::PassThrough; },
       original_ok, -22);
   assert(bad_value == -22 && calls == 1);
 
   calls = 0;
   const auto no_memory = cr::camhook::dispatch_queue(
-      counters,
+      counters, true,
       [] { return cr::camhook::ReplacementOutcome::AttemptedFailed; },
       original_ok, -12);
   assert(no_memory == -12 && calls == 1);
@@ -46,7 +46,7 @@ int main()
   assert(counters.original_queue_failed.load() == 2);
 
   const auto refused = cr::camhook::dispatch_queue(
-      counters,
+      counters, true,
       [] { return cr::camhook::ReplacementOutcome::YuvWritten; },
       original_ok, -32);
   assert(refused == -32);
@@ -54,19 +54,30 @@ int main()
   assert(counters.original_queue_failed.load() == 3);
 
   const auto jpeg = cr::camhook::dispatch_queue(
-      counters,
+      counters, true,
       [] { return cr::camhook::ReplacementOutcome::JpegWritten; },
       original_ok, 0);
   assert(jpeg == 0 && counters.jpeg_queued.load() == 1);
 
   using Original = std::int32_t (*)(int);
   const auto missing = cr::camhook::dispatch_queue(
-      counters,
+      counters, true,
       [] {
         assert(false && "a buffer must not be written without a queue target");
         return cr::camhook::ReplacementOutcome::JpegWritten;
       },
       static_cast<Original>(nullptr), 0);
   assert(missing == -19);
+  const auto recorded_callbacks = counters.callback_seen.load();
+  calls = 0;
+  const auto paused = cr::camhook::dispatch_queue(
+      counters, false,
+      [] {
+        assert(false && "a paused camera must not touch source or output buffers");
+        return cr::camhook::ReplacementOutcome::YuvWritten;
+      },
+      original_ok, -21);
+  assert(paused == -21 && calls == 1);
+  assert(counters.callback_seen.load() == recorded_callbacks);
   return 0;
 }

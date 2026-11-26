@@ -23,7 +23,6 @@ import java.nio.ByteOrder;
 import java.security.MessageDigest;
 import java.security.DigestInputStream;
 import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -67,39 +66,42 @@ final class MediaSourceManager {
         return prepareMedia(requireInput(uri), size, "audio", "");
     }
 
-    void configureObs(boolean allowLan, boolean obsAudio) throws IOException, InterruptedException {
+    void configureObs(String requestedUrl, boolean obsAudio) throws IOException, InterruptedException {
         ensureStorage();
         SourceSnapshot current = readConfig();
-        String token = current.config.obsToken.isEmpty()
-                ? newObsKey() : current.config.obsToken;
-        commitConfig(current, current.config.withObs(token,
-                allowLan ? "lan" : "loopback", obsAudio));
+        String url = resolveObsUrl(requestedUrl, current.config);
+        commitConfig(current, current.config.withObs(url, obsAudio));
     }
 
-    boolean obsSettingsMatch(boolean allowLan, boolean obsAudio)
+    boolean obsSettingsMatch(String requestedUrl, boolean obsAudio)
             throws IOException, InterruptedException {
         SourceConfig config = readConfig().config;
+        String url = resolveObsUrl(requestedUrl, config);
         return "obs".equals(config.visualMode)
                 && obsAudio == "obs".equals(config.audioMode)
-                && (allowLan ? "lan" : "loopback").equals(config.obsBind);
+                && url.equals(config.obsUrl);
     }
 
-    String readObsKey() throws IOException, InterruptedException {
-        SourceConfig config = readConfig().config;
-        if (!config.usesObs()) throw new IOException("OBS 输入尚未配置");
-        return config.obsToken;
+    private static String resolveObsUrl(String requested, SourceConfig config) throws IOException {
+        String url = requested.trim();
+        if (url.isEmpty()) url = config.obsUrl;
+        if (!validObsUrl(url)) throw new IOException("请输入电脑的 RTMP 拉流地址，例如 rtmp://192.168.1.10:1935/longvc");
+        return url;
     }
 
-    void rotateObsKey() throws IOException, InterruptedException {
-        SourceSnapshot current = readConfig();
-        if (!current.config.usesObs()) throw new IOException("OBS 输入尚未配置");
-        commitConfig(current, current.config.withObsKey(newObsKey()));
-    }
-
-    private static String newObsKey() {
-        byte[] random = new byte[32];
-        new SecureRandom().nextBytes(random);
-        return hex(random);
+    private static boolean validObsUrl(String url) {
+        if (url.length() > 512 || !url.matches("[!-~]+")) return false;
+        try {
+            java.net.URI uri = java.net.URI.create(url);
+            return "rtmp".equals(uri.getScheme()) && uri.getHost() != null
+                    && uri.getRawUserInfo() == null && uri.getRawFragment() == null
+                    && !uri.getRawAuthority().endsWith(":")
+                    && (uri.getPort() == -1 || uri.getPort() >= 1 && uri.getPort() <= 65535)
+                    && uri.getRawPath().length() > 1 && !uri.getRawPath().endsWith("/")
+                    && !uri.getRawPath().startsWith("//");
+        } catch (IllegalArgumentException invalid) {
+            return false;
+        }
     }
 
     private PreparedMedia prepareMedia(InputStream source, long declaredSize,
@@ -481,20 +483,17 @@ final class MediaSourceManager {
         final String visualPath;
         final String audioMode;
         final String audioPath;
-        final String obsBind;
-        final String obsToken;
+        final String obsUrl;
         final String generation;
 
         SourceConfig(String visualMode, String visualKind, String visualPath,
-                     String audioMode, String audioPath, String obsBind,
-                     String obsToken) {
+                     String audioMode, String audioPath, String obsUrl) {
             this.visualMode = visualMode;
             this.visualKind = visualKind;
             this.visualPath = visualPath;
             this.audioMode = audioMode;
             this.audioPath = audioPath;
-            this.obsBind = obsBind;
-            this.obsToken = obsToken;
+            this.obsUrl = obsUrl;
             this.generation = Long.toUnsignedString(System.nanoTime());
         }
 
@@ -513,7 +512,7 @@ final class MediaSourceManager {
             }
             if (values.size() == 1 && "2".equals(values.get("schema"))) {
                 return new SourceConfig("local", "none", "", "local", "",
-                        "loopback", "");
+                        "");
             }
             if (!"2".equals(values.get("schema"))) {
                 throw new IOException("unsupported source configuration schema");
@@ -523,47 +522,32 @@ final class MediaSourceManager {
             String visualPath = values.getOrDefault("visual_path", "");
             String audioMode = values.getOrDefault("audio_mode", "local");
             String audioPath = values.getOrDefault("audio_path", "");
-            String obsBind = values.getOrDefault("obs_bind", "loopback");
-            String obsToken = values.getOrDefault("obs_token", "");
+            String obsUrl = values.getOrDefault("obs_url", "");
             if (!modeValid(visualMode) || !modeValid(audioMode)
                     || !("none".equals(visualKind) || "video".equals(visualKind)
                     || "image".equals(visualKind))
-                    || !("loopback".equals(obsBind) || "lan".equals(obsBind))
                     || (!visualPath.isEmpty() && !validMediaPath(visualPath, "visual"))
                     || (!audioPath.isEmpty() && !validMediaPath(audioPath, "audio"))
-                    || (!obsToken.isEmpty() && !obsToken.matches("[0-9a-f]{64}"))) {
+                    || (!obsUrl.isEmpty() && !validObsUrl(obsUrl))) {
                 throw new IOException("invalid source configuration");
             }
-            if (("obs".equals(visualMode) || "obs".equals(audioMode))
-                    && obsToken.isEmpty()) {
-                throw new IOException("OBS source is missing its authentication token");
-            }
             return new SourceConfig(visualMode, visualKind, visualPath, audioMode,
-                    audioPath, obsBind, obsToken);
+                    audioPath, obsUrl);
         }
 
         SourceConfig withVisual(String kind, String path) {
             return new SourceConfig("local", kind, path, audioMode, audioPath,
-                    obsBind, obsToken);
+                    obsUrl);
         }
 
         SourceConfig withAudio(String path) {
             return new SourceConfig(visualMode, visualKind, visualPath, "local",
-                    path, obsBind, obsToken);
+                    path, obsUrl);
         }
 
-        boolean usesObs() {
-            return "obs".equals(visualMode) || "obs".equals(audioMode);
-        }
-
-        SourceConfig withObs(String token, String bind, boolean useObsAudio) {
+        SourceConfig withObs(String url, boolean useObsAudio) {
             return new SourceConfig("obs", visualKind, visualPath, useObsAudio ? "obs" : "local",
-                    audioPath, bind, token);
-        }
-
-        SourceConfig withObsKey(String token) {
-            return new SourceConfig(visualMode, visualKind, visualPath, audioMode,
-                    audioPath, obsBind, token);
+                    audioPath, url);
         }
 
         String serialize() {
@@ -574,8 +558,7 @@ final class MediaSourceManager {
                     + "visual_path=" + visualPath + "\n"
                     + "audio_mode=" + audioMode + "\n"
                     + "audio_path=" + audioPath + "\n"
-                    + "obs_bind=" + obsBind + "\n"
-                    + "obs_token=" + obsToken + "\n";
+                    + "obs_url=" + obsUrl + "\n";
         }
 
         static boolean validMediaPath(String path, String type) {

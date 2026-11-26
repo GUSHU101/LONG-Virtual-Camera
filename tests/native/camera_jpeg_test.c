@@ -56,5 +56,25 @@ int main(void)
   uint32_t written = 0;
   memcpy(&written, blob + tail + 4, sizeof(written));
   assert(written == length);
+
+  const uint8_t rotated_jpeg[] = {
+      0xff, 0xd8, 0xff, 0xe1, 0, 0x22, 'E', 'x', 'i', 'f', 0, 0,
+      'M', 'M', 0, 42, 0, 0, 0, 8, 0, 1,
+      0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0, 0xff, 0xd9};
+  memcpy(blob, rotated_jpeg, sizeof(rotated_jpeg));
+  const uint32_t original_size = sizeof(rotated_jpeg);
+  memcpy(blob + tail + 4, &original_size, sizeof(original_size));
+  assert(cr_replace_camera_jpeg(blob, sizeof(blob), jpeg, length) == 0);
+  assert(memcmp(blob + 6, "Exif\0\0", 6) == 0);
+  assert(blob[30] == 6); // Retains a 90-degree clockwise display rotation.
+  assert(memcmp(blob + 38, jpeg + 2, length - 2) == 0);
+  memcpy(&written, blob + tail + 4, sizeof(written));
+  assert(written == length + 36);
+
+  memcpy(blob, rotated_jpeg, sizeof(rotated_jpeg));
+  blob[8] = 'X'; // A different APP1 type contributes no orientation.
+  memcpy(blob + tail + 4, &original_size, sizeof(original_size));
+  assert(cr_replace_camera_jpeg(blob, sizeof(blob), jpeg, length) == 0);
+  assert(memcmp(blob, jpeg, length) == 0);
   free(jpeg);
 }

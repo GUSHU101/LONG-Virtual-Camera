@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -81,7 +82,10 @@ public:
   {
     return transfer(static_cast<unsigned char*>(data), length, POLLIN,
         [this](auto* ptr, std::size_t count) {
-          return ::recv(fd_, ptr, count, MSG_DONTWAIT);
+          const auto bytes = ::recv(fd_, ptr, count, MSG_DONTWAIT);
+          if (bytes > 0)
+            received_ += static_cast<std::uint64_t>(bytes);
+          return bytes;
         });
   }
 
@@ -94,6 +98,8 @@ public:
   }
 
   void finish_startup() noexcept { deadline_ = Clock::time_point::max(); }
+  void set_io_timeout(Clock::duration timeout) noexcept { io_timeout_ = timeout; }
+  std::uint64_t received() const noexcept { return received_; }
 
 private:
   template <class Byte, class Operation>
@@ -152,6 +158,7 @@ private:
   const std::atomic<bool>& stop_;
   Clock::duration io_timeout_;
   Clock::time_point deadline_;
+  mutable std::uint64_t received_ = 0;
 };
 
 } // namespace cr::feed

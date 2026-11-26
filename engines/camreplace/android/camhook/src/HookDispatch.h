@@ -41,9 +41,11 @@ struct HookCounters
 // replacement side effect runs first, but may never suppress, duplicate or
 // rewrite the original status_t value.
 template <class ReplaceFn, class OriginalFn, class... Args>
-std::int32_t dispatch_queue(HookCounters& counters, ReplaceFn&& replace,
+std::int32_t dispatch_queue(HookCounters& counters, bool enabled, ReplaceFn&& replace,
                             OriginalFn original, Args&&... args) noexcept
 {
+  if (!enabled)
+    return original ? original(std::forward<Args>(args)...) : -19;
   counters.callback_seen.fetch_add(1, std::memory_order_relaxed);
   // A missing original target cannot submit a buffer. Avoid modifying it.
   if (!original)

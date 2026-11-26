@@ -33,7 +33,7 @@
  * Installs the cameraserver-side camera-frame replacement hook.
  *
  * cr_camhook_init maps the feed shared-memory file, selects the configured
- * NV21 scaler, resolves compatible camera buffer APIs, and installs a
+ * NV21 scaler, and installs a
  * ShadowHook proxy for a supported Camera3OutputStream queue method. The
  * proxy validates the mapped feed header, locks the destination buffer,
  * scales the latest committed NV21 frame into it, and calls the original
@@ -596,6 +596,10 @@ static void resolve_runtime_ops()
 {
   if (g_runtime_preview_ready.load(std::memory_order_acquire))
     return;
+  static std::atomic<std::uint32_t> attempts{0};
+  if ((attempts.fetch_add(1, std::memory_order_relaxed) % 30) != 0)
+    return;
+
   std::unique_lock<std::shared_mutex> lock(g_runtime_ops_mu);
   if (ahb_planes_ready() || gbm_ready())
   {
@@ -700,7 +704,7 @@ static bool inspect_anwb(const ANWB* anb, ANWBInfo& out)
   return true;
 }
 
-static void try_lazy_init()
+static void try_map_feed()
 {
   if (!g_shm_ready.load(std::memory_order_acquire))
   {
@@ -710,9 +714,6 @@ static void try_lazy_init()
       open_shm();
     }
   }
-  static std::atomic<int> runtime_attempt{0};
-  if ((runtime_attempt.fetch_add(1, std::memory_order_relaxed) % 30) == 0)
-    resolve_runtime_ops();
 }
 
 struct LockedView
@@ -1067,13 +1068,39 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   return true;
 }
 
-static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence, bool deferred)
+struct CameraModes
+{
+  bool video;
+  bool photo;
+
+  bool active() const { return video || photo; }
+};
+
+static CameraModes read_camera_modes(bool photo_supported)
+{
+  return {access("/data/cr/video_mode", R_OK) == 0,
+          photo_supported && access("/data/cr/photo_mode", R_OK) == 0};
+}
+
+static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
+                                                       CameraModes modes, bool deferred)
 {
   ANWBInfo bi;
   if (!inspect_anwb(anb, bi))
     return cr::camhook::ReplacementOutcome::PassThrough;
 
-  try_lazy_init();
+  const int fmt = bi.format;
+  if (fmt != 0x21 && fmt != 0x11 && fmt != 0x22 && fmt != 0x23)
+  {
+    ++g_stat_skip_fmt;
+    if (fmt == 0x25)
+      ++g_stat_skip_raw10;
+    return cr::camhook::ReplacementOutcome::PassThrough;
+  }
+  if (fmt == 0x21 ? !modes.photo || !refresh_photo_mode_() : !modes.video)
+    return cr::camhook::ReplacementOutcome::PassThrough;
+
+  try_map_feed();
   if (!g_shm_ready.load(std::memory_order_acquire))
   {
     ++g_stat_skip_noshm;
@@ -1114,41 +1141,17 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence, bool
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
-  // Runtime buffer-mapper pointers are retried lazily because vendor DSOs may
-  // appear after injection. Hold a shared lock for the complete lock/blit/
-  // unlock operation so no retry publishes a new function set mid-callback.
+  // Mapper initialization can call into Android services. Run it on a
+  // normal frame callback, after confirming that the current route is live.
+  resolve_runtime_ops();
+  // Keep the mapper's operations stable through lock, write and unlock.
   std::shared_lock<std::shared_mutex> runtime_ops(g_runtime_ops_mu);
 
-  const int fmt = bi.format;
-
   if (fmt == 0x21)
-  {
-    if (deferred)
-      return cr::camhook::ReplacementOutcome::PassThrough;
-    const bool photo_on = refresh_photo_mode_();
-    static std::atomic<int> blob_seen{0};
-    int bn = ++blob_seen;
-    if (bn <= 5 || (bn % 30) == 0)
-    {
-      LOGI(OBF("BLOB qbtc#%d %dx%d photo_mode=%s").c_str(), bn, bi.width, bi.height, photo_on ? "ON" : OBF("OFF").c_str());
-    }
-    if (photo_on)
-      return overwrite_blob_jpeg(anb, fence)
-                 ? cr::camhook::ReplacementOutcome::JpegWritten
-                 : cr::camhook::ReplacementOutcome::AttemptedFailed;
-    return cr::camhook::ReplacementOutcome::PassThrough;
-  }
+    return overwrite_blob_jpeg(anb, fence)
+               ? cr::camhook::ReplacementOutcome::JpegWritten
+               : cr::camhook::ReplacementOutcome::AttemptedFailed;
 
-  if (fmt != 0x11 && fmt != 0x22 && fmt != 0x23)
-  {
-    ++g_stat_skip_fmt;
-    if (fmt == 0x25)
-      ++g_stat_skip_raw10;
-    return cr::camhook::ReplacementOutcome::PassThrough;
-  }
-
-  if (access("/data/cr/video_mode", R_OK) != 0)
-    return cr::camhook::ReplacementOutcome::PassThrough;
   if (!ahb_planes_ready() && !gbm_ready())
   {
     ++g_stat_skip_nogbm;
@@ -1239,7 +1242,7 @@ static void* g_preview_spacer_stub = nullptr;
 static cr::camhook::HookCounters g_hook_counters;
 static cr::camhook::HookCounters g_preview_counters;
 
-static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
+static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence, CameraModes modes)
 {
   const std::uint64_t n = g_hook_counters.callback_seen.load(std::memory_order_relaxed);
   if (n <= 5 || (n % 60) == 0)
@@ -1252,7 +1255,7 @@ static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence)
          layout_ok ? bi.format : -1, layout_ok ? bi.handle : nullptr);
   }
 
-  return overwrite_nv21(anb, fence, false);
+  return overwrite_nv21(anb, fence, modes, false);
 }
 
 static void report_queue_stats() noexcept
@@ -1294,22 +1297,26 @@ static void report_queue_stats() noexcept
 static std::int32_t proxy_qbtc_surfaces(void* thiz, void* consumer, ANWB* anb,
                                         int fence, const std::vector<std::size_t>& surface_ids)
 {
+  const auto modes = read_camera_modes(true);
   const auto status = cr::camhook::dispatch_queue(
-      g_hook_counters, [=] { return replace_for_queue(anb, fence); },
+      g_hook_counters, modes.active(), [=] { return replace_for_queue(anb, fence, modes); },
       reinterpret_cast<qbtc_surfaces_t>(__atomic_load_n(&g_orig_qbtc_surfaces, __ATOMIC_ACQUIRE)),
       thiz, consumer, anb, fence, surface_ids);
-  report_queue_stats();
+  if (modes.active())
+    report_queue_stats();
   return status;
 }
 
 static std::int32_t proxy_qbtc_legacy(void* thiz, void* consumer, ANWB* anb,
                                       int fence)
 {
+  const auto modes = read_camera_modes(true);
   const auto status = cr::camhook::dispatch_queue(
-      g_hook_counters, [=] { return replace_for_queue(anb, fence); },
+      g_hook_counters, modes.active(), [=] { return replace_for_queue(anb, fence, modes); },
       reinterpret_cast<qbtc_legacy_t>(__atomic_load_n(&g_orig_qbtc_legacy, __ATOMIC_ACQUIRE)),
       thiz, consumer, anb, fence);
-  report_queue_stats();
+  if (modes.active())
+    report_queue_stats();
   return status;
 }
 
@@ -1317,14 +1324,15 @@ static std::int32_t proxy_preview_spacer(void* thiz, std::int64_t timestamp,
                                         std::int64_t readout_timestamp, std::int32_t transform,
                                         ANWB* anb, int fence)
 {
+  const auto modes = read_camera_modes(false);
   const auto status = cr::camhook::dispatch_queue(
-      g_preview_counters, [=] { return overwrite_nv21(anb, fence, true); },
+      g_preview_counters, modes.active(), [=] { return overwrite_nv21(anb, fence, modes, true); },
       reinterpret_cast<preview_spacer_t>(__atomic_load_n(&g_orig_preview_spacer, __ATOMIC_ACQUIRE)),
       thiz, timestamp, readout_timestamp, transform, anb, fence);
   // A successful return acknowledges the spacer's pending queue. Its worker
   // submits the buffer to the preview consumer asynchronously.
   const auto seen = g_preview_counters.callback_seen.load(std::memory_order_relaxed);
-  if (seen <= 5 || (seen % 30) == 0)
+  if (modes.active() && (seen <= 5 || (seen % 30) == 0))
     LOGI("camera_preview v1 seen=%llu staged=%llu queue_error=%llu",
          (unsigned long long) seen,
          (unsigned long long) g_preview_counters.yuv_queued.load(std::memory_order_relaxed),
@@ -1450,7 +1458,6 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
   resolve_scaler();
   resolve_photo_mode();
   open_shm();
-  resolve_runtime_ops();
 
   int hook_rc = -1;
   if (try_hook_primary() == 0)

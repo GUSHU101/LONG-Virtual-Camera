@@ -15,9 +15,8 @@ final class RuntimeState {
     final boolean visualSourceReady;
     final boolean audioSourceReady;
     final boolean obsConfigured;
-    final boolean obsListenerReady;
-    final String obsBind;
-    final String obsStreamKey;
+    final boolean obsPullRunning;
+    final String obsAddress;
     final boolean cameraEnabled;
     final boolean photoEnabled;
     final boolean micEnabled;
@@ -40,10 +39,8 @@ final class RuntimeState {
     final String abi;
     final String selinux;
     final String raw;
-    private final Map<String, String> values;
 
-    private RuntimeState(Map<String, String> values, String raw, String ephemeralObsKey) {
-        this.values = new LinkedHashMap<>(values);
+    private RuntimeState(Map<String, String> values, String raw) {
         this.root = flag(values, "root");
         this.installed = flag(values, "installed");
         this.controllerVerified = flag(values, "controller_verified");
@@ -54,9 +51,8 @@ final class RuntimeState {
         this.visualSourceReady = flag(values, "visual_source_ready");
         this.audioSourceReady = flag(values, "audio_source_ready");
         this.obsConfigured = flag(values, "obs_configured");
-        this.obsListenerReady = flag(values, "obs_listener_ready");
-        this.obsBind = values.getOrDefault("obs_bind", "loopback");
-        this.obsStreamKey = ephemeralObsKey == null ? "" : ephemeralObsKey;
+        this.obsPullRunning = flag(values, "obs_pull_running");
+        this.obsAddress = values.getOrDefault("obs_address", "");
         this.cameraEnabled = flag(values, "camera_enabled");
         this.photoEnabled = flag(values, "photo_enabled");
         this.micEnabled = flag(values, "mic_enabled");
@@ -101,7 +97,7 @@ final class RuntimeState {
         for (String key : new String[]{"camera_enabled", "photo_enabled", "mic_enabled",
                 "camera_hook_ready", "audio_hook_ready", "video_feeder_ready",
                 "audio_feeder_ready", "video_channel_ready", "audio_channel_ready",
-                "visual_source_ready", "audio_source_ready", "obs_listener_ready"}) {
+                "visual_source_ready", "audio_source_ready", "obs_pull_running"}) {
             String value = values.get(key);
             if (!"0".equals(value) && !"1".equals(value)) {
                 throw new IOException("missing or invalid controller status: " + key);
@@ -109,13 +105,13 @@ final class RuntimeState {
         }
         values.put("installed", hashesCurrent ? "1" : "0");
         values.put("controller_verified", controllerVerified ? "1" : "0");
-        return new RuntimeState(values, raw, "");
+        return new RuntimeState(values, raw);
     }
 
     static RuntimeState noRoot(String raw) {
         Map<String, String> values = new LinkedHashMap<>();
         values.put("root", "0");
-        return new RuntimeState(values, raw, "");
+        return new RuntimeState(values, raw);
     }
 
     boolean cameraHealthy() {
@@ -148,7 +144,7 @@ final class RuntimeState {
     boolean isStopped() {
         return root && controllerVerified && !cameraEnabled && !photoEnabled
                 && !micEnabled && !cameraHookReady && !audioHookReady
-                && !videoFeederReady && !audioFeederReady && !obsListenerReady
+                && !videoFeederReady && !audioFeederReady && !obsPullRunning
                 && !videoChannelReady && !audioChannelReady;
     }
 
@@ -162,11 +158,6 @@ final class RuntimeState {
 
     boolean audioUsesObs() {
         return "obs".equals(audioMode);
-    }
-
-    RuntimeState withObsStreamKey(String key) {
-        if (key == null || !key.matches("[0-9a-f]{64}")) return this;
-        return new RuntimeState(values, raw, key);
     }
 
     private static boolean flag(Map<String, String> values, String key) {

@@ -55,102 +55,36 @@ extern "C" int cr_feed_run_file_video(const char* path);
 extern "C" int cr_feed_run_file_nv21(const char* path);
 extern "C" int cr_feed_run_file_audio(const char* path);
 #if defined(CR_FEED_ENABLE_RTMP_DIRECT)
-extern "C" int cr_feed_run_rtmp(int port, const char* stream_key,
-                                int allow_lan, int enable_video,
-                                int enable_audio);
+extern "C" int cr_feed_run_rtmp_pull(const char* url, int video_enabled, int audio_enabled);
 #endif
 
 namespace
 {
 
-bool read_obs_key(std::string& key)
+#if defined(CR_FEED_ENABLE_RTMP_DIRECT)
+bool read_obs_url(std::string& url)
 {
   char config[4096];
-  const int fd = open("/data/cr/control/source.conf",
-                      O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const int fd = open("/data/cr/control/source.conf", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0)
     return false;
   const ssize_t count = read(fd, config, sizeof(config));
   close(fd);
   if (count <= 0 || static_cast<size_t>(count) == sizeof(config))
     return false;
-  const std::string text(config, static_cast<size_t>(count));
-  const std::string marker = "\nobs_token=";
+  const std::string_view text(config, static_cast<size_t>(count));
+  constexpr std::string_view marker = "\nobs_url=";
   const size_t start = text.find(marker);
-  if (start == std::string::npos)
+  if (start == std::string_view::npos)
     return false;
   const size_t value = start + marker.size();
   const size_t end = text.find('\n', value);
-  if (end == std::string::npos || end - value != 64)
+  if (end == std::string_view::npos || end == value || end - value > 512)
     return false;
-  key = text.substr(value, end - value);
+  url = text.substr(value, end - value);
   return true;
 }
-
-bool parse_rtmp_endpoint(const char* value, int& port, std::string& stream_key,
-                         bool& allow_lan, bool& enable_video,
-                         bool& enable_audio)
-{
-  if (!value)
-    return false;
-  const char* separator = strchr(value, ':');
-  if (!separator || separator == value || separator[1] == '\0')
-    return false;
-  std::string port_text(value, static_cast<size_t>(separator - value));
-  if (port_text.size() > 5)
-    return false;
-  for (char c : port_text)
-    if (!std::isdigit(static_cast<unsigned char>(c)))
-      return false;
-  port = atoi(port_text.c_str());
-  const char* key_begin = separator + 1;
-  const char* key_end = strchr(key_begin, ':');
-  if (!key_end)
-  {
-    // Compatibility with early phone-only payloads; the secure default is
-    // loopback and both tracks are accepted.
-    stream_key.assign(key_begin);
-    allow_lan = false;
-    enable_video = true;
-    enable_audio = true;
-  }
-  else
-  {
-    stream_key.assign(key_begin, static_cast<size_t>(key_end - key_begin));
-    const char* bind_begin = key_end + 1;
-    const char* bind_end = strchr(bind_begin, ':');
-    if (!bind_end || bind_end == bind_begin || bind_end[1] == '\0' ||
-        strchr(bind_end + 1, ':'))
-      return false;
-    const std::string bind_mode(bind_begin,
-                                static_cast<size_t>(bind_end - bind_begin));
-    const std::string tracks(bind_end + 1);
-    if (bind_mode == OBF("loopback").c_str())
-      allow_lan = false;
-    else if (bind_mode == OBF("lan").c_str())
-      allow_lan = true;
-    else
-      return false;
-    enable_video = tracks == OBF("video").c_str() ||
-                   tracks == OBF("av").c_str();
-    enable_audio = tracks == OBF("audio").c_str() ||
-                   tracks == OBF("av").c_str();
-    if (!enable_video && !enable_audio)
-      return false;
-  }
-  if (stream_key == "config" && !read_obs_key(stream_key))
-    return false;
-  if (port < 1 || port > 65535 || stream_key.size() < 24 ||
-      stream_key.size() > 96)
-    return false;
-  for (char c : stream_key)
-  {
-    const unsigned char u = static_cast<unsigned char>(c);
-    if (!std::isalnum(u) && c != '-' && c != '_')
-      return false;
-  }
-  return true;
-}
+#endif
 
 bool trusted_local_media_path(const char* value, std::string& canonical)
 {
@@ -209,22 +143,18 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_feed_run(c
       return cr_feed_run_tcp_nv21(port);
     }
 #if defined(CR_FEED_ENABLE_RTMP_DIRECT)
-    if (parse_scheme(feed_url, OBF("rtmp:listen:").c_str(), &arg))
+    if (parse_scheme(feed_url, "rtmp:pull:config:", &arg))
     {
-      int port = 0;
-      std::string stream_key;
-      bool allow_lan = false;
-      bool enable_video = false;
-      bool enable_audio = false;
-      if (!parse_rtmp_endpoint(arg, port, stream_key, allow_lan,
-                               enable_video, enable_audio))
+      const std::string_view tracks(arg);
+      const bool video = tracks == "video" || tracks == "av";
+      const bool audio = tracks == "audio" || tracks == "av";
+      std::string url;
+      if ((!video && !audio) || !read_obs_url(url))
       {
-        LOGE(OBF("rtmp endpoint is invalid").c_str());
+        LOGE("rtmp: desktop playback configuration missing");
         return -1;
       }
-      return cr_feed_run_rtmp(port, stream_key.c_str(), allow_lan ? 1 : 0,
-                              enable_video ? 1 : 0,
-                              enable_audio ? 1 : 0);
+      return cr_feed_run_rtmp_pull(url.c_str(), video, audio);
     }
 #endif
     if (parse_scheme(feed_url, OBF("tcp_pcm:listen:").c_str(), &arg))
@@ -269,7 +199,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_feed_run(c
     }
 
 #if defined(CR_FEED_ENABLE_RTMP_DIRECT)
-    LOGE(OBF("unsupported feed URL (local media, authenticated rtmp, or compatibility tcp)").c_str());
+    LOGE(OBF("unsupported feed URL (local media, desktop RTMP playback, or compatibility tcp)").c_str());
 #else
     LOGE(OBF("unsupported feed URL (local media or compatibility tcp)").c_str());
 #endif

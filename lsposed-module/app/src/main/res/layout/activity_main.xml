@@ -119,14 +119,17 @@
                     style="@style/BodyText"
                     android:layout_marginTop="5dp"
                     android:text="@string/obs_hint" />
-                <Switch
-                    android:id="@+id/obs_lan_switch"
+                <EditText
+                    android:id="@+id/obs_url_input"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
                     android:minHeight="48dp"
-                    android:text="@string/obs_lan_opt_in"
-                    android:textColor="@color/ink" />
+                    android:hint="@string/obs_url_hint"
+                    android:importantForAutofill="no"
+                    android:inputType="textUri"
+                    android:saveEnabled="false"
+                    android:singleLine="true" />
                 <Switch
                     android:id="@+id/obs_audio_switch"
                     android:layout_width="match_parent"
@@ -148,27 +151,6 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="10dp"
                     android:text="@string/configure_obs" />
-                <Button
-                    android:id="@+id/reveal_obs_button"
-                    style="@style/SecondaryButton"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:text="@string/obs_reveal" />
-                <Button
-                    android:id="@+id/copy_obs_button"
-                    style="@style/SecondaryButton"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:text="@string/copy_obs" />
-                <Button
-                    android:id="@+id/rotate_obs_button"
-                    style="@style/SecondaryButton"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:text="@string/obs_rotate" />
             </LinearLayout>
 
             <LinearLayout style="@style/Card" android:orientation="vertical">
