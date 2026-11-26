@@ -28,4 +28,29 @@ int main()
   assert(!cr::camhook::nv21_to_bggr10(red, 4, 2, raw, 4, 4));
   assert(!cr::camhook::nv21_to_bggr10(red, 4, 2, raw, 6, 2));
   assert(raw == before);
+
+  const std::array<float, 9> identity{{1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}};
+  cr::camhook::Raw10Color calibrated;
+  assert(cr::camhook::invert_sensor_color(identity, {2.f, 1.f, 1.f, 1.5f}, calibrated));
+  auto gray = neutral;
+  gray.fill(128);
+  assert(cr::camhook::nv21_to_bggr10(gray, 4, 2, raw, 4, 2, calibrated, true));
+  const auto unpack = [&raw](size_t start, size_t pixel) {
+    return static_cast<unsigned>(raw[start + pixel]) * 4 +
+           ((raw[start + 4] >> (pixel * 2)) & 3u);
+  };
+  const auto blue = unpack(0, 0) - 64, green = unpack(0, 1) - 64, red_value = unpack(5, 1) - 64;
+  assert(std::abs(blue * 1.5 - green) <= 1.5);
+  assert(std::abs(red_value * 2.0 - green) <= 1.0);
+  const auto saved = calibrated;
+  const std::array<float, 9> singular{};
+  assert(!cr::camhook::invert_sensor_color(singular, {1.f, 1.f, 1.f, 1.f}, calibrated));
+  assert(!cr::camhook::invert_sensor_color(identity, {0.f, 1.f, 1.f, 1.f}, calibrated));
+  assert(calibrated == saved);
+  assert(cr::camhook::nv21_to_bggr10(red, 4, 2, raw, 4, 2, {}, true));
+  const auto red_709 = raw;
+  assert(cr::camhook::nv21_to_bggr10(red, 4, 2, raw, 4, 2, {}, false));
+  assert(raw != red_709);
+  assert(cr::camhook::nv21_to_bggr10(gray, 4, 2, raw, 4, 2, {}, true, true));
+  assert(unpack(0, 0) < green + 64);
 }

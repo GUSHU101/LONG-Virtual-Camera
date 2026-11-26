@@ -22,6 +22,12 @@ extern "C"
 // the header struct changes.
 #define CR_FEED_SHM_VERSION 2
 
+// NV21 remains the byte layout. These bits describe the decoded samples.
+// A zero format is the original contract (BT.601 limited range).
+#define CR_FEED_COLOR_BT709 1u
+#define CR_FEED_COLOR_FULL_RANGE 2u
+#define CR_FEED_COLOR_FLAGS (CR_FEED_COLOR_BT709 | CR_FEED_COLOR_FULL_RANGE)
+
 #ifdef __cplusplus
 }
 #endif

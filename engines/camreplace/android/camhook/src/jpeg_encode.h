@@ -21,6 +21,9 @@ extern "C"
 
   int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int src_w, int src_h,
                       size_t dst_cap, int quality, uint8_t** out, size_t* out_written);
+  int cr_nv21_to_jpeg_color(const uint8_t* nv21, size_t src_size, int src_w, int src_h,
+                            size_t dst_cap, int quality, uint8_t** out, size_t* out_written,
+                            int bt709, int full_range);
 
   // Returns the encoded pixel dimensions of the original Camera3 JPEG.
   int cr_camera_jpeg_dimensions(const uint8_t* blob, size_t blob_size,

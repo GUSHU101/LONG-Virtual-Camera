@@ -193,7 +193,7 @@ struct ShmOut
     return true;
   }
 
-  bool publish_nv21(const uint8_t* src)
+  bool publish_nv21(const uint8_t* src, uint32_t color_flags = 0)
   {
     if (!map)
       return false;
@@ -201,6 +201,12 @@ struct ShmOut
     uint32_t next = 0;
     if (!cr_feed_claim_write(hd, cur_wi, &next))
       return false;
+    if (__atomic_load_n(&hd->format, __ATOMIC_RELAXED) != color_flags)
+    {
+      atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_NONE, memory_order_release);
+      __atomic_store_n(&hd->format, color_flags, __ATOMIC_RELEASE);
+      atomic_store(&hd->generation, cr_feed_next_generation(atomic_load(&hd->generation)));
+    }
     memcpy(slot0 + (size_t) next * CR_FEED_MAX_NV21_BYTES, src, slot_bytes);
     cr_feed_publish(hd, next);
     atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_READY,
@@ -303,6 +309,7 @@ public:
     (void) ensure_media_codec_binder_pool();
     w = ww;
     h = hh;
+    color_flags = (w >= 1280 || h >= 720) ? CR_FEED_COLOR_BT709 : 0u;
     if (!fit_source_geometry(w, h, output_w, output_h))
     {
       CR_FEED_LOGE(OBF("h264 pipe: rejected source geometry %dx%d").c_str(),
@@ -473,10 +480,21 @@ public:
       if (out_idx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED)
       {
         AMediaFormat* of = AMediaCodec_getOutputFormat(dec);
+        if (!of)
+          break;
         AMediaFormat_getInt32(of, OBF("color-format").c_str(), &color_format);
         AMediaFormat_getInt32(of, OBF("stride").c_str(), &y_stride);
         AMediaFormat_getInt32(of, OBF("slice-height").c_str(), &slice_height);
         uv_stride = y_stride;
+        // MediaFormat COLOR_STANDARD_BT709=1, COLOR_RANGE_FULL=1.
+        // Some codecs omit color-standard on untagged SDR H.264.
+        int32_t standard = 0, range = 0;
+        AMediaFormat_getInt32(of, "color-standard", &standard);
+        AMediaFormat_getInt32(of, "color-range", &range);
+        const bool hd = (w >= 1280 || h >= 720);
+        color_flags = (standard == 1 || (standard == 0 && hd) ? CR_FEED_COLOR_BT709 : 0u) |
+                      (range == 1 ? CR_FEED_COLOR_FULL_RANGE : 0u);
+        CR_FEED_LOGI("h264 color standard=%d range=%d shared_flags=%u", standard, range, color_flags);
         CR_FEED_LOGI(OBF("h264 out fmt: color=0x%x stride=%d slice=%d").c_str(), color_format, y_stride, slice_height);
         AMediaFormat_delete(of);
         continue;
@@ -573,7 +591,7 @@ public:
                          output_w, output_h, output_w, output_w, 0);
             published = scaled_nv21.data();
           }
-          if (shm.publish_nv21(published))
+          if (shm.publish_nv21(published, color_flags))
           {
             ++published_count;
             if (published_count <= 3 || (published_count % 120) == 0)
@@ -612,6 +630,7 @@ private:
   std::vector<uint8_t> scaled_nv21;
   uint64_t in_count = 0;
   uint64_t published_count = 0;
+  uint32_t color_flags = 0;
   uint64_t output_layout_warns = 0;
 };
 

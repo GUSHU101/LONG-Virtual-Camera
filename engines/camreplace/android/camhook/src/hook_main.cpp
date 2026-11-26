@@ -29,6 +29,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <vector>
@@ -66,6 +67,7 @@ struct PinnedSlot
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t slot_size = 0;
+  uint32_t color_flags = 0;
   uint64_t frame_seq = 0;
 
   ~PinnedSlot()
@@ -136,7 +138,7 @@ struct ShmView
         2ull;
     if (width == 0 || height == 0 || (width & 1u) || (height & 1u) ||
         width > CR_FEED_MAX_WIDTH || height > CR_FEED_MAX_HEIGHT ||
-        stride != width || format != 0 || slot_size == 0 ||
+        stride != width || (format & ~CR_FEED_COLOR_FLAGS) != 0 || slot_size == 0 ||
         min_slot == 0 || min_slot > slot_size ||
         slot_size > CR_FEED_MAX_NV21_BYTES || size < hdr || off > (size - hdr) ||
         slot_size > (size - hdr - off))
@@ -151,6 +153,7 @@ struct ShmView
     out.width = width;
     out.height = height;
     out.slot_size = slot_size;
+    out.color_flags = format;
     out.frame_seq = frame_seq;
     return true;
   }
@@ -180,7 +183,7 @@ static bool feed_header_sane(const cr_feed_header* h, size_t map_size)
     return false;
   if (width == 0 || height == 0 || (width & 1u) || (height & 1u) ||
       width > CR_FEED_MAX_WIDTH || height > CR_FEED_MAX_HEIGHT ||
-      stride != width || format != 0)
+      stride != width || (format & ~CR_FEED_COLOR_FLAGS) != 0)
   {
     return false;
   }
@@ -1052,8 +1055,9 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
       pixel_bytes = scaled.size();
     }
     uint8_t* encoded = nullptr;
-    const int result = cr_nv21_to_jpeg(pixels, pixel_bytes, target_w, target_h,
-                                      encode_cap, 85, &encoded, &jpeg.size);
+    const int result = cr_nv21_to_jpeg_color(pixels, pixel_bytes, target_w, target_h,
+        encode_cap, 85, &encoded, &jpeg.size, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
+        (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0);
     if (result != 0)
     {
       const int n = ++g_stat_blob_too_big;
@@ -1083,6 +1087,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   if (access("/data/cr/photo_mode", R_OK) != 0 ||
       atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
           CR_CHANNEL_STATE_READY ||
+      atomic_load_explicit(&source.header->generation, memory_order_acquire) != source.generation ||
       cr_replace_camera_jpeg(static_cast<uint8_t*>(vaddr), buf_capacity,
                              jpeg.data.get(), jpeg.size) != 0)
     return false;
@@ -1118,6 +1123,200 @@ static constexpr std::array<Raw10Layout, 3> kPixel5RawLayouts{{
 static bool g_pixel5_raw10 = false;
 static std::atomic<unsigned> g_raw10_written{0};
 static std::atomic<unsigned> g_raw10_lock_failed{0};
+static std::atomic<unsigned> g_raw10_no_color{0};
+
+// Android 14 camera_capture_result and camera_metadata_ro_entry ABIs on
+// the reviewed Pixel 5 build. Read only the metadata owned by this callback.
+struct CameraCaptureResult
+{
+  uint32_t frame_number;
+  const void* metadata;
+  uint32_t output_count;
+  const void* output_buffers;
+  const void* input_buffer;
+  uint32_t partial_result;
+  uint32_t physical_count;
+  const char* const* physical_ids;
+  const void* const* physical_metadata;
+};
+struct CameraMetadataEntry
+{
+  size_t index;
+  uint32_t tag;
+  uint8_t type;
+  size_t count;
+  const void* data;
+};
+struct MetadataRational
+{
+  int32_t numerator, denominator;
+};
+static_assert(offsetof(CameraCaptureResult, physical_metadata) == 56);
+static_assert(offsetof(CameraMetadataEntry, data) == 24);
+using FindCameraMetadata = int (*)(const void*, uint32_t, CameraMetadataEntry*);
+static FindCameraMetadata g_find_camera_metadata = nullptr;
+using ProcessCameraResult = void (*)(void*, const CameraCaptureResult*);
+using ReturnCameraBuffer = int32_t (*)(void*, const void*, int64_t, int64_t, bool, int32_t,
+                                       const std::vector<size_t>&, void*);
+static void* g_orig_camera_result = nullptr;
+static void* g_orig_camera_return = nullptr;
+static void* g_camera_result_hook = nullptr;
+static void* g_camera_return_hook = nullptr;
+
+struct CaptureColor
+{
+  int64_t timestamp = 0;
+  std::optional<cr::camhook::Raw10Color> logical;
+  std::array<std::optional<cr::camhook::Raw10Color>, 2> rear;
+};
+static std::mutex g_capture_colors_mutex;
+static std::array<CaptureColor, 64> g_capture_colors;
+static size_t g_capture_color_next = 0;
+static thread_local int64_t g_return_sensor_timestamp = 0;
+
+static std::optional<cr::camhook::Raw10Color> capture_color(const void* metadata)
+{
+  constexpr uint32_t kColorTransform = 0x00000001;
+  constexpr uint32_t kColorGains = 0x00000002;
+  CameraMetadataEntry gains{}, matrix{};
+  if (!metadata ||
+      g_find_camera_metadata(metadata, kColorGains, &gains) != 0 ||
+      gains.type != 2 || gains.count != 4 || !gains.data ||
+      g_find_camera_metadata(metadata, kColorTransform, &matrix) != 0 ||
+      matrix.type != 5 || matrix.count != 9 || !matrix.data)
+    return {};
+  std::array<float, 4> balance{};
+  memcpy(balance.data(), gains.data, sizeof(balance));
+  const auto* entries = static_cast<const MetadataRational*>(matrix.data);
+  std::array<float, 9> transform{};
+  for (size_t i = 0; i < transform.size(); ++i)
+  {
+    if (entries[i].denominator == 0)
+      return {};
+    transform[i] = static_cast<float>(entries[i].numerator) / entries[i].denominator;
+  }
+  cr::camhook::Raw10Color color;
+  return cr::camhook::invert_sensor_color(transform, balance, color)
+             ? std::optional{color} : std::nullopt;
+}
+
+static void observe_capture_color(const CameraCaptureResult& result)
+{
+  constexpr uint32_t kSensorTimestamp = 0x000e0010;
+  CameraMetadataEntry timestamp{};
+  if (!result.metadata || g_find_camera_metadata(result.metadata, kSensorTimestamp, &timestamp) != 0 ||
+      timestamp.type != 3 || timestamp.count != 1 || !timestamp.data)
+    return;
+  CaptureColor color;
+  memcpy(&color.timestamp, timestamp.data, sizeof(color.timestamp));
+  if (color.timestamp <= 0)
+    return;
+  color.logical = capture_color(result.metadata);
+  if (result.physical_count <= 4 && result.physical_ids && result.physical_metadata)
+    for (size_t index = 0; index < result.physical_count; ++index)
+    {
+      const char* id = result.physical_ids[index];
+      if (id && strcmp(id, "2") == 0)
+        color.rear[0] = capture_color(result.physical_metadata[index]);
+      else if (id && strcmp(id, "3") == 0)
+        color.rear[1] = capture_color(result.physical_metadata[index]);
+    }
+  if (!color.logical && !color.rear[0] && !color.rear[1])
+    return;
+  std::lock_guard lock(g_capture_colors_mutex);
+  g_capture_colors[g_capture_color_next] = color;
+  g_capture_color_next = (g_capture_color_next + 1) % g_capture_colors.size();
+}
+
+static void proxy_camera_result(void* states, const CameraCaptureResult* result)
+{
+  const auto original = reinterpret_cast<ProcessCameraResult>(
+      __atomic_load_n(&g_orig_camera_result, __ATOMIC_ACQUIRE));
+  if (!original)
+    return;
+  if (result && g_find_camera_metadata && access("/data/cr/photo_mode", R_OK) == 0)
+    observe_capture_color(*result);
+  original(states, result);
+}
+
+static int32_t proxy_camera_return(void* stream, const void* buffer, int64_t timestamp,
+                                    int64_t readout, bool output, int32_t transform,
+                                    const std::vector<size_t>& surface_ids, void* release_fence)
+{
+  const auto original = reinterpret_cast<ReturnCameraBuffer>(
+      __atomic_load_n(&g_orig_camera_return, __ATOMIC_ACQUIRE));
+  if (!original)
+    return -ENOSYS;
+  const int64_t previous = g_return_sensor_timestamp;
+  g_return_sensor_timestamp = timestamp;
+  const auto status = original(stream, buffer, timestamp, readout, output, transform,
+                               surface_ids, release_fence);
+  g_return_sensor_timestamp = previous;
+  return status;
+}
+
+static std::optional<cr::camhook::Raw10Color> camera_color_for_buffer(size_t profile)
+{
+  if (g_return_sensor_timestamp <= 0)
+    return {};
+  std::lock_guard lock(g_capture_colors_mutex);
+  const CaptureColor* best = nullptr;
+  int64_t nearest = 100'000'001;
+  for (const auto& color : g_capture_colors)
+  {
+    if (color.timestamp <= 0)
+      continue;
+    const int64_t distance = std::abs(color.timestamp - g_return_sensor_timestamp);
+    if (distance < nearest)
+    {
+      best = &color;
+      nearest = distance;
+    }
+  }
+  if (!best)
+    return {};
+  if (profile < best->rear.size() && best->rear[profile])
+    return best->rear[profile];
+  return best->logical;
+}
+
+static void remove_camera_color_hooks()
+{
+  if (g_camera_return_hook)
+  {
+    shadowhook_unhook(g_camera_return_hook);
+    g_camera_return_hook = nullptr;
+  }
+  if (g_camera_result_hook)
+  {
+    shadowhook_unhook(g_camera_result_hook);
+    g_camera_result_hook = nullptr;
+  }
+}
+
+static bool install_camera_color_hooks()
+{
+  void* metadata = dlopen("libcamera_metadata.so", RTLD_NOW | RTLD_NOLOAD);
+  if (!metadata)
+    return false;
+  g_find_camera_metadata = reinterpret_cast<FindCameraMetadata>(
+      dlsym(metadata, "find_camera_metadata_ro_entry"));
+  dlclose(metadata);
+  if (!g_find_camera_metadata)
+    return false;
+  g_camera_result_hook = shadowhook_hook_sym_name("libcameraservice.so",
+      "_ZN7android7camera320processCaptureResultERNS0_19CaptureOutputStatesEPKNS0_21camera_capture_resultE",
+      reinterpret_cast<void*>(proxy_camera_result), &g_orig_camera_result);
+  g_camera_return_hook = shadowhook_hook_sym_name("libcameraservice.so",
+      "_ZN7android7camera319Camera3OutputStream25returnBufferCheckedLockedERKNS0_20camera_stream_bufferEllbiRKNSt3__16vectorImNS5_9allocatorImEEEEPNS_2spINS_5FenceEEE",
+      reinterpret_cast<void*>(proxy_camera_return), &g_orig_camera_return);
+  if (g_camera_result_hook && g_camera_return_hook &&
+      __atomic_load_n(&g_orig_camera_result, __ATOMIC_ACQUIRE) &&
+      __atomic_load_n(&g_orig_camera_return, __ATOMIC_ACQUIRE))
+    return true;
+  remove_camera_color_hooks();
+  return false;
+}
 
 struct Raw10Frame
 {
@@ -1150,7 +1349,8 @@ public:
     slots_ = {};
   }
 
-  std::shared_ptr<const Raw10Frame> get(size_t profile, const PinnedSlot& source)
+  std::shared_ptr<const Raw10Frame> get(size_t profile, const PinnedSlot& source,
+                                        const cr::camhook::Raw10Color& color)
   {
     std::lock_guard lock(mutex_);
     if (!enabled_)
@@ -1159,12 +1359,14 @@ public:
     const auto now = monotonic_ns();
     constexpr int64_t kRefreshNs = 250'000'000LL;
     if (slot.generation != source.generation ||
-        (slot.sequence != source.frame_seq && now - slot.requested >= kRefreshNs))
+        ((slot.sequence != source.frame_seq || slot.color != color) &&
+         now - slot.requested >= kRefreshNs))
     {
       if (!worker_.joinable())
         worker_ = std::thread(&Raw10Cache::run, this);
       slot.generation = source.generation;
       slot.sequence = source.frame_seq;
+      slot.color = color;
       slot.requested = now;
       slot.pending = true;
       changed_.notify_one();
@@ -1184,6 +1386,7 @@ private:
     uint64_t sequence = 0;
     int64_t requested = 0;
     bool pending = false;
+    cr::camhook::Raw10Color color;
   };
 
   void run() noexcept
@@ -1192,6 +1395,7 @@ private:
     {
       size_t profile;
       uint32_t generation;
+      cr::camhook::Raw10Color color;
       {
         std::unique_lock lock(mutex_);
         const auto has_pending = [](const Slot& slot) { return slot.pending; };
@@ -1205,6 +1409,7 @@ private:
           profile = (profile + 1) % slots_.size();
         slots_[profile].pending = false;
         generation = slots_[profile].generation;
+        color = slots_[profile].color;
         next_ = (profile + 1) % slots_.size();
       }
       try
@@ -1221,7 +1426,9 @@ private:
         result->pixels.reset(new uint8_t[size]);
         result->generation = generation;
         if (!cr::camhook::nv21_to_bggr10({source.data, source.slot_size}, source.width,
-                                        source.height, {result->pixels.get(), size}, width, height))
+                                        source.height, {result->pixels.get(), size}, width, height,
+                                        color, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
+                                        (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0))
           continue;
         result->prepared = monotonic_ns();
         std::lock_guard lock(mutex_);
@@ -1283,7 +1490,16 @@ static bool overwrite_raw10(ANWB* anb, const ANWBInfo& bi, int fence)
   if (!g_shm.pin_current(source) || !frame_is_fresh(source))
     return false;
 
-  const auto cache = g_raw10_cache.get(static_cast<size_t>(layout - kPixel5RawLayouts.begin()), source);
+  const auto profile = static_cast<size_t>(layout - kPixel5RawLayouts.begin());
+  const auto color = camera_color_for_buffer(profile);
+  if (!color)
+  {
+    const auto skipped = ++g_raw10_no_color;
+    if (skipped <= 3)
+      LOGW("camera RAW10: waiting for capture color calibration");
+    return false;
+  }
+  const auto cache = g_raw10_cache.get(profile, source, *color);
   if (!cache)
     return false;
   const size_t row_bytes = static_cast<size_t>(width / 4) * 5;
@@ -1862,8 +2078,6 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
   resolve_scaler();
   resolve_photo_mode();
   g_pixel5_raw10 = pixel5_stock_android14();
-  if (g_pixel5_raw10)
-    g_raw10_cache.enable();
   open_shm();
 
   int hook_rc = -1;
@@ -1871,6 +2085,13 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
   {
     try_hook_preview_spacer();
     try_hook_video_encoder_buffers();
+    if (g_pixel5_raw10)
+    {
+      if (install_camera_color_hooks())
+        g_raw10_cache.enable();
+      else
+        LOGW("camera RAW10: capture metadata ABI unavailable");
+    }
     hook_rc = 0;
   }
   else
@@ -1916,6 +2137,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_sh
   if (!g_installed.exchange(false))
     return 0;
   g_raw10_cache.stop();
+  remove_camera_color_hooks();
   if (g_camera_surface_usage_stub)
   {
     shadowhook_unhook(g_camera_surface_usage_stub);

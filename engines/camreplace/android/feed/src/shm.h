@@ -44,7 +44,7 @@ extern "C"
     uint32_t stride;             // == width for NV21
     uint32_t slot_size;          // bytes per slot = width*height*3/2
     uint32_t num_slots;          // >= 1
-    uint32_t format;             // 0 = NV21
+    uint32_t format;             // NV21 with CR_FEED_COLOR_* flags
     atomic_uint write_index;     // last slot a writer fully committed
     atomic_uint generation;      // bumped on any feed-shape change
     atomic_ullong frame_counter; // monotonic, ++'d per commit

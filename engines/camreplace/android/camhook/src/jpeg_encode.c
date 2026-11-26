@@ -7,7 +7,7 @@
 // Pipeline per encode call:
 //   1. Allocate w*h*3 byte RGB scratch on heap (~6 MB at 1080p, ~36 MB
 //      at 4K — fine inside cameraserver, freed immediately).
-//   2. NV21 → RGB888 conversion (BT.601 limited-range Y'CbCr math).
+//   2. NV21 → RGB888 conversion with the feed's SDR matrix and range.
 //   3. Encode into a bounded scratch buffer. The camera buffer remains
 //      untouched until the caller has a complete JPEG.
 
@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "jpeg_encode.h"
+#include "YuvColor.h"
 struct EncodeCtx
 {
   uint8_t* dst;
@@ -69,10 +70,12 @@ static inline int clampi(int v, int lo, int hi)
 // NV21 → RGB888. NV21 is Y plane (sw*sh bytes) followed by interleaved
 // V,U pairs at half-resolution ((sw/2)*(sh/2) pairs * 2 bytes). The
 // chroma row index is y/2; the chroma byte pair starts at (x/2)*2.
-static void nv21_to_rgb24(const uint8_t* nv21, int sw, int sh, uint8_t* rgb)
+static void nv21_to_rgb24(const uint8_t* nv21, int sw, int sh, uint8_t* rgb,
+                           int bt709, int full_range)
 {
   const uint8_t* y_plane = nv21;
   const uint8_t* vu_plane = nv21 + (size_t) sw * sh;
+  const cr_yuv_coefficients yuv = cr_yuv_coefficients_for(bt709, full_range);
   for (int y = 0; y < sh; ++y)
   {
     const int sy_uv = y >> 1;
@@ -85,13 +88,12 @@ static void nv21_to_rgb24(const uint8_t* nv21, int sw, int sh, uint8_t* rgb)
       const int Y = yr[x];
       const int V = vu[sx_uv + 0];
       const int U = vu[sx_uv + 1];
-      // BT.601 limited-range YUV → RGB.
-      const int C = Y - 16;
+      const int C = yuv.y_scale * (Y - yuv.y_offset);
       const int D = U - 128;
       const int E = V - 128;
-      int R = (298 * C + 409 * E + 128) >> 8;
-      int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
-      int B = (298 * C + 516 * D + 128) >> 8;
+      int R = (C + yuv.red_v * E + 128) >> 8;
+      int G = (C - yuv.green_u * D - yuv.green_v * E + 128) >> 8;
+      int B = (C + yuv.blue_u * D + 128) >> 8;
       drow[x * 3 + 0] = (uint8_t) clampi(R, 0, 255);
       drow[x * 3 + 1] = (uint8_t) clampi(G, 0, 255);
       drow[x * 3 + 2] = (uint8_t) clampi(B, 0, 255);
@@ -99,8 +101,9 @@ static void nv21_to_rgb24(const uint8_t* nv21, int sw, int sh, uint8_t* rgb)
   }
 }
 
-int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int sw, int sh,
-                    size_t dst_cap, int quality, uint8_t** out, size_t* out_written)
+int cr_nv21_to_jpeg_color(const uint8_t* nv21, size_t src_size, int sw, int sh,
+                          size_t dst_cap, int quality, uint8_t** out, size_t* out_written,
+                          int bt709, int full_range)
 {
   if (out)
     *out = NULL;
@@ -118,7 +121,7 @@ int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int sw, int sh,
   uint8_t* rgb = (uint8_t*) malloc(pixels * 3);
   if (!rgb)
     return -2;
-  nv21_to_rgb24(nv21, sw, sh, rgb);
+  nv21_to_rgb24(nv21, sw, sh, rgb, bt709, full_range);
 
   struct EncodeCtx ctx = {0};
   ctx.limit = dst_cap;
@@ -134,6 +137,12 @@ int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int sw, int sh,
   *out = ctx.dst;
   *out_written = ctx.off;
   return 0;
+}
+
+int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int sw, int sh,
+                    size_t dst_cap, int quality, uint8_t** out, size_t* out_written)
+{
+  return cr_nv21_to_jpeg_color(nv21, src_size, sw, sh, dst_cap, quality, out, out_written, 0, 0);
 }
 
 struct CameraJpegTrailer
