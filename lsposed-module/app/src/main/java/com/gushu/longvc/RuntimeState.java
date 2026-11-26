@@ -30,6 +30,7 @@ final class RuntimeState {
     final long cameraWrittenJpeg;
     final long cameraQueuedYuv;
     final long cameraQueuedJpeg;
+    final long cameraRecordingQueued;
     final long cameraQueueErrors;
     final long cameraPreviewSeen;
     final long cameraPreviewStaged;
@@ -66,6 +67,7 @@ final class RuntimeState {
         this.cameraWrittenJpeg = counter(values, "camera_written_jpeg");
         this.cameraQueuedYuv = counter(values, "camera_queued_yuv");
         this.cameraQueuedJpeg = counter(values, "camera_queued_jpeg");
+        this.cameraRecordingQueued = counter(values, "camera_recording_queued");
         this.cameraQueueErrors = counter(values, "camera_queue_errors");
         this.cameraPreviewSeen = counter(values, "camera_preview_seen");
         this.cameraPreviewStaged = counter(values, "camera_preview_staged");

@@ -539,6 +539,10 @@ public final class MainActivity extends Activity
                     .append(" 帧（共 ").append(state.cameraPreviewSeen).append(" 次回调，提交失败 ")
                     .append(state.cameraPreviewErrors).append(" 次）。");
         }
+        if (state.cameraRecordingQueued > 0) {
+            summary.append("\n录像编码队列累计接收 ").append(state.cameraRecordingQueued)
+                    .append(" 帧替换视频。");
+        }
         return summary.toString();
     }
 

@@ -59,6 +59,11 @@ int main()
       original_ok, 0);
   assert(jpeg == 0 && counters.jpeg_queued.load() == 1);
 
+  const auto record = [] { return cr::camhook::ReplacementOutcome::RecordingYuvWritten; };
+  assert(cr::camhook::dispatch_queue(counters, true, record, original_ok, 0) == 0);
+  assert(cr::camhook::dispatch_queue(counters, true, record, original_ok, -32) == -32);
+  assert(counters.yuv_queued.load() == 2 && counters.recording_queued.load() == 1);
+
   using Original = std::int32_t (*)(int);
   const auto missing = cr::camhook::dispatch_queue(
       counters, true,

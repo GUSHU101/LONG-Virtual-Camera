@@ -291,31 +291,55 @@ inline bool parse_avc_decoder_config(std::span<const std::uint8_t> data,
 
 inline bool avcc_access_unit_to_annexb(std::span<const std::uint8_t> data,
                                        std::uint8_t length_size,
-                                       std::vector<std::uint8_t>& out)
+                                       std::vector<std::uint8_t>& out,
+                                       std::span<const std::uint8_t> prefix)
 {
-  if (length_size != 1 && length_size != 2 && length_size != 4)
+  if (data.empty() || (length_size != 1 && length_size != 2 && length_size != 4))
     return false;
 
-  std::vector<std::uint8_t> converted;
-  converted.reserve(data.size() + 16);
-  std::size_t cursor = 0;
-  while (cursor < data.size())
+  const auto next_nalu = [&](std::size_t& cursor) -> std::span<const std::uint8_t>
   {
     if (data.size() - cursor < length_size)
-      return false;
+      return {};
     std::uint32_t nalu_size = 0;
     for (std::uint8_t i = 0; i < length_size; ++i)
       nalu_size = (nalu_size << 8u) | data[cursor + i];
     cursor += length_size;
     if (nalu_size == 0 || nalu_size > data.size() - cursor)
-      return false;
-    if (!append_annexb_nalu(data.subspan(cursor, nalu_size), converted))
-      return false;
+      return {};
+    const auto nalu = data.subspan(cursor, nalu_size);
     cursor += nalu_size;
+    return nalu;
+  };
+
+  // Validate before touching out, so a truncated unit preserves prior output.
+  // The receive and prefix storage must remain distinct from the destination.
+  std::size_t size = prefix.size();
+  for (std::size_t cursor = 0; cursor < data.size();)
+  {
+    const auto nalu = next_nalu(cursor);
+    if (nalu.empty() || size > out.max_size() - 4 ||
+        nalu.size() > out.max_size() - size - 4)
+      return false;
+    size += 4 + nalu.size();
   }
-  if (converted.empty())
+  out.reserve(size);
+  out.clear();
+  if (!prefix.empty())
+    out.insert(out.end(), prefix.begin(), prefix.end());
+  for (std::size_t cursor = 0; cursor < data.size();)
+    append_annexb_nalu(next_nalu(cursor), out);
+  return true;
+}
+
+inline bool avcc_access_unit_to_annexb(std::span<const std::uint8_t> data,
+                                       std::uint8_t length_size,
+                                       std::vector<std::uint8_t>& out)
+{
+  std::vector<std::uint8_t> converted;
+  if (!avcc_access_unit_to_annexb(data, length_size, converted, {}))
     return false;
-  out = std::move(converted);
+  out.swap(converted);
   return true;
 }
 

@@ -1247,19 +1247,29 @@ static cr::camhook::ReplacementOutcome replace_for_queue(ANWB* anb, int fence, C
          layout_ok ? bi.format : -1, layout_ok ? bi.handle : nullptr);
   }
 
-  return overwrite_nv21(anb, fence, modes, false);
+  using Outcome = cr::camhook::ReplacementOutcome;
+  const auto outcome = overwrite_nv21(anb, fence, modes, false);
+  if (outcome == Outcome::YuvWritten &&
+      anb->common.version >= static_cast<int32_t>(sizeof(ANWB)) &&
+      (anb->usage & AHARDWAREBUFFER_USAGE_VIDEO_ENCODE) != 0)
+    return Outcome::RecordingYuvWritten;
+  return outcome;
 }
 
 static void report_queue_stats() noexcept
 {
   const std::uint64_t n = g_hook_counters.callback_seen.load(std::memory_order_relaxed);
   if (n <= 5 || (n % 30) == 0)
+  {
     LOGI(OBF("camera_output v2 yuv=%d jpeg=%d raw10=%d unsupported=%d queued_yuv=%llu queued_jpeg=%llu queue_error=%llu").c_str(),
          g_stat_blit_ok.load(), g_stat_blob_ok.load(), g_stat_skip_raw10.load(),
          g_stat_skip_fmt.load(),
          (unsigned long long) g_hook_counters.yuv_queued.load(),
          (unsigned long long) g_hook_counters.jpeg_queued.load(),
          (unsigned long long) g_hook_counters.original_queue_failed.load());
+    if (const auto recording = g_hook_counters.recording_queued.load(); recording != 0)
+      LOGI("camera_recording v1 queued=%llu", static_cast<unsigned long long>(recording));
+  }
 
   if ((n % 60) == 0)
   {

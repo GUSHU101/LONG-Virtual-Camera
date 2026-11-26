@@ -8,6 +8,8 @@ The shared video buffer has a fixed pixel budget. ReCam-derived SPS geometry and
 
 Media files are written under content-addressed names, verified by length and SHA-256, and referenced from a single atomically renamed source manifest. Video and audio selections have separate fields. The OBS feeder opens an outbound RTMP playback session to a configured relay. It reads the URL from the protected source manifest. Status output omits any URL query parameters, and the process arguments contain only the requested track combination.
 
+The RTMP reader keeps one bounded buffer per chunk stream and reuses the AVC conversion buffer across frames. It discards aborted messages, sends acknowledgements during large reads, and clears the media channel when playback ends or fresh video stops. Geometry comes from the H.264 SPS when available. RTMP metadata supplies a fallback for streams without readable SPS dimensions.
+
 Emergency recovery runs separately from ordinary app operations. The controller attempts all cleanup steps, verifies feeder exit and service recovery, and reports error if any step fails. Root process cleanup and the device-side wait remain bounded. The platform and root manager determine whether subordinate processes can be fully cleaned up after a forced interruption.
 
 Quality CI runs Python contract checks, controller fault injection, native geometry and ring tests, APK lint, signing checks and packaged payload verification. Official release builds require signing secrets. Testing Android vendor buffer access, concurrent camera clients, microphone restoration, stream reconnect and long-running stability requires a device.

@@ -858,6 +858,7 @@ camera_output_stats() {
       split($4, preview_staged, "=")
       split($5, preview_errors, "=")
     }
+    /^camera_recording v1 queued=[0-9]+$/ { split($3, recording, "=") }
     END {
       if (found) {
         print "camera_written_yuv=" yuv[2]
@@ -875,6 +876,7 @@ camera_output_stats() {
         print "camera_preview_staged=" preview_staged[2]
         print "camera_preview_errors=" preview_errors[2]
       }
+      if (recording[2] != "") print "camera_recording_queued=" recording[2]
     }'
 }
 

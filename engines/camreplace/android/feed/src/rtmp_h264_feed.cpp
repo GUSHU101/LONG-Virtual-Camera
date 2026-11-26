@@ -3,6 +3,7 @@
 #include "h264_decode_pipe.h"
 #include "aac_decode_pipe.h"
 #include "interruptible_socket.h"
+#include "RtmpChunks.h"
 #include "media/Avcc.h"
 #include "media/RtmpAddress.h"
 
@@ -21,12 +22,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <thread>
 #include <chrono>
 #include <cmath>
-#include <map>
 #include <new>
 #include <random>
 #include <string>
@@ -44,20 +45,12 @@ extern std::atomic<bool> g_stop;
 namespace
 {
 
-constexpr size_t kMaxRtmpMessageBytes = 8u * 1024u * 1024u;
-constexpr size_t kMaxBufferedRtmpBytes = 24u * 1024u * 1024u;
-constexpr size_t kMaxChunkStreams = 64u;
-constexpr uint32_t kMaxInboundChunkBytes = 1024u * 1024u;
 constexpr unsigned kMaxAmfDepth = 16u;
 constexpr size_t kMaxStartupBytes = 1024u * 1024u;
 constexpr auto kStartupTimeout = std::chrono::seconds(12);
 constexpr auto kLiveIoTimeout = std::chrono::seconds(3);
 constexpr auto kVideoFrameTimeout = std::chrono::seconds(2);
 
-inline uint32_t be24(const uint8_t* p)
-{
-  return (p[0] << 16) | (p[1] << 8) | p[2];
-}
 inline uint32_t be32(const uint8_t* p)
 {
   return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) | (uint32_t) p[3];
@@ -122,6 +115,30 @@ struct Amf0Reader
     return true;
   }
   bool skip_value(unsigned depth = 0);
+
+  bool read_string_property(std::string_view key, std::string& value)
+  {
+    if (peek_type() == 0x03)
+      ++p;
+    else if (peek_type() == 0x08 && has(5))
+      p += 5;
+    else
+      return false;
+    while (has(2))
+    {
+      const size_t length = (size_t{p[0]} << 8) | p[1];
+      p += 2;
+      if (length == 0 || !has(length))
+        return false;
+      const std::string_view name(reinterpret_cast<const char*>(p), length);
+      p += length;
+      if (name == key)
+        return read_string(value);
+      if (!skip_value())
+        return false;
+    }
+    return false;
+  }
 
   bool skip_object_body(unsigned depth)
   {
@@ -314,27 +331,46 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   if (!send_command(connection, 0, connect))
     return false;
 
-  // ---- Chunk stream loop -----------------------------------------------
-  uint32_t in_chunk_size = 128;
+  cr::feed::RtmpChunkReader reader;
   uint32_t ack_window = 0;
+  uint32_t advertised_peer_window = 0;
   uint64_t last_ack = 0;
-
-  struct MsgHdr
+  auto acknowledge = [&]()
   {
-    uint32_t timestamp = 0;
-    uint32_t timestamp_delta = 0;
-    uint32_t length = 0;
-    uint8_t type = 0;
-    uint32_t stream_id = 0;
-    bool extended_timestamp = false;
-    bool valid = false;
+    const uint64_t received = connection.received();
+    if (ack_window == 0 || received - last_ack < ack_window)
+      return true;
+    uint8_t ack[4];
+    put_be32(ack, static_cast<uint32_t>(received));
+    if (!send_message(connection, 0x03, 0, ack, sizeof(ack)))
+      return false;
+    last_ack = received;
+    return true;
   };
-  std::map<uint32_t, MsgHdr> last_hdrs;
-  std::map<uint32_t, std::vector<uint8_t>> partial;
+  auto read_with_ack = [&](uint8_t* data, size_t size)
+  {
+    while (size != 0)
+    {
+      if (!acknowledge())
+        return false;
+      size_t take = size;
+      if (ack_window != 0)
+        take = static_cast<size_t>(std::min<uint64_t>(
+            size, ack_window - (connection.received() - last_ack)));
+      if (!connection.receive(data, take))
+        return false;
+      data += take;
+      size -= take;
+    }
+    return acknowledge();
+  };
 
   std::vector<uint8_t> sps_pps_annexb;
+  std::vector<uint8_t> annexb;
   uint8_t avcc_nalu_length_size = 0;
   int stream_w = 0, stream_h = 0;
+  int metadata_w = 0, metadata_h = 0;
+  bool geometry_from_sps = false;
   int stream_fps_hint = 30;
   bool pipe_started = false;
   int pipe_w = 0, pipe_h = 0;
@@ -347,7 +383,6 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   bool connection_accepted = false;
   uint32_t play_stream_id = 0;
   bool receiving_media = false;
-  size_t startup_bytes = 0;
   uint64_t last_decoded = 0;
   auto last_frame = std::chrono::steady_clock::time_point::min();
   bool video_ready = false;
@@ -394,206 +429,69 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
-    // --- Basic header -------------------------------------------------
-    uint8_t bh0;
-    if (!connection.receive(&bh0, 1))
+    cr::feed::RtmpMessage message;
+    const auto result = reader.read(read_with_ack, message);
+    if (result == cr::feed::RtmpChunkResult::Closed)
       break;
-    uint32_t fmt = bh0 >> 6;
-    uint32_t cs_id = bh0 & 0x3f;
-    if (cs_id == 0)
+    if (result == cr::feed::RtmpChunkResult::Invalid)
     {
-      uint8_t ext;
-      if (!connection.receive(&ext, 1))
-        break;
-      cs_id = 64u + ext;
-    }
-    else if (cs_id == 1)
-    {
-      uint8_t ext[2];
-      if (!connection.receive(ext, 2))
-        break;
-      cs_id = 64u + (uint32_t) ext[0] + ((uint32_t) ext[1] << 8);
-    }
-
-    // --- Message header ----------------------------------------------
-    auto header_it = last_hdrs.find(cs_id);
-    if (header_it == last_hdrs.end())
-    {
-      if (fmt != 0 || last_hdrs.size() >= kMaxChunkStreams)
-      {
-        LOGW(OBF("rtmp: invalid or excessive chunk stream").c_str());
-        return false;
-      }
-      header_it = last_hdrs.emplace(cs_id, MsgHdr{}).first;
-      partial.emplace(cs_id, std::vector<uint8_t>{});
-    }
-    MsgHdr& last = header_it->second;
-    auto& buf = partial.at(cs_id);
-    const bool first_chunk = buf.empty();
-    if (!first_chunk && fmt != 3)
-    {
-      LOGW(OBF("rtmp: new message header before prior message completed").c_str());
+      LOGW("rtmp: invalid chunk headers or receive budget exceeded");
       return false;
     }
-
-    if (fmt == 0)
+    if (!receiving_media && (connection.received() > kMaxStartupBytes ||
+                            std::chrono::steady_clock::now() > startup_deadline))
     {
-      uint8_t h[11];
-      if (!connection.receive(h, 11))
-        break;
-      const uint32_t raw_timestamp = be24(h);
-      last.timestamp = raw_timestamp;
-      last.length = be24(h + 3);
-      last.type = h[6];
-      last.stream_id = (uint32_t) h[7] | ((uint32_t) h[8] << 8) |
-                       ((uint32_t) h[9] << 16) |
-                       ((uint32_t) h[10] << 24);
-      last.timestamp_delta = 0;
-      last.extended_timestamp = raw_timestamp == 0xffffffu;
-      if (last.extended_timestamp)
-      {
-        uint8_t ext[4];
-        if (!connection.receive(ext, 4))
-          break;
-        last.timestamp = be32(ext);
-      }
-      last.valid = true;
-    }
-    else if (fmt == 1)
-    {
-      if (!last.valid)
-        return false;
-      uint8_t h[7];
-      if (!connection.receive(h, 7))
-        break;
-      const uint32_t raw_delta = be24(h);
-      uint32_t delta = raw_delta;
-      last.length = be24(h + 3);
-      last.type = h[6];
-      last.extended_timestamp = raw_delta == 0xffffffu;
-      if (last.extended_timestamp)
-      {
-        uint8_t ext[4];
-        if (!connection.receive(ext, 4))
-          break;
-        delta = be32(ext);
-      }
-      last.timestamp_delta = delta;
-      last.timestamp += delta;
-    }
-    else if (fmt == 2)
-    {
-      if (!last.valid)
-        return false;
-      uint8_t h[3];
-      if (!connection.receive(h, 3))
-        break;
-      const uint32_t raw_delta = be24(h);
-      uint32_t delta = raw_delta;
-      last.extended_timestamp = raw_delta == 0xffffffu;
-      if (last.extended_timestamp)
-      {
-        uint8_t ext[4];
-        if (!connection.receive(ext, 4))
-          break;
-        delta = be32(ext);
-      }
-      last.timestamp_delta = delta;
-      last.timestamp += delta;
-    }
-    else
-    {
-      if (!last.valid)
-        return false;
-      if (last.extended_timestamp)
-      {
-        uint8_t ignored[4];
-        if (!connection.receive(ignored, 4))
-          break;
-      }
-      if (first_chunk)
-        last.timestamp += last.timestamp_delta;
-    }
-
-    if (last.length > kMaxRtmpMessageBytes || buf.size() > last.length)
-    {
-      LOGW(OBF("rtmp: message exceeds parser budget").c_str());
+      LOGW("rtmp: play startup deadline exceeded");
       return false;
     }
-
-    // --- Chunk payload ------------------------------------------------
-    const uint32_t remaining =
-        last.length - static_cast<uint32_t>(buf.size());
-    const uint32_t take = remaining < in_chunk_size ? remaining : in_chunk_size;
-    size_t buffered = 0;
-    for (const auto& entry : partial)
-    {
-      if (entry.second.size() > kMaxBufferedRtmpBytes - buffered)
-        return false;
-      buffered += entry.second.size();
-    }
-    if (take > kMaxBufferedRtmpBytes - buffered)
-      return false;
-    size_t old_size = buf.size();
-    buf.resize(old_size + take);
-    if (take > 0)
-    {
-      if (!connection.receive(buf.data() + old_size, take))
-        goto done;
-    }
-    if (!receiving_media)
-    {
-      startup_bytes += take;
-      if (startup_bytes > kMaxStartupBytes ||
-          std::chrono::steady_clock::now() > startup_deadline)
-      {
-        LOGW(OBF("rtmp: play startup deadline exceeded").c_str());
-        return false;
-      }
-    }
-
-    const uint64_t received = connection.received();
-    if (ack_window && received - last_ack >= ack_window)
-    {
-      uint8_t ack[4];
-      put_be32(ack, static_cast<uint32_t>(received));
-      if (!send_message(connection, 0x03, 0, ack, sizeof(ack)))
-        goto done;
-      last_ack = received;
-    }
-
-    if (buf.size() < last.length)
+    if (result == cr::feed::RtmpChunkResult::Incomplete)
       continue;
 
-    // --- Full message — dispatch -------------------------------------
     {
-      const uint8_t type = last.type;
-      std::vector<uint8_t> body = std::move(buf);
-      buf.clear();
-
+      const uint8_t type = message.type;
+      auto body = message.body;
       switch (type)
       {
-      case 0x01:
-      { // Set Chunk Size
-        if (body.size() >= 4)
+      case 0x01: // Set Chunk Size
+        if (body.size() != 4 || !reader.set_chunk_size(be32(body.data())))
+          goto done;
+        break;
+
+      case 0x02: // Abort one partially assembled message.
+        if (body.size() == 4)
+          reader.abort(be32(body.data()));
+        break;
+
+      case 0x04: // User Control
+        if (body.size() == 6 && body[0] == 0)
         {
-          uint32_t ns = be32(body.data()) & 0x7fffffff;
-          if (ns > 0 && ns <= kMaxInboundChunkBytes)
-            in_chunk_size = ns;
+          if (body[1] == 1 && play_stream_id != 0 && be32(body.data() + 2) == play_stream_id)
+            goto done; // Stream EOF
+          if (body[1] == 6)
+          {
+            body[1] = 7;
+            if (!send_message(connection, 0x04, 0, body.data(), body.size()))
+              goto done;
+          }
         }
         break;
-      }
-      case 0x04:
-        if (body.size() == 6 && body[0] == 0 && body[1] == 6)
-        {
-          body[1] = 7;
-          if (!send_message(connection, 0x04, 0, body.data(), body.size()))
-            goto done;
-        }
-        break;
-      case 0x05:
+
+      case 0x05: // Window Acknowledgement Size
         if (body.size() == 4 && be32(body.data()) != 0)
-          ack_window = std::max(be32(body.data()), 65536u);
+          ack_window = be32(body.data());
+        break;
+
+      case 0x06: // Set Peer Bandwidth
+        if (body.size() == 5 && body[4] <= 2)
+        {
+          const uint32_t window = be32(body.data());
+          if (window != 0 && window != advertised_peer_window)
+          {
+            if (!send_message(connection, 0x05, 0, body.data(), 4))
+              goto done;
+            advertised_peer_window = window;
+          }
+        }
         break;
 
       case 0x11:
@@ -608,7 +506,22 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
         if (!r.read_string(name) || !r.read_double(transaction))
           break;
         if (name == "_error")
+        {
+          LOGW("rtmp: server rejected the playback request");
           goto done;
+        }
+        if (name == "onStatus" && play_stream_id != 0 &&
+            message.stream_id == play_stream_id)
+        {
+          std::string code;
+          if (r.skip_value() && r.read_string_property("code", code) &&
+              (code == "NetStream.Play.StreamNotFound" || code == "NetStream.Play.Failed" ||
+               code == "NetStream.Play.Stop" || code == "NetStream.Play.UnpublishNotify"))
+          {
+            LOGI("rtmp: requested stream ended or is unavailable");
+            goto done;
+          }
+        }
         if (name == "_result" && transaction == 1 && !connection_accepted)
         {
           std::vector<uint8_t> create;
@@ -641,7 +554,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
       case 0x12:
       case 0x0f:
       { // AMF data (onMetaData)
-        if (play_stream_id == 0 || last.stream_id != play_stream_id || body.empty())
+        if (play_stream_id == 0 || message.stream_id != play_stream_id || body.empty())
           break;
         const uint8_t* p0 = body.data();
         const uint8_t* pe = body.data() + body.size();
@@ -694,9 +607,9 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
                 if (!std::isfinite(d))
                   continue;
                 if (key == OBF("width").c_str() && d >= 16.0 && d <= 8192.0)
-                  stream_w = static_cast<int>(d);
+                  metadata_w = static_cast<int>(d);
                 else if (key == OBF("height").c_str() && d >= 16.0 && d <= 8192.0)
-                  stream_h = static_cast<int>(d);
+                  metadata_h = static_cast<int>(d);
                 else if ((key == OBF("framerate").c_str() || key == "fps") &&
                          d >= 1.0 && d <= 240.0)
                   stream_fps_hint = static_cast<int>(d + 0.5);
@@ -709,8 +622,11 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
             }
             break;
           }
-          if (enable_video && stream_w > 0 && stream_h > 0)
+          if (enable_video && !geometry_from_sps && avcc_nalu_length_size != 0 &&
+              metadata_w > 0 && metadata_h > 0)
           {
+            stream_w = metadata_w;
+            stream_h = metadata_h;
             LOGI(OBF("rtmp meta: %dx%d @%d fps").c_str(), stream_w, stream_h, stream_fps_hint);
             try_start_pipe();
           }
@@ -720,7 +636,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
 
       case 0x08:
       { // audio (FLV)
-        if (play_stream_id == 0 || last.stream_id != play_stream_id || !enable_audio)
+        if (play_stream_id == 0 || message.stream_id != play_stream_id || !enable_audio)
           break;
         if (body.size() < 2)
           break;
@@ -728,7 +644,6 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
         const uint8_t sound_fmt = flv0 >> 4;
         if (sound_fmt != 10)
           break; // only AAC handled
-        begin_media();
         const uint8_t aac_pkt_type = body[1];
         const uint8_t* payload = body.data() + 2;
         size_t pay_len = body.size() - 2;
@@ -737,11 +652,12 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
           if (audio_pipe.on_csd(payload, pay_len))
           {
             audio_pipe_started = true;
+            begin_media();
           }
         }
         else if (aac_pkt_type == 1 && audio_pipe_started)
         {
-          int64_t pts_us = (int64_t) last.timestamp * 1000;
+          int64_t pts_us = (int64_t) message.timestamp * 1000;
           audio_pipe.push(payload, pay_len, pts_us);
         }
         break;
@@ -749,7 +665,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
 
       case 0x09:
       { // video (H.264 / AVC)
-        if (play_stream_id == 0 || last.stream_id != play_stream_id || !enable_video)
+        if (play_stream_id == 0 || message.stream_id != play_stream_id || !enable_video)
           break;
         if (body.size() < 5)
           break;
@@ -757,13 +673,12 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
         uint8_t codec_id = body[0] & 0x0f;
         if (codec_id != 7)
           break;
-        begin_media();
 
         uint8_t avc_packet_type = body[1];
         int32_t cts_ms = (int32_t) ((body[2] << 16) | (body[3] << 8) | body[4]);
         if (cts_ms & 0x800000)
           cts_ms |= ~0xffffff;
-        int64_t dts_ms = (int64_t) last.timestamp;
+        int64_t dts_ms = (int64_t) message.timestamp;
         int64_t pts_us = (dts_ms + cts_ms) * 1000;
 
         const uint8_t* payload = body.data() + 5;
@@ -777,25 +692,20 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
             LOGW(OBF("rtmp: invalid AVCDecoderConfigurationRecord").c_str());
             break;
           }
+          begin_media();
           sps_pps_annexb = std::move(config.parameter_sets_annexb);
           avcc_nalu_length_size = config.nalu_length_size;
           seen_video_keyframe = false;
           // ReCam's SPS-derived geometry removes the fragile dependency on
           // onMetaData ordering. SPS is authoritative when it is parseable;
           // metadata remains a compatibility fallback for unusual profiles.
-          if (config.width != 0 && config.height != 0)
-          {
-            stream_w = static_cast<int>(config.width);
-            stream_h = static_cast<int>(config.height);
-          }
+          geometry_from_sps = config.width != 0 && config.height != 0;
+          stream_w = geometry_from_sps ? static_cast<int>(config.width) : metadata_w;
+          stream_h = geometry_from_sps ? static_cast<int>(config.height) : metadata_h;
           if (stream_w > 0 && stream_h > 0)
             try_start_pipe();
-          if (pipe_started && !sps_pps_annexb.empty())
-          {
-            pipe.push(sps_pps_annexb.data(), sps_pps_annexb.size(), pts_us);
-          }
         }
-        else if (avc_packet_type == 1)
+        else if (avc_packet_type == 1 && avcc_nalu_length_size != 0)
         {
           if (!pipe_started)
           {
@@ -808,24 +718,17 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
             if (!pipe_started)
               break;
           }
-          std::vector<uint8_t> annexb;
           const bool is_key = (frame_type == 1);
           if (!is_key && !seen_video_keyframe)
             break;
-          if (is_key && !sps_pps_annexb.empty())
-          {
-            annexb.insert(annexb.end(), sps_pps_annexb.begin(), sps_pps_annexb.end());
-          }
-          if (avcc_nalu_length_size == 0)
-            break;
-          std::vector<uint8_t> converted;
+          const auto prefix = is_key ? std::span<const uint8_t>(sps_pps_annexb)
+                                     : std::span<const uint8_t>();
           if (!cr::media::avcc_access_unit_to_annexb(
-                  {payload, pay_len}, avcc_nalu_length_size, converted))
+                  {payload, pay_len}, avcc_nalu_length_size, annexb, prefix))
           {
             LOGW(OBF("rtmp: malformed AVCC access unit").c_str());
             break;
           }
-          annexb.insert(annexb.end(), converted.begin(), converted.end());
           if (!annexb.empty())
           {
             if (!pipe.push(annexb.data(), annexb.size(), pts_us))
@@ -848,7 +751,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
     {
       last_decoded = frame_count;
       last_frame = std::chrono::steady_clock::now();
-      video_ready = true;
+      video_ready = frame_count != 0;
     }
     else if (video_ready && std::chrono::steady_clock::now() - last_frame >= kVideoFrameTimeout)
     {

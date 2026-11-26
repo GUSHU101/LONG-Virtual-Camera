@@ -86,13 +86,17 @@ jobs:
             -Iengines/camreplace/android/camhook/src tests/native/camera_jpeg_test.c \
             engines/camreplace/android/camhook/src/jpeg_encode.c -lm -o /tmp/camera_jpeg_test
           /tmp/camera_jpeg_test
-      - name: Interruptible network listener
+      - name: Interruptible sockets and RTMP chunks
         run: |
           set -euo pipefail
           g++ -std=c++20 -Wall -Wextra -Werror -pthread \
             -Iengines/camreplace/android/feed/src tests/native/interruptible_socket_test.cpp \
             -o /tmp/interruptible_socket_test
           timeout 5s /tmp/interruptible_socket_test
+          g++ -std=c++20 -Wall -Wextra -Werror \
+            -Iengines/camreplace/android/feed/src tests/native/rtmp_chunks_test.cpp \
+            -o /tmp/rtmp_chunks_test
+          /tmp/rtmp_chunks_test
       - name: Authenticated channel tests
         run: |
           set -euo pipefail

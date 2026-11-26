@@ -46,9 +46,11 @@ logcat() {
 logcat() {
   printf '%s\n' 'camera_preview v1 seen=60 staged=58 queue_error=1' \
     'camera_preview v1 seen=90 staged=88 queue_error=1' \
-    'camera_preview v1 seen=91 staged=90 queue_error=-1'
+    'camera_preview v1 seen=91 staged=90 queue_error=-1' \
+    'camera_recording v1 queued=42' \
+    'camera_recording v1 queued=-1'
 }
-[[ $(camera_output_stats 42) == $'camera_preview_seen=90\ncamera_preview_staged=88\ncamera_preview_errors=1' ]]
+[[ $(camera_output_stats 42) == $'camera_preview_seen=90\ncamera_preview_staged=88\ncamera_preview_errors=1\ncamera_recording_queued=42' ]]
 
 dumpsys() { printf '%s\n' "$camera_dump"; }
 camera_history=$'== Camera service events log ==\nDISCONNECT device 0 client for package com.example.previous\nClient Package Name: com.example.closed'

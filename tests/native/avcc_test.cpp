@@ -60,6 +60,12 @@ int main()
   assert(out == saved); // malformed input is transactional, never partial.
   assert(!cr::media::avcc_access_unit_to_annexb({}, 4, out));
   assert(!cr::media::avcc_access_unit_to_annexb(zero, 1, out));
+  const std::vector<std::uint8_t> prefix{0, 0, 0, 1, 0x67};
+  assert(cr::media::avcc_access_unit_to_annexb(four, 4, out, prefix));
+  assert(out == (std::vector<std::uint8_t>{0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x41, 0xcc}));
+  const auto prefixed = out;
+  assert(!cr::media::avcc_access_unit_to_annexb(malformed, 4, out, prefix));
+  assert(out == prefixed);
   cr::media::RtmpAddress address;
   assert(cr::media::parse_rtmp_address("rtmp://relay.local/longvc", address));
   assert(address.host == "relay.local" && address.port == "1935" && address.app.empty());
