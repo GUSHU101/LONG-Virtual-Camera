@@ -6,6 +6,7 @@
 #include "RtmpChunks.h"
 #include "media/Avcc.h"
 #include "media/RtmpAddress.h"
+#include "TrackFreshness.h"
 
 #include <android/log.h>
 #include <arpa/inet.h>
@@ -49,7 +50,7 @@ constexpr unsigned kMaxAmfDepth = 16u;
 constexpr size_t kMaxStartupBytes = 1024u * 1024u;
 constexpr auto kStartupTimeout = std::chrono::seconds(12);
 constexpr auto kLiveIoTimeout = std::chrono::seconds(3);
-constexpr auto kVideoFrameTimeout = std::chrono::seconds(2);
+constexpr auto kTrackPublicationTimeout = std::chrono::seconds(2);
 
 inline uint32_t be32(const uint8_t* p)
 {
@@ -369,9 +370,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   bool connection_accepted = false;
   uint32_t play_stream_id = 0;
   bool receiving_media = false;
-  uint64_t last_published = 0;
-  auto last_frame = std::chrono::steady_clock::time_point::min();
-  bool video_ready = false;
+  cr::feed::TrackFreshness video_freshness, audio_freshness;
 
   auto begin_media = [&]()
   {
@@ -415,20 +414,16 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
-    // Audio, keepalives and partial messages can outlive video.
-    const auto frame_count = pipe.frames_published();
     const auto now = std::chrono::steady_clock::now();
-    if (frame_count != last_published)
-    {
-      last_published = frame_count;
-      last_frame = now;
-      video_ready = frame_count != 0;
-    }
-    else if (video_ready && now - last_frame >= kVideoFrameTimeout)
+    if (video_freshness.expired(pipe.frames_published(), now, kTrackPublicationTimeout))
     {
       pipe.revoke_frame();
-      video_ready = false;
       LOGW("rtmp: no new video published in two seconds, waiting for a fresh frame");
+    }
+    if (audio_freshness.expired(audio_pipe.pcm_blocks_published(), now, kTrackPublicationTimeout))
+    {
+      audio_pipe.revoke_pcm();
+      LOGW("rtmp: no new PCM published in two seconds, waiting for fresh audio");
     }
 
     cr::feed::RtmpMessage message;

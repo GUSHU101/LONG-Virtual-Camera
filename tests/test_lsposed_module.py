@@ -71,11 +71,13 @@ class LsposedModuleContractTests(unittest.TestCase):
         script = (MODULE / "payload/longvc-control.sh").read_text(encoding="utf-8")
         camera = script.split("arm_camera()", 1)[1].split("disarm_camera()", 1)[0]
         photo = script.split("arm_photo()", 1)[1].split("disarm_photo()", 1)[0]
+        visual = script.split("arm_visual()", 1)[1].split("arm_camera()", 1)[0]
         mic = script.split("arm_mic()", 1)[1].split("disarm_mic()", 1)[0]
         feeder = script.split("start_feeder()", 1)[1].split("hook_pid()", 1)[0]
 
-        self.assertIn("stop_video_passthrough", camera)
-        self.assertIn("stop_video_passthrough", photo)
+        self.assertIn("arm_visual camera video_mode", camera)
+        self.assertIn("arm_visual photo photo_mode", photo)
+        self.assertIn("stop_video_passthrough", visual)
         self.assertIn("stop_audio_passthrough", mic)
         self.assertIn("unload_audio_hook", mic)
         self.assertIn('stop_feeder "$start_tag"', feeder)

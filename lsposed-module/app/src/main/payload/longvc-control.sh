@@ -49,6 +49,21 @@ require_payload() {
 }
 
 acquire_lock() {
+  # Serialize stale-directory recovery with a kernel lock where available.
+  # Retain the directory lock so an installed pre-upgrade controller still
+  # cooperates with the staged controller used during payload installation.
+  if command -v flock >/dev/null 2>&1; then
+    (umask 077; : >> "$LOCK.flock") || fail "controller_lock_open_failed"
+    exec 9>> "$LOCK.flock"
+    lock_attempt=0
+    # Android's mksh closes extra inherited FDs when it execs a command.
+    # Explicitly duplicate the parent's open description into flock's FD.
+    until flock -xn 8 8>&9; do
+      lock_attempt=$((lock_attempt + 1))
+      [ "$lock_attempt" -lt 50 ] || fail "controller_busy"
+      sleep 0.1
+    done
+  fi
   lock_i=0
   while ! mkdir "$LOCK" 2>/dev/null; do
     lock_i=$((lock_i + 1))
@@ -259,10 +274,10 @@ start_feeder() {
   rm -f "$start_log"
   if command -v nohup >/dev/null 2>&1; then
     LD_LIBRARY_PATH="$BASE" nohup "$FEEDER" --feed "$start_url" --role "$start_role" \
-      >"$start_log" 2>&1 </dev/null &
+      >"$start_log" 2>&1 </dev/null 9>&- &
   else
     (LD_LIBRARY_PATH="$BASE" "$FEEDER" --feed "$start_url" --role "$start_role" \
-      >"$start_log" 2>&1 </dev/null) &
+      >"$start_log" 2>&1 </dev/null) 9>&- &
   fi
   wait_feeder "$start_tag" "$start_ready"
 }
@@ -586,24 +601,14 @@ ensure_video() {
     video_url=$(local_visual_url) || return 1
     start_feeder "$video_url" video video "$VIDEO_LOG" || return 1
   fi
-  if ! ensure_camera_hook; then
-    if [ "$(current_visual_mode)" = obs ]; then
-      if [ ! -e "$CONTROL/mic.lease" ] || [ "$(current_audio_mode)" != obs ]; then
-        stop_feeder "--role obs"
-      fi
-    else
-      stop_feeder "--role video"
-    fi
-    revoke_u32 "$DATA/feed" 0 || true
-    return 1
-  fi
+  ensure_camera_hook
 }
 
 ensure_audio() {
   prepare_data || return 1
   if [ "$(current_audio_mode)" = obs ]; then
     obs_tracks=audio
-    if { [ -e "$CONTROL/camera.lease" ] || [ -e "$CONTROL/photo.lease" ]; } &&
+    if visual_requested &&
        [ "$(current_visual_mode)" = obs ]; then
       obs_tracks=av
     fi
@@ -612,17 +617,11 @@ ensure_audio() {
     audio_url=$(local_audio_url) || return 1
     start_feeder "$audio_url" audio audio "$AUDIO_LOG" || return 1
   fi
-  if ! publish_mic_mode || ! ensure_audio_hook; then
-    if [ "$(current_audio_mode)" = obs ]; then
-      [ "$(current_visual_mode)" = obs ] &&
-        { [ -e "$CONTROL/camera.lease" ] || [ -e "$CONTROL/photo.lease" ]; } ||
-        stop_feeder "--role obs"
-    else
-      stop_feeder "--role audio"
-    fi
-    revoke_u32 "$DATA/audio" 0 || true
-    return 1
-  fi
+  publish_mic_mode && ensure_audio_hook
+}
+
+visual_requested() {
+  [ -e "$CONTROL/camera.lease" ] || [ -e "$CONTROL/photo.lease" ]
 }
 
 stop_video_passthrough() {
@@ -646,8 +645,7 @@ stop_video_passthrough() {
 stop_audio_passthrough() {
   stop_rc=0
   if [ "$(current_audio_mode)" = obs ]; then
-    if { [ ! -e "$CONTROL/camera.lease" ] &&
-         [ ! -e "$CONTROL/photo.lease" ]; } ||
+    if ! visual_requested ||
        [ "$(current_visual_mode)" != obs ]; then
       stop_feeder "--role obs" || stop_rc=1
     else
@@ -660,6 +658,14 @@ stop_audio_passthrough() {
   revoke_u32 "$DATA/audio" 36 || stop_rc=1
   revoke_u32 "$DATA/audio" 0 || stop_rc=1
   return "$stop_rc"
+}
+
+reconcile_mode_pair() {
+  if [ -e "$1" ]; then
+    [ -f "$2" ] || rm -f "$1" "$2"
+  elif [ -e "$2" ]; then
+    rm -f "$2"
+  fi
 }
 
 reconcile_stale_leases() {
@@ -688,6 +694,9 @@ reconcile_stale_leases() {
   if [ "$audio_live" = "0" ]; then
     rm -f "$CONTROL/mic.lease" "$MIC_MODE"
   fi
+  reconcile_mode_pair "$CONTROL/camera.lease" "$DATA/video_mode"
+  reconcile_mode_pair "$CONTROL/photo.lease" "$DATA/photo_mode"
+  reconcile_mode_pair "$CONTROL/mic.lease" "$MIC_MODE"
 }
 
 unload_camera_hook() {
@@ -727,31 +736,39 @@ unload_audio_hook() {
 
 install_camera_flag() {
   flag_path=$1
-  printf '1\n' > "$flag_path" || return 1
-  (chown cameraserver:camera "$flag_path" 2>/dev/null ||
-    chown 1047:1006 "$flag_path") || return 1
-  chmod 0400 "$flag_path" || return 1
-  apply_data_context "$flag_path"
+  flag_stage=$DATA/.camera-mode.$$
+  if (umask 077; set -C; printf '1\n' > "$flag_stage") &&
+     (chown cameraserver:camera "$flag_stage" 2>/dev/null ||
+       chown 1047:1006 "$flag_stage") &&
+     chmod 0400 "$flag_stage" && apply_data_context "$flag_stage" &&
+     mv -f "$flag_stage" "$flag_path"; then
+    return 0
+  fi
+  rm -f "$flag_stage"
+  return 1
 }
 
-arm_camera() {
-  if ! (: > "$CONTROL/camera.lease" && chmod 0600 "$CONTROL/camera.lease"); then
-    rm -f "$CONTROL/camera.lease"
-    return 1
+arm_visual() {
+  visual_lease="$CONTROL/$1.lease"
+  visual_flag="$DATA/$2"
+  visual_already_active=0
+  [ ! -e "$visual_lease" ] || [ ! -f "$visual_flag" ] || visual_already_active=1
+  if (umask 077; : > "$visual_lease") && chmod 0600 "$visual_lease" &&
+     ensure_video && install_camera_flag "$visual_flag"; then
+    return 0
   fi
-  if ! ensure_video; then
-    rm -f "$CONTROL/camera.lease" "$DATA/video_mode"
-    if [ ! -e "$CONTROL/photo.lease" ]; then
-      stop_video_passthrough
-      unload_camera_hook
-    fi
-    return 1
+  [ "$visual_already_active" = 0 ] || return 1
+  rm -f "$visual_lease" "$visual_flag"
+  # Both visual modes use the same writer. An unsuccessful second arm must
+  # leave the surviving mode's writer and shared buffer intact.
+  if ! visual_requested; then
+    stop_video_passthrough
+    unload_camera_hook
   fi
-  if ! install_camera_flag "$DATA/video_mode"; then
-    disarm_camera
-    return 1
-  fi
+  return 1
 }
+
+arm_camera() { arm_visual camera video_mode; }
 
 disarm_camera() {
   rm -f "$CONTROL/camera.lease" "$DATA/video_mode" || return 1
@@ -760,24 +777,7 @@ disarm_camera() {
   fi
 }
 
-arm_photo() {
-  if ! (: > "$CONTROL/photo.lease" && chmod 0600 "$CONTROL/photo.lease"); then
-    rm -f "$CONTROL/photo.lease"
-    return 1
-  fi
-  if ! ensure_video; then
-    rm -f "$CONTROL/photo.lease" "$DATA/photo_mode"
-    if [ ! -e "$CONTROL/camera.lease" ]; then
-      stop_video_passthrough
-      unload_camera_hook
-    fi
-    return 1
-  fi
-  if ! install_camera_flag "$DATA/photo_mode"; then
-    disarm_photo
-    return 1
-  fi
-}
+arm_photo() { arm_visual photo photo_mode; }
 
 disarm_photo() {
   rm -f "$CONTROL/photo.lease" "$DATA/photo_mode" || return 1
@@ -935,7 +935,7 @@ print_status() {
   audio_hook=$(hook_pid audioserver "$AUD_READY" 2>/dev/null || true)
   [ -n "$camera_hook" ] && camera_hook_ready=1 || camera_hook_ready=0
   [ -n "$audio_hook" ] && audio_hook_ready=1 || audio_hook_ready=0
-  [ -e "$CONTROL/camera.lease" ] && camera_enabled=1 || camera_enabled=0
+  [ -e "$CONTROL/camera.lease" ] && [ -f "$DATA/video_mode" ] && camera_enabled=1 || camera_enabled=0
   [ -e "$CONTROL/photo.lease" ] && [ -e "$DATA/photo_mode" ] && photo_enabled=1 || photo_enabled=0
   [ -e "$CONTROL/mic.lease" ] && [ -f "$MIC_MODE" ] && audio_enabled=1 || audio_enabled=0
 

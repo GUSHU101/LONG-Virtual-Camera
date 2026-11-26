@@ -110,10 +110,48 @@ camera_dump=$'Active Camera Clients:\n[\n(Camera ID: 0, Client Package Name: com
   if ensure_camera_hook; then exit 1; fi
 )
 
-ensure_video() { steps+=" video"; }
-install_camera_flag() { steps+=" flag"; [[ $flag_ready == 1 ]]; }
-disarm_photo() { steps+=" rollback"; rm -f "$CONTROL/photo.lease"; }
-steps=""
-flag_ready=0
-if arm_photo; then exit 1; fi
-[[ $steps == ' video flag rollback' && ! -e "$CONTROL/photo.lease" ]]
+(
+  ensure_video() { steps+=" video"; }
+  install_camera_flag() { steps+=" flag"; return 1; }
+  stop_video_passthrough() { steps+=" feeder"; }
+  unload_camera_hook() { steps+=" hook"; }
+  steps=""
+  if arm_photo; then exit 1; fi
+  [[ $steps == ' video flag feeder hook' && ! -e "$CONTROL/photo.lease" ]]
+)
+
+(
+  prepare_data() { return 0; }
+  current_visual_mode() { printf 'local\n'; }
+  local_visual_url() { printf 'test\n'; }
+  start_feeder() { return 0; }
+  ensure_camera_hook() { return 1; }
+  stop_feeder() { exit 8; }
+  revoke_u32() { exit 9; }
+  unload_camera_hook() { exit 10; }
+  touch "$CONTROL/camera.lease" "$DATA/video_mode"
+  if arm_photo || arm_camera; then exit 1; fi
+  [[ -f "$CONTROL/camera.lease" && -f "$DATA/video_mode" && ! -e "$CONTROL/photo.lease" ]]
+  rm -f "$CONTROL/camera.lease" "$DATA/video_mode"
+)
+touch "$CONTROL/photo.lease" "$DATA/video_mode"
+reconcile_mode_pair "$CONTROL/photo.lease" "$DATA/photo_mode"
+reconcile_mode_pair "$CONTROL/camera.lease" "$DATA/video_mode"
+[[ ! -e "$CONTROL/photo.lease" && ! -e "$DATA/video_mode" ]]
+
+if command -v flock >/dev/null 2>&1; then
+  BASE=$fixture
+  LOCK=$fixture/controller
+  (acquire_lock; printf 'first\n' >> "$fixture/order"; sleep 0.3; printf 'release\n' >> "$fixture/order") &
+  first=$!
+  for ((i=0; i<100; i++)); do
+    [[ -s "$fixture/order" ]] && break
+    sleep 0.01
+  done
+  [[ -s "$fixture/order" ]]
+  (acquire_lock; printf 'second\n' >> "$fixture/order") &
+  second=$!
+  wait "$first" "$second"
+  [[ $(cat "$fixture/order") == $'first\nrelease\nsecond' ]]
+  rm -f "$fixture/order" "$LOCK.flock"
+fi

@@ -102,6 +102,10 @@ jobs:
             -Iengines/camreplace/android/feed/src tests/native/rtmp_chunks_test.cpp \
             -o /tmp/rtmp_chunks_test
           /tmp/rtmp_chunks_test
+          g++ -std=c++20 -Wall -Wextra -Werror \
+            -Iengines/camreplace/android/feed/src tests/native/track_freshness_test.cpp \
+            -o /tmp/track_freshness_test
+          /tmp/track_freshness_test
       - name: Authenticated channel tests
         run: |
           set -euo pipefail

@@ -1,20 +1,7 @@
 #pragma once
 
-// Phone-side AAC → S16LE PCM → /data/cr/audio pipe (sprint B follow-up).
-// Lives next to H264DecodePipe for the legacy opt-in rtmp_h264_feed.cpp
-// path: when an FLV audio tag (type 0x08) arrives, the RTMP server
-// hands the AAC payload to AacDecodePipe::push(); when an AAC sequence
-// header (AACPacketType=0) arrives we configure the decoder from the
-// AudioSpecificConfig and arm the audio shm.
-// The output rate matches the AAC stream natively (typically 44100 or
-// 48000, stereo). libcr_audhook reads the shm without resampling, so
-// whatever rate we publish is what apps see.
-// Why this exists in direct-RTMP mode:
-//   In legacy mode the PC's RtmpServer demuxed audio out of the FLV
-//   stream and fed it to AudioPump (Media Foundation AAC decoder), which
-//   shipped raw PCM to a separate cr_feed_proc instance running with
-//   tcp_pcm:listen:8902. With direct-RTMP the AAC is now arriving on
-//   the phone — there's no PC-side decode any more. So we decode here.
+// The phone's RTMP reader decodes AAC into a shared PCM ring. The audio
+// hook consumes the published rate and adapts it to each client's format.
 
 #include "audio_shm.h"
 #include "media_codec_runtime.h"
@@ -23,6 +10,8 @@
 #include <media/NdkMediaFormat.h>
 
 #include <android/log.h>
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -33,7 +22,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <vector>
 #include "util/Obf.h"
 
 #define CR_AUDIO_LOGI(...) __android_log_print(ANDROID_LOG_INFO, OBF("cr_feed").c_str(), __VA_ARGS__)
@@ -107,10 +95,10 @@ public:
   // restart with a different format works without leaks.
   bool on_csd(const uint8_t* csd, size_t len)
   {
-    if (!csd || len < 2 || len > 64)
+    if (!csd || len < 2 || len > config_.size())
       return false;
-
-    (void) ensure_media_codec_binder_pool();
+    if (len == config_size_ && std::memcmp(csd, config_.data(), len) == 0)
+      return true;
 
     // Parse AudioSpecificConfig: object_type (5b), sr_idx (4b),
     // channel_cfg (4b). Same lookup table the PC AudioPump uses.
@@ -126,8 +114,21 @@ public:
       return false;
     }
 
-    teardown_decoder();
+    std::memcpy(config_.data(), csd, len);
+    config_size_ = len;
+    input_rate_ = sample_rate;
+    input_channels_ = channels;
+    reset_decoder();
+    start_decoder();
+    return true;
+  }
 
+private:
+  bool start_decoder()
+  {
+    using namespace std::chrono_literals;
+    retry_at_ = std::chrono::steady_clock::now() + 500ms;
+    (void) ensure_media_codec_binder_pool();
     dec_ = AMediaCodec_createDecoderByType(OBF("audio/mp4a-latm").c_str());
     if (!dec_)
     {
@@ -136,10 +137,16 @@ public:
     }
 
     AMediaFormat* fmt = AMediaFormat_new();
+    if (!fmt)
+    {
+      AMediaCodec_delete(dec_);
+      dec_ = nullptr;
+      return false;
+    }
     AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, OBF("audio/mp4a-latm").c_str());
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_SAMPLE_RATE, sample_rate);
-    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_CHANNEL_COUNT, channels);
-    AMediaFormat_setBuffer(fmt, "csd-0", csd, len);
+    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_SAMPLE_RATE, input_rate_);
+    AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_CHANNEL_COUNT, input_channels_);
+    AMediaFormat_setBuffer(fmt, "csd-0", config_.data(), config_size_);
 
     media_status_t cs = AMediaCodec_configure(dec_, fmt, nullptr, nullptr, 0);
     AMediaFormat_delete(fmt);
@@ -159,8 +166,8 @@ public:
       return false;
     }
 
-    sample_rate_ = (uint32_t) sample_rate;
-    channels_ = (uint16_t) channels;
+    sample_rate_ = static_cast<uint32_t>(input_rate_);
+    channels_ = static_cast<uint16_t>(input_channels_);
     pcm_encoding_ = 2; // Android AudioFormat.ENCODING_PCM_16BIT
 
     if (!open_shm())
@@ -174,10 +181,13 @@ public:
     return true;
   }
 
+public:
   // Feed one AAC raw access unit (FLV AAC packet type 1).
   void push(const uint8_t* aac, size_t len, int64_t pts_us)
   {
-    if (!ready_ || !dec_ || !aac || !len)
+    if (!aac || !len || config_size_ == 0)
+      return;
+    if (!ready_ && (std::chrono::steady_clock::now() < retry_at_ || !start_decoder()))
       return;
 
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(dec_, 5'000);
@@ -195,7 +205,8 @@ public:
         {
           CR_AUDIO_LOGW(OBF("aac: queueInput failed status=%d").c_str(),
                         (int) queued);
-          ready_ = false;
+          reset_decoder();
+          return;
         }
       }
       else
@@ -204,13 +215,28 @@ public:
         // us permanently drains the input pool after a few oversized packets.
         CR_AUDIO_LOGW(OBF("aac: input packet too large len=%zu cap=%zu").c_str(),
                       len, cap);
-        AMediaCodec_queueInputBuffer(dec_, (size_t) in_idx, 0, 0,
-                                     pts_us < 0 ? 0u : (uint64_t) pts_us, 0);
+        if (AMediaCodec_queueInputBuffer(dec_, (size_t) in_idx, 0, 0,
+                                        pts_us < 0 ? 0u : (uint64_t) pts_us, 0) != AMEDIA_OK)
+        {
+          reset_decoder();
+          return;
+        }
       }
+    }
+    else if (in_idx != AMEDIACODEC_INFO_TRY_AGAIN_LATER)
+    {
+      reset_decoder();
+      return;
     }
     drain();
   }
 
+  // Drop old buffered samples if the AAC track stalls while video continues.
+  // A new generation makes consumers take their normal fresh prebuffer path.
+  void revoke_pcm() { publish_audio_header(); }
+  uint64_t pcm_blocks_published() const noexcept { return pcm_blocks_published_; }
+
+private:
   void drain()
   {
     if (!dec_)
@@ -226,16 +252,25 @@ public:
         // Audio format changes on first output; refresh sr/ch
         // from the codec's actual output and republish header.
         AMediaFormat* of = AMediaCodec_getOutputFormat(dec_);
+        if (!of)
+        {
+          reset_decoder();
+          return;
+        }
         int32_t sr = sample_rate_, ch = channels_;
         int32_t pcm_encoding = 2;
         AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_SAMPLE_RATE, &sr);
         AMediaFormat_getInt32(of, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &ch);
         AMediaFormat_getInt32(of, OBF("pcm-encoding").c_str(), &pcm_encoding);
         AMediaFormat_delete(of);
-        if (sr >= 8000 && sr <= 192000)
-          sample_rate_ = (uint32_t) sr;
-        if (ch == 1 || ch == 2)
-          channels_ = (uint16_t) ch;
+        if (sr < 8000 || sr > 192000 || (ch != 1 && ch != 2))
+        {
+          CR_AUDIO_LOGW("aac: unsupported PCM layout sr=%d ch=%d", sr, ch);
+          reset_decoder();
+          return;
+        }
+        sample_rate_ = static_cast<uint32_t>(sr);
+        channels_ = static_cast<uint16_t>(ch);
         pcm_encoding_ = pcm_encoding;
         if (pcm_encoding_ != 2)
           CR_AUDIO_LOGW(OBF("aac: unsupported decoder PCM encoding=%d; dropping output").c_str(),
@@ -246,7 +281,10 @@ public:
       if (out_idx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED)
         continue;
       if (out_idx < 0)
-        break;
+      {
+        reset_decoder();
+        return;
+      }
 
       if (info.size > 0 && audio_hdr_)
       {
@@ -269,15 +307,12 @@ public:
     }
   }
 
+public:
   void stop()
   {
-    teardown_decoder();
+    reset_decoder();
     if (audio_hdr_)
     {
-      // Revoke replacement before invalidating metadata so the hook returns
-      // immediately to the phone microphone.
-      atomic_store_explicit(&audio_hdr_->channel_state,
-                            CR_CHANNEL_STATE_NONE, memory_order_release);
       __atomic_store_n(&audio_hdr_->magic, 0u, __ATOMIC_RELEASE);
       munmap(audio_map_, audio_size_);
       audio_hdr_ = nullptr;
@@ -289,7 +324,7 @@ public:
       ::close(audio_fd_);
       audio_fd_ = -1;
     }
-    ready_ = false;
+    config_size_ = 0;
   }
 
   ~AacDecodePipe()
@@ -298,6 +333,16 @@ public:
   }
 
 private:
+  void reset_decoder()
+  {
+    ready_ = false;
+    retry_at_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    if (audio_hdr_)
+      atomic_store_explicit(&audio_hdr_->channel_state,
+                            CR_CHANNEL_STATE_NONE, memory_order_release);
+    teardown_decoder();
+  }
+
   void teardown_decoder()
   {
     if (dec_)
@@ -366,8 +411,15 @@ private:
     atomic_store_explicit(&audio_hdr_->channel_state,
                           CR_CHANNEL_STATE_READY, memory_order_release);
     cr_audio_end_write(audio_hdr_, write_token);
+    ++pcm_blocks_published_;
   }
 
+  std::array<uint8_t, 64> config_{};
+  size_t config_size_ = 0;
+  int input_rate_ = 0;
+  int input_channels_ = 0;
+  std::chrono::steady_clock::time_point retry_at_{};
+  uint64_t pcm_blocks_published_ = 0;
   AMediaCodec* dec_ = nullptr;
   bool ready_ = false;
   uint32_t sample_rate_ = 0;
