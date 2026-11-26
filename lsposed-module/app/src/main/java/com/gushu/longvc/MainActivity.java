@@ -506,7 +506,8 @@ public final class MainActivity extends Activity
             return cameraState(state, state.photoEnabled);
         }
         if (state.cameraQueuedJpeg > 0) return "已向相机提交替换 JPEG";
-        return "等待相机请求兼容的 JPEG 输出";
+        if (state.cameraQueuedRawTen > 0) return "已向相机提交替换 RAW10 帧";
+        return "等待相机请求兼容的照片输出";
     }
 
     private static String cameraOutputSummary(RuntimeState state) {
@@ -527,7 +528,7 @@ public final class MainActivity extends Activity
             }
             if (state.cameraRawTen > 0) {
                 summary.append("\nRAW10 传感器帧直通 ").append(state.cameraRawTen)
-                        .append(" 次。照片替换开关只处理 JPEG 输出。");
+                        .append(" 次。");
             }
             long otherFormats = state.cameraUnsupported - state.cameraRawTen;
             if (otherFormats > 0) {
@@ -542,6 +543,11 @@ public final class MainActivity extends Activity
         if (state.cameraRecordingQueued > 0) {
             summary.append("\n录像编码队列累计接收 ").append(state.cameraRecordingQueued)
                     .append(" 帧替换视频。");
+        }
+        if (state.cameraWrittenRawTen >= 0) {
+            summary.append("\nRAW10 写入 ").append(state.cameraWrittenRawTen)
+                    .append(" 帧，系统队列接受 ").append(state.cameraQueuedRawTen)
+                    .append(" 帧，缓冲锁定失败 ").append(state.cameraRawTenLockErrors).append(" 次。");
         }
         return summary.toString();
     }

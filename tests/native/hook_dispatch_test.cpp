@@ -64,6 +64,11 @@ int main()
   assert(cr::camhook::dispatch_queue(counters, true, record, original_ok, -32) == -32);
   assert(counters.yuv_queued.load() == 2 && counters.recording_queued.load() == 1);
 
+  const auto raw = [] { return cr::camhook::ReplacementOutcome::Raw10Written; };
+  assert(cr::camhook::dispatch_queue(counters, true, raw, original_ok, 0) == 0);
+  assert(cr::camhook::dispatch_queue(counters, true, raw, original_ok, -32) == -32);
+  assert(counters.raw10_queued.load() == 1 && counters.jpeg_queued.load() == 1);
+
   using Original = std::int32_t (*)(int);
   const auto missing = cr::camhook::dispatch_queue(
       counters, true,

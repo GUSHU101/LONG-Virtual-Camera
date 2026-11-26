@@ -36,6 +36,9 @@ final class RuntimeState {
     final long cameraPreviewStaged;
     final long cameraPreviewErrors;
     final long cameraRawTen;
+    final long cameraWrittenRawTen;
+    final long cameraQueuedRawTen;
+    final long cameraRawTenLockErrors;
     final long cameraUnsupported;
     final String abi;
     final String selinux;
@@ -73,6 +76,9 @@ final class RuntimeState {
         this.cameraPreviewStaged = counter(values, "camera_preview_staged");
         this.cameraPreviewErrors = counter(values, "camera_preview_errors");
         this.cameraRawTen = counter(values, "camera_raw_ten");
+        this.cameraWrittenRawTen = counter(values, "camera_written_raw_ten");
+        this.cameraQueuedRawTen = counter(values, "camera_queued_raw_ten");
+        this.cameraRawTenLockErrors = counter(values, "camera_raw_ten_lock_errors");
         this.cameraUnsupported = counter(values, "camera_unsupported");
         this.abi = values.getOrDefault("abi", "unknown");
         this.selinux = values.getOrDefault("selinux", "unknown");

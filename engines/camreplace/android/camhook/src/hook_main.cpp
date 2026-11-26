@@ -5,6 +5,7 @@
 #include "nv21_blit.h"
 #include "jpeg_encode.h"
 #include "HookDispatch.h"
+#include "Raw10Bayer.h"
 #include "shadowhook.h"
 
 #include <android/hardware_buffer.h>
@@ -23,10 +24,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <array>
+#include <condition_variable>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
 #include "util/Obf.h"
 
@@ -41,7 +45,7 @@
  * queue method. Multiple mangled symbol and buffer-mapper layouts are tried
  * to cover Android platform variants without runtime SDK branching.
  *
- * Photo mode writes a JPEG BLOB instead of a preview frame. Shared memory is
+ * Photo mode also handles JPEG BLOBs and reviewed RAW10 layouts. Shared memory is
  * owned by the feed process; this library maps it read-only and never changes
  * its producer state. Global hook and mapper state is process-local to
  * cameraserver. Invalid headers, unavailable CPU mappings, unsupported
@@ -368,11 +372,13 @@ using AHB_lockPlanes_fn = int (*)(AHardwareBuffer*, uint64_t, int32_t, const ARe
                                   AHardwareBuffer_Planes*);
 using AHB_unlock_fn = int (*)(AHardwareBuffer*, int32_t*);
 using AHB_lock_fn = int (*)(AHardwareBuffer*, uint64_t, int32_t, const ARect*, void**);
+using AHB_describe_fn = void (*)(const AHardwareBuffer*, AHardwareBuffer_Desc*);
 typedef void* (*ANWB_getHardwareBuffer_fn)(void* buffer);
 
 static AHB_lockPlanes_fn g_ahb_lockPlanes = nullptr;
 static AHB_unlock_fn g_ahb_unlock = nullptr;
 static AHB_lock_fn g_ahb_lock = nullptr;
+static AHB_describe_fn g_ahb_describe = nullptr;
 static ANWB_getHardwareBuffer_fn g_get_hardware_buffer = nullptr;
 
 struct Rect
@@ -549,6 +555,7 @@ static void resolve_runtime_ops_unlocked()
     g_ahb_unlock = (AHB_unlock_fn) dlsym(libnw, OBF("AHardwareBuffer_unlock").c_str());
 
     g_ahb_lock = (AHB_lock_fn) dlsym(libnw, OBF("AHardwareBuffer_lock").c_str());
+    g_ahb_describe = (AHB_describe_fn) dlsym(libnw, "AHardwareBuffer_describe");
     g_get_hardware_buffer = (ANWB_getHardwareBuffer_fn) dlsym(libnw, OBF("ANativeWindowBuffer_getHardwareBuffer").c_str());
   }
 
@@ -751,7 +758,7 @@ static bool describe_yuv420(LockedView& view, int width, int height,
   return true;
 }
 
-static bool wait_for_fence(int fence)
+static bool wait_for_fence(int fence, int timeout_ms = 3000)
 {
   if (fence < 0)
     return true;
@@ -759,7 +766,7 @@ static bool wait_for_fence(int fence)
   int rc;
   do
   {
-    rc = poll(&pfd, 1, 3000);
+    rc = poll(&pfd, 1, timeout_ms);
   } while (rc < 0 && errno == EINTR);
   return rc == 1 && (pfd.revents & POLLIN) != 0 &&
          (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
@@ -1101,6 +1108,212 @@ struct CameraModes
   bool active() const { return video || photo; }
 };
 
+static constexpr int kRaw10Format = 0x25;
+struct Raw10Layout
+{
+  int width, height, stride;
+};
+static constexpr std::array<Raw10Layout, 2> kPixel5RawLayouts{{
+    {4032, 3024, 5056}, {4656, 3496, 5824}}};
+static bool g_pixel5_raw10 = false;
+static std::atomic<unsigned> g_raw10_written{0};
+static std::atomic<unsigned> g_raw10_lock_failed{0};
+
+struct Raw10Frame
+{
+  std::unique_ptr<uint8_t[]> pixels;
+  uint32_t generation = 0;
+  int64_t prepared = 0;
+};
+
+class Raw10Cache
+{
+public:
+  ~Raw10Cache() { stop(); }
+
+  void enable()
+  {
+    std::lock_guard lock(mutex_);
+    enabled_ = true;
+  }
+
+  void stop()
+  {
+    {
+      std::lock_guard lock(mutex_);
+      enabled_ = false;
+    }
+    changed_.notify_one();
+    if (worker_.joinable())
+      worker_.join();
+    std::lock_guard lock(mutex_);
+    slots_ = {};
+  }
+
+  std::shared_ptr<const Raw10Frame> get(size_t profile, const PinnedSlot& source)
+  {
+    std::lock_guard lock(mutex_);
+    if (!enabled_)
+      return {};
+    auto& slot = slots_[profile];
+    const auto now = monotonic_ns();
+    constexpr int64_t kRefreshNs = 250'000'000LL;
+    if (slot.generation != source.generation ||
+        (slot.sequence != source.frame_seq && now - slot.requested >= kRefreshNs))
+    {
+      if (!worker_.joinable())
+        worker_ = std::thread(&Raw10Cache::run, this);
+      slot.generation = source.generation;
+      slot.sequence = source.frame_seq;
+      slot.requested = now;
+      slot.pending = true;
+      changed_.notify_one();
+    }
+    constexpr int64_t kMaxRawAgeNs = 750'000'000LL;
+    if (slot.frame && slot.frame->generation == source.generation &&
+        now - slot.frame->prepared <= kMaxRawAgeNs)
+      return slot.frame;
+    return {};
+  }
+
+private:
+  struct Slot
+  {
+    std::shared_ptr<const Raw10Frame> frame;
+    uint32_t generation = 0;
+    uint64_t sequence = 0;
+    int64_t requested = 0;
+    bool pending = false;
+  };
+
+  void run() noexcept
+  {
+    for (;;)
+    {
+      size_t profile;
+      uint32_t generation;
+      {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [this] { return !enabled_ || slots_[0].pending || slots_[1].pending; });
+        if (!enabled_)
+          return;
+        profile = slots_[next_].pending ? next_ : 1 - next_;
+        slots_[profile].pending = false;
+        generation = slots_[profile].generation;
+        next_ = 1 - profile;
+      }
+      try
+      {
+        const auto [width, height, stride] = kPixel5RawLayouts[profile];
+        PinnedSlot source;
+        if (access("/data/cr/photo_mode", R_OK) != 0 ||
+            !g_shm.pin_current(source) || source.generation != generation ||
+            atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
+                CR_CHANNEL_STATE_READY)
+          continue;
+        const size_t size = static_cast<size_t>(width / 4) * 5 * height;
+        auto result = std::make_shared<Raw10Frame>();
+        result->pixels.reset(new uint8_t[size]);
+        result->generation = generation;
+        if (!cr::camhook::nv21_to_bggr10({source.data, source.slot_size}, source.width,
+                                        source.height, {result->pixels.get(), size}, width, height))
+          continue;
+        result->prepared = monotonic_ns();
+        std::lock_guard lock(mutex_);
+        if (enabled_ && slots_[profile].generation == generation)
+          slots_[profile].frame = std::move(result);
+      }
+      catch (const std::exception&)
+      {
+        // Continue serving the camera if memory is temporarily unavailable.
+      }
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::array<Slot, 2> slots_{};
+  std::thread worker_;
+  size_t next_ = 0;
+  bool enabled_ = false;
+};
+
+static Raw10Cache g_raw10_cache;
+
+static bool pixel5_raw10_profile()
+{
+  char product[PROP_VALUE_MAX]{}, build[PROP_VALUE_MAX]{}, incremental[PROP_VALUE_MAX]{};
+  __system_property_get("ro.product.device", product);
+  __system_property_get("ro.build.id", build);
+  __system_property_get("ro.build.version.incremental", incremental);
+  return strcmp(product, "redfin") == 0 && strcmp(build, "UP1A.231105.001.B2") == 0 &&
+         strcmp(incremental, "11260668") == 0;
+}
+
+static bool overwrite_raw10(ANWB* anb, const ANWBInfo& bi, int fence)
+{
+  const int width = bi.width, height = bi.height;
+  if (!g_pixel5_raw10 || !g_ahb_lock || !g_ahb_unlock || !g_ahb_describe ||
+      !g_get_hardware_buffer || anb->common.version < static_cast<int32_t>(sizeof(ANWB)) ||
+      (anb->usage & AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT) != 0)
+    return false;
+  const auto layout = std::find_if(kPixel5RawLayouts.begin(), kPixel5RawLayouts.end(),
+      [&](const Raw10Layout& item) {
+        return item.width == width && item.height == height && item.stride == bi.stride;
+      });
+  if (layout == kPixel5RawLayouts.end())
+    return false;
+  auto* ahb = static_cast<AHardwareBuffer*>(g_get_hardware_buffer(anb));
+  if (!ahb)
+    return false;
+  AHardwareBuffer_Desc desc{};
+  g_ahb_describe(ahb, &desc);
+  if (desc.format != kRaw10Format || desc.layers != 1 ||
+      desc.width != static_cast<uint32_t>(width) ||
+      desc.height != static_cast<uint32_t>(height) ||
+      desc.stride != static_cast<uint32_t>(bi.stride))
+    return false;
+
+  PinnedSlot source;
+  if (!g_shm.pin_current(source) || !frame_is_fresh(source))
+    return false;
+
+  const auto cache = g_raw10_cache.get(static_cast<size_t>(layout - kPixel5RawLayouts.begin()), source);
+  if (!cache)
+    return false;
+  const size_t row_bytes = static_cast<size_t>(width / 4) * 5;
+
+  if (!wait_for_fence(fence, 8) || access("/data/cr/photo_mode", R_OK) != 0 ||
+      atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
+          CR_CHANNEL_STATE_READY ||
+      atomic_load_explicit(&source.header->generation, memory_order_acquire) != source.generation)
+    return false;
+  void* mapped = nullptr;
+  const int status = g_ahb_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+                                -1, nullptr, &mapped);
+  if (status != 0 || !mapped)
+  {
+    if (status == 0)
+      g_ahb_unlock(ahb, nullptr);
+    const unsigned failed = ++g_raw10_lock_failed;
+    if (failed <= 5)
+      LOGW("camera raw10: lock failed %dx%d stride=%d usage=0x%llx status=%d",
+           width, height, bi.stride, static_cast<unsigned long long>(anb->usage), status);
+    return false;
+  }
+  auto* destination = static_cast<uint8_t*>(mapped);
+  for (int y = 0; y < height; ++y)
+    memcpy(destination + static_cast<size_t>(y) * bi.stride,
+           cache->pixels.get() + static_cast<size_t>(y) * row_bytes, row_bytes);
+  if (g_ahb_unlock(ahb, nullptr) != 0)
+    return false;
+  const unsigned written = ++g_raw10_written;
+  if (written <= 5 || written % 60 == 0)
+    LOGI("camera raw10: replaced %u buffers (%dx%d stride=%d)",
+         written, width, height, bi.stride);
+  return true;
+}
+
 static CameraModes read_camera_modes(bool photo_supported)
 {
   return {access("/data/cr/video_mode", R_OK) == 0,
@@ -1115,14 +1328,16 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
     return cr::camhook::ReplacementOutcome::PassThrough;
 
   const int fmt = bi.format;
-  if (fmt != 0x21 && fmt != 0x11 && fmt != 0x22 && fmt != 0x23)
+  const bool raw10 = fmt == kRaw10Format;
+  if (fmt != 0x21 && fmt != 0x11 && fmt != 0x22 && fmt != 0x23 &&
+      !(raw10 && g_pixel5_raw10 && modes.photo))
   {
     ++g_stat_skip_fmt;
-    if (fmt == 0x25)
+    if (raw10)
       ++g_stat_skip_raw10;
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
-  if (fmt == 0x21 ? !modes.photo || !refresh_photo_mode_() : !modes.video)
+  if ((fmt == 0x21 || raw10) ? !modes.photo || !refresh_photo_mode_() : !modes.video)
     return cr::camhook::ReplacementOutcome::PassThrough;
 
   try_map_feed();
@@ -1172,6 +1387,14 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
   // Keep the mapper's operations stable through lock, write and unlock.
   std::shared_lock<std::shared_mutex> runtime_ops(g_runtime_ops_mu);
 
+  if (raw10)
+  {
+    if (overwrite_raw10(anb, bi, fence))
+      return cr::camhook::ReplacementOutcome::Raw10Written;
+    ++g_stat_skip_raw10;
+    ++g_stat_skip_fmt;
+    return cr::camhook::ReplacementOutcome::PassThrough;
+  }
   if (fmt == 0x21)
     return overwrite_blob_jpeg(anb, fence)
                ? cr::camhook::ReplacementOutcome::JpegWritten
@@ -1308,6 +1531,11 @@ static void report_queue_stats() noexcept
          (unsigned long long) g_hook_counters.original_queue_failed.load());
     if (const auto recording = g_hook_counters.recording_queued.load(); recording != 0)
       LOGI("camera_recording v1 queued=%llu", static_cast<unsigned long long>(recording));
+    const auto raw_written = g_raw10_written.load();
+    const auto raw_failed = g_raw10_lock_failed.load();
+    if (raw_written != 0 || raw_failed != 0)
+      LOGI("camera_raw10 v1 written=%u queued=%llu lock_error=%u",
+           raw_written, static_cast<unsigned long long>(g_hook_counters.raw10_queued.load()), raw_failed);
   }
 
   if ((n % 60) == 0)
@@ -1584,6 +1812,9 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
 
   resolve_scaler();
   resolve_photo_mode();
+  g_pixel5_raw10 = pixel5_raw10_profile();
+  if (g_pixel5_raw10)
+    g_raw10_cache.enable();
   open_shm();
 
   int hook_rc = -1;
@@ -1635,6 +1866,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_sh
 {
   if (!g_installed.exchange(false))
     return 0;
+  g_raw10_cache.stop();
   if (g_preview_spacer_stub)
   {
     shadowhook_unhook(g_preview_spacer_stub);

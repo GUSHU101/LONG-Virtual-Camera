@@ -859,6 +859,9 @@ camera_output_stats() {
       split($5, preview_errors, "=")
     }
     /^camera_recording v1 queued=[0-9]+$/ { split($3, recording, "=") }
+    /^camera_raw10 v1 written=[0-9]+ queued=[0-9]+ lock_error=[0-9]+$/ {
+      split($3, raw_written, "="); split($4, raw_queued, "="); split($5, raw_errors, "=")
+    }
     END {
       if (found) {
         print "camera_written_yuv=" yuv[2]
@@ -877,6 +880,11 @@ camera_output_stats() {
         print "camera_preview_errors=" preview_errors[2]
       }
       if (recording[2] != "") print "camera_recording_queued=" recording[2]
+      if (raw_written[2] != "") {
+        print "camera_written_raw_ten=" raw_written[2]
+        print "camera_queued_raw_ten=" raw_queued[2]
+        print "camera_raw_ten_lock_errors=" raw_errors[2]
+      }
     }'
 }
 

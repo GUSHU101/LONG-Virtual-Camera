@@ -26,6 +26,7 @@ enum class ReplacementOutcome : std::uint8_t
   YuvWritten,
   RecordingYuvWritten,
   JpegWritten,
+  Raw10Written,
 };
 
 struct HookCounters
@@ -35,6 +36,7 @@ struct HookCounters
   std::atomic<std::uint64_t> yuv_queued{0};
   std::atomic<std::uint64_t> recording_queued{0};
   std::atomic<std::uint64_t> jpeg_queued{0};
+  std::atomic<std::uint64_t> raw10_queued{0};
   std::atomic<std::uint64_t> pass_through{0};
   std::atomic<std::uint64_t> original_queue_failed{0};
 };
@@ -83,6 +85,8 @@ std::int32_t dispatch_queue(HookCounters& counters, bool enabled, ReplaceFn&& re
   }
   else if (outcome == ReplacementOutcome::JpegWritten)
     counters.jpeg_queued.fetch_add(1, std::memory_order_relaxed);
+  else if (outcome == ReplacementOutcome::Raw10Written)
+    counters.raw10_queued.fetch_add(1, std::memory_order_relaxed);
   return status;
 }
 

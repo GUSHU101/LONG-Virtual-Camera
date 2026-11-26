@@ -81,6 +81,11 @@ jobs:
             engines/camreplace/android/camhook/src/nv21_blit.c \
             -o /tmp/nv21_blit_test
           /tmp/nv21_blit_test
+          g++ -std=c++20 -Wall -Wextra -Werror \
+            -Iengines/camreplace/android/camhook/src \
+            tests/native/raw10_bayer_test.cpp engines/camreplace/android/camhook/src/nv21_blit.c \
+            -o /tmp/raw10_bayer_test
+          /tmp/raw10_bayer_test
           gcc -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer \
             -fsanitize=address,undefined -fno-sanitize-recover=all \
             -Iengines/camreplace/android/camhook/src tests/native/camera_jpeg_test.c \
