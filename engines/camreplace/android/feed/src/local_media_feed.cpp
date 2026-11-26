@@ -12,6 +12,7 @@
 #include "audio_shm.h"
 #include "feed_queues.h"
 #include "h264_decode_pipe.h"
+#include "media/Avcc.h"
 #include "media_codec_runtime.h"
 
 #include <media/NdkMediaCodec.h>
@@ -138,6 +139,42 @@ private:
   size_t index_ = 0;
 };
 
+cr_feed::SdrColorAspects read_track_color(AMediaFormat* track, const char* mime)
+{
+  cr_feed::SdrColorAspects color;
+  color.update(track);
+  if (strcmp(mime, "video/avc") != 0 || (color.standard != 0 && color.range != 0))
+    return color;
+
+  void* bytes = nullptr;
+  size_t size = 0;
+  if (!AMediaFormat_getBuffer(track, "csd-0", &bytes, &size) || !bytes || size < 4)
+    return color;
+  // Android AVC csd-0 contains a start-code-prefixed SPS. Some MP4 files
+  // describe color only here, and some device codecs report default aspects.
+  auto sps = std::span(static_cast<const uint8_t*>(bytes), size);
+  if (sps[0] == 0 && sps[1] == 0)
+  {
+    if (sps[2] == 1)
+      sps = sps.subspan(3);
+    else if (sps[2] == 0 && sps[3] == 1)
+      sps = sps.subspan(4);
+  }
+  const auto info = cr::media::parse_h264_sps(sps);
+  if (color.standard == 0)
+  {
+    switch (info.matrix_coefficients)
+    {
+    case 1: color.standard = 1; break; // BT.709
+    case 5: color.standard = 2; break; // BT.601 PAL / BT.470 BG
+    case 6: color.standard = 4; break; // BT.601 NTSC / SMPTE 170M
+    }
+  }
+  if (color.range == 0 && info.full_range.has_value())
+    color.range = *info.full_range ? 1 : 2;
+  return color;
+}
+
 class FileVideoDecoder
 {
 public:
@@ -192,7 +229,7 @@ public:
 
     AMediaFormat_getInt32(selected, AMEDIAFORMAT_KEY_WIDTH, &coded_width_);
     AMediaFormat_getInt32(selected, AMEDIAFORMAT_KEY_HEIGHT, &coded_height_);
-    track_color_.update(selected);
+    track_color_ = read_track_color(selected, mime);
     int32_t fps = 0;
     if (AMediaFormat_getInt32(selected, AMEDIAFORMAT_KEY_FRAME_RATE, &fps) &&
         fps >= 1 && fps <= 240)
@@ -403,10 +440,14 @@ private:
         cr::media::padded_yuv420_crop(stride_, slice_height_, crop_left_, crop_top_,
                                     crop_right_, crop_bottom_, kMaxDecoderFrameBytes,
                                     output_layout_);
-    // Decoder output takes precedence. Keep container values when a codec does
-    // not expose them. Untagged local media keeps its previous SDR defaults.
-    auto output_color = track_color_;
+    // Byte-buffer NV21 preserves the coded sample values. Prefer explicit
+    // source metadata over vendor defaults for that YUV output.
+    cr_feed::SdrColorAspects output_color;
     output_color.update(format);
+    if (track_color_.standard != 0)
+      output_color.standard = track_color_.standard;
+    if (track_color_.range != 0)
+      output_color.range = track_color_.range;
     output_color_flags_ = output_color.flags(false);
     __android_log_print(valid ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, TAG,
         OBF("local video output: color=0x%x stride=%d slice=%d crop=%d,%d-%d,%d valid=%d color_flags=%u").c_str(),

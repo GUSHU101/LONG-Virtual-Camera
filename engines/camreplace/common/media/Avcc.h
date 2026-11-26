@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -18,11 +19,18 @@ struct H264Dimensions
   explicit operator bool() const noexcept { return width != 0 && height != 0; }
 };
 
+struct H264SpsInfo
+{
+  H264Dimensions dimensions;
+  std::optional<bool> full_range;
+  std::uint8_t matrix_coefficients = 2; // Unspecified in H.264 VUI.
+};
+
 namespace detail
 {
 
 // RBSP/SPS geometry reader adapted from ReCam's MIT-licensed H.264 parser.
-// It is intentionally limited to the fields needed to discover dimensions,
+// It reads the fields needed to discover dimensions and VUI video signal type,
 // with caps added before every attacker-controlled loop and multiplication.
 class H264BitReader
 {
@@ -110,17 +118,17 @@ inline void skip_h264_scaling_list(H264BitReader& reader, unsigned size)
   std::int32_t next = 8;
   for (unsigned i = 0; i < size && !reader.bad(); ++i)
   {
-    if (next != 0) next = (last + reader.se() + 256) % 256;
+    if (next != 0) next = (last + reader.se() % 256 + 256) % 256;
     if (next != 0) last = next;
   }
 }
 
 } // namespace detail
 
-inline H264Dimensions parse_h264_sps_dimensions(
+inline H264SpsInfo parse_h264_sps(
     std::span<const std::uint8_t> nalu)
 {
-  H264Dimensions result{};
+  H264SpsInfo result{};
   if (nalu.size() < 4 || (nalu[0] & 0x1fu) != 7u) return result;
   detail::H264BitReader reader(nalu.subspan(1));
   const std::uint32_t profile = reader.bits(8);
@@ -211,9 +219,37 @@ inline H264Dimensions parse_h264_sps_dimensions(
   const std::uint64_t height = coded_height - vertical_crop;
   if (width < 2 || height < 2 || width > 16384 || height > 16384)
     return result;
-  result.width = static_cast<std::uint32_t>(width);
-  result.height = static_cast<std::uint32_t>(height);
+  result.dimensions = {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
+
+  if (!reader.bit()) return result; // vui_parameters_present_flag
+  if (reader.bit() && reader.bits(8) == 255u) // Extended_SAR
+  {
+    reader.bits(16); // sar_width
+    reader.bits(16); // sar_height
+  }
+  if (reader.bit()) reader.bit(); // overscan_appropriate_flag
+  if (!reader.bit()) return result; // video_signal_type_present_flag
+  reader.bits(3); // video_format
+  const bool full_range = reader.bit() != 0;
+  std::uint8_t matrix = 2;
+  if (reader.bit()) // colour_description_present_flag
+  {
+    reader.bits(8); // colour_primaries
+    reader.bits(8); // transfer_characteristics
+    matrix = static_cast<std::uint8_t>(reader.bits(8));
+  }
+  if (!reader.bad())
+  {
+    result.full_range = full_range;
+    result.matrix_coefficients = matrix;
+  }
   return result;
+}
+
+inline H264Dimensions parse_h264_sps_dimensions(
+    std::span<const std::uint8_t> nalu)
+{
+  return parse_h264_sps(nalu).dimensions;
 }
 
 struct AvcDecoderConfig

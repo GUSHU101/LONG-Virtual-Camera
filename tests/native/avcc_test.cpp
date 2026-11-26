@@ -24,6 +24,19 @@ int main()
   assert(dimensions.width == 1280 && dimensions.height == 720);
   const std::vector<std::uint8_t> truncated_sps{0x67, 0x64, 0x00, 0x1f};
   assert(!cr::media::parse_h264_sps_dimensions(truncated_sps));
+  const auto untagged = cr::media::parse_h264_sps(sps_1280x720);
+  assert(!untagged.full_range.has_value() && untagged.matrix_coefficients == 2);
+  const std::vector<std::uint8_t> bt709_full_sps{
+      0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50, 0x05, 0xbb,
+      0x01, 0x6e, 0x04, 0x04, 0x02, 0x80, 0x00, 0x00, 0x03, 0x00,
+      0x80, 0x00, 0x00, 0x1e, 0x07, 0x8c, 0x18, 0xcb};
+  const auto tagged = cr::media::parse_h264_sps(bt709_full_sps);
+  assert(tagged.dimensions.width == 1280 && tagged.dimensions.height == 720);
+  assert(tagged.full_range == true && tagged.matrix_coefficients == 1);
+  const auto truncated_vui = cr::media::parse_h264_sps(
+      std::span<const std::uint8_t>(bt709_full_sps).first(13));
+  assert(truncated_vui.dimensions.width == 1280);
+  assert(!truncated_vui.full_range.has_value() && truncated_vui.matrix_coefficients == 2);
 
   for (const std::uint8_t minus_one : {std::uint8_t{0}, std::uint8_t{1}, std::uint8_t{3}})
   {
