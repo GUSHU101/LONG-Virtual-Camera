@@ -70,10 +70,17 @@ struct PinnedSlot
   uint32_t color_flags = 0;
   uint64_t frame_seq = 0;
 
-  ~PinnedSlot()
+  ~PinnedSlot() { release_read(); }
+
+  // Keep the publication metadata for commit-time checks after the caller
+  // has finished reading or made its own copy of the pixels.
+  void release_read() noexcept
   {
-    if (header)
+    if (data)
+    {
       cr_feed_slot_release_read(header, index);
+      data = nullptr;
+    }
   }
   PinnedSlot() = default;
   PinnedSlot(const PinnedSlot&) = delete;
@@ -983,23 +990,6 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     return false;
   if (!feed_header_sane(g_shm.header, g_shm.size))
     return false;
-  PinnedSlot source;
-  if (!g_shm.pin_current(source))
-    return false;
-  if (!frame_is_fresh(source))
-  {
-    ++g_stat_skip_stale;
-    return false;
-  }
-  const uint64_t cur_frame = source.frame_seq;
-  if (cur_frame == 0)
-    return false;
-
-  const int src_w = (int) source.width;
-  const int src_h = (int) source.height;
-  if (src_w < 16 || src_h < 16)
-    return false;
-
   const int W = anb->width;
   const int H = anb->height;
   // Android's BLOB ABI is one-dimensional: height must be exactly one and
@@ -1036,6 +1026,19 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
                                   &target_w, &target_h) != 0 || !blob_lock.unlock())
       return false;
   }
+  PinnedSlot source;
+  if (!g_shm.pin_current(source))
+    return false;
+  if (!frame_is_fresh(source))
+  {
+    ++g_stat_skip_stale;
+    return false;
+  }
+  const uint64_t cur_frame = source.frame_seq;
+  const int src_w = static_cast<int>(source.width);
+  const int src_h = static_cast<int>(source.height);
+  if (src_w < 16 || src_h < 16)
+    return false;
   const size_t target_pixels = static_cast<size_t>(target_w) * target_h;
   constexpr size_t kMaxJpegPixels = 16u * 1024u * 1024u;
   cr_nv21_crop_rect crop;
@@ -1059,20 +1062,22 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   const bool cache_hit = static_cast<bool>(jpeg.data);
   if (!cache_hit)
   {
-    const uint8_t* pixels = source.data;
-    size_t pixel_bytes = source.slot_size;
-    std::vector<uint8_t> scaled;
-    if (src_w != target_w || src_h != target_h)
+    const bool same_size = src_w == target_w && src_h == target_h;
+    const size_t pixel_bytes = target_pixels + target_pixels / 2;
+    std::unique_ptr<uint8_t[]> pixels(new (std::nothrow) uint8_t[pixel_bytes]);
+    if (!pixels)
+      return false;
+    if (same_size)
+      memcpy(pixels.get(), source.data, pixel_bytes);
+    else
     {
-      scaled.resize(target_pixels + target_pixels / 2);
       // Use the same aspect-preserving crop as the live camera outputs.
-      cr_nv21_blit(source.data, src_w, src_h, scaled.data(), scaled.data() + target_pixels,
+      cr_nv21_blit(source.data, src_w, src_h, pixels.get(), pixels.get() + target_pixels,
                     target_w, target_h, target_w, target_w, 0);
-      pixels = scaled.data();
-      pixel_bytes = scaled.size();
     }
+    source.release_read();
     uint8_t* encoded = nullptr;
-    const int result = cr_nv21_to_jpeg_color(pixels, pixel_bytes, target_w, target_h,
+    const int result = cr_nv21_to_jpeg_color(pixels.get(), pixel_bytes, target_w, target_h,
         encode_cap, 85, &encoded, &jpeg.size, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
         (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0);
     if (result != 0)
@@ -1090,6 +1095,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     std::lock_guard<std::mutex> guard(g_jpeg_cache_mutex);
     g_jpeg_cache = jpeg;
   }
+  source.release_read();
   if (jpeg.size > encode_cap)
     return false;
 
@@ -1408,6 +1414,7 @@ private:
 
   void run() noexcept
   {
+    std::vector<uint8_t> input;
     for (;;)
     {
       size_t profile;
@@ -1438,11 +1445,15 @@ private:
             atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
                 CR_CHANNEL_STATE_READY)
           continue;
+        const size_t input_bytes =
+            static_cast<size_t>(source.width) * source.height * 3 / 2;
+        input.assign(source.data, source.data + input_bytes);
+        source.release_read();
         const size_t size = static_cast<size_t>(width / 4) * 5 * height;
         auto result = std::make_shared<Raw10Frame>();
         result->pixels.reset(new uint8_t[size]);
         result->generation = generation;
-        if (!cr::camhook::nv21_to_bggr10({source.data, source.slot_size}, source.width,
+        if (!cr::camhook::nv21_to_bggr10(input, source.width,
                                         source.height, {result->pixels.get(), size}, width, height,
                                         color, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
                                         (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0))
@@ -1517,6 +1528,7 @@ static bool overwrite_raw10(ANWB* anb, const ANWBInfo& bi, int fence)
     return false;
   }
   const auto cache = g_raw10_cache.get(profile, source, *color);
+  source.release_read();
   if (!cache)
     return false;
   const size_t row_bytes = static_cast<size_t>(width / 4) * 5;
@@ -1706,6 +1718,7 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
                         view.y, view.cb, view.cr, W, H,
                         (int) view.ystride, (int) view.uvstride);
 
+  source.release_read();
   const bool replaced = unlock(handle, ahb, view);
   if (replaced && !deferred)
     ++g_stat_blit_ok;

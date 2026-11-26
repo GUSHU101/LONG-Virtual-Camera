@@ -14,6 +14,11 @@ class TrackFreshness
 public:
   using Clock = std::chrono::steady_clock;
 
+  Clock::time_point deadline(Clock::duration timeout) const noexcept
+  {
+    return active_ ? last_progress_ + timeout : Clock::time_point::max();
+  }
+
   bool expired(uint64_t publications, Clock::time_point now, Clock::duration timeout) noexcept
   {
     if (publications != observed_)
@@ -22,7 +27,7 @@ public:
       last_progress_ = now;
       active_ = publications != 0;
     }
-    if (!active_ || now - last_progress_ < timeout)
+    if (!active_ || now < deadline(timeout))
       return false;
     active_ = false;
     return true;

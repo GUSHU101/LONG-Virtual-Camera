@@ -59,6 +59,7 @@ static void verify_idle_receive()
     auto& state = *static_cast<Idle*>(context);
     ++state.calls;
     assert(::send(state.peer, "b", 1, 0) == 1);
+    return Socket::Clock::time_point::max();
   };
   char bytes[2]{};
   const auto started = Socket::Clock::now();
@@ -69,6 +70,7 @@ static void verify_idle_receive()
 
   auto leave_waiting = [](void* context) noexcept {
     ++*static_cast<int*>(context);
+    return Socket::Clock::time_point::max();
   };
   int ticks = 0;
   const auto bounded = Socket::Clock::now();
@@ -79,6 +81,16 @@ static void verify_idle_receive()
   const auto expired = Socket::Clock::now();
   assert(!input.receive(bytes, 1, expired + 30ms, {expired, service, &progress}));
   assert(errno == ETIMEDOUT && progress.calls == 1);
+
+  int deadlines = 0;
+  auto scheduled = [](void* context) noexcept {
+    const int count = ++*static_cast<int*>(context);
+    return count == 1 ? Socket::Clock::now() + 20ms : Socket::Clock::time_point::max();
+  };
+  const auto quiet = Socket::Clock::now();
+  assert(!input.receive(bytes, 1, quiet + 100ms,
+                        {quiet, scheduled, &deadlines, quiet + 20ms}));
+  assert(errno == ETIMEDOUT && deadlines == 2);
   ::close(pair[0]);
   ::close(pair[1]);
 }

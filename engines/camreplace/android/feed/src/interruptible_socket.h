@@ -76,8 +76,10 @@ public:
   struct ReceiveIdle
   {
     Clock::time_point until{};
-    void (*service)(void*) noexcept = nullptr;
+    // Return the next independent service deadline, or time_point::max().
+    Clock::time_point (*service)(void*) noexcept = nullptr;
     void* context = nullptr;
+    Clock::time_point wake_at = Clock::time_point::max();
   };
 
   DeadlineSocket(int fd, const std::atomic<bool>& stop, Clock::duration io_timeout,
@@ -127,6 +129,7 @@ private:
                 Operation operation, const ReceiveIdle* idle) const noexcept
   {
     const auto until = std::min(transfer_deadline(), limit);
+    auto wake_at = idle ? idle->wake_at : Clock::time_point::max();
     while (length != 0)
     {
       if (stop_.load(std::memory_order_relaxed))
@@ -141,18 +144,24 @@ private:
         errno = ETIMEDOUT;
         return false;
       }
+      if (idle && idle->service && now >= wake_at)
+      {
+        wake_at = idle->service(idle->context);
+        continue;
+      }
       const bool service_idle = idle && idle->service && now < idle->until;
       const auto cap = service_idle ? std::chrono::milliseconds(8) :
                                      std::chrono::milliseconds(250);
-      const auto ms = std::min(std::chrono::ceil<std::chrono::milliseconds>(remaining),
+      const auto wait = std::min(remaining, wake_at - now);
+      const auto ms = std::min(std::chrono::ceil<std::chrono::milliseconds>(wait),
                                cap).count();
       pollfd descriptor{fd_, event, 0};
       const int ready = ::poll(&descriptor, 1, static_cast<int>(ms));
       if (ready == 0)
       {
-        if (service_idle && Clock::now() < until &&
+        if (service_idle && Clock::now() < wake_at && Clock::now() < until &&
             !stop_.load(std::memory_order_relaxed))
-          idle->service(idle->context);
+          wake_at = idle->service(idle->context);
         continue;
       }
       if (ready < 0 && errno == EINTR)

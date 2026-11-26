@@ -415,7 +415,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
     return true;
   };
 
-  while (!g_stop.load(std::memory_order_relaxed))
+  auto update_track_readiness = [&]() noexcept
   {
     const auto now = std::chrono::steady_clock::now();
     if (video_freshness.expired(pipe.frames_published(), now, kTrackPublicationTimeout))
@@ -428,7 +428,25 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
       audio_pipe.revoke_pcm();
       LOGW("rtmp: no new PCM published in two seconds, waiting for fresh audio");
     }
+  };
 
+  auto next_track_deadline = [&]() noexcept
+  {
+    return std::min(video_freshness.deadline(kTrackPublicationTimeout),
+                    audio_freshness.deadline(kTrackPublicationTimeout));
+  };
+
+  auto service_media = [&]() noexcept
+  {
+    if (cr::feed::DeadlineSocket::Clock::now() < decoder_idle_until)
+      pipe.drain();
+    update_track_readiness();
+    return next_track_deadline();
+  };
+
+  while (!g_stop.load(std::memory_order_relaxed))
+  {
+    update_track_readiness();
     cr::feed::RtmpMessage message;
     // One deadline covers the entire chunk, including header fields and
     // transfers split by an acknowledgement boundary.
@@ -448,8 +466,8 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
         // recent-input window and the original socket deadline.
         const cr::feed::DeadlineSocket::ReceiveIdle idle{
             decoder_idle_until, [](void* context) noexcept {
-              static_cast<cr_feed::H264DecodePipe*>(context)->drain();
-            }, &pipe};
+              return (*static_cast<decltype(service_media)*>(context))();
+            }, &service_media, next_track_deadline()};
         if (!connection.receive(data, take, deadline, idle))
           return false;
         data += take;
@@ -784,9 +802,11 @@ done:
   LOGI(OBF("rtmp: reader disconnected (input=%llu published=%llu audio=%s)").c_str(),
        (unsigned long long) pipe.input_count(), (unsigned long long) pipe.frames_published(),
        audio_pipe_started ? "on" : OBF("off").c_str());
+  const bool delivered_media =
+      pipe.frames_published() != 0 || audio_pipe.pcm_blocks_published() != 0;
   pipe.stop();
   audio_pipe.stop();
-  return true;
+  return delivered_media;
 }
 
 } // namespace
@@ -858,6 +878,7 @@ extern "C" int cr_feed_run_rtmp_pull(const char* url, int video_enabled, int aud
   unsigned retry = 0;
   while (!g_stop.load(std::memory_order_relaxed))
   {
+    bool delivered_media = false;
     const int socket = connect_rtmp(address);
     if (socket >= 0)
     {
@@ -865,7 +886,7 @@ extern "C" int cr_feed_run_rtmp_pull(const char* url, int video_enabled, int aud
       LOGI("rtmp: connected to desktop media server");
       try
       {
-        play_session(socket, address, video_enabled != 0, audio_enabled != 0);
+        delivered_media = play_session(socket, address, video_enabled != 0, audio_enabled != 0);
       }
       catch (const std::bad_alloc&)
       {
@@ -877,7 +898,10 @@ extern "C" int cr_feed_run_rtmp_pull(const char* url, int video_enabled, int aud
     {
       LOGW("rtmp: desktop media server unreachable, retrying");
     }
-    for (int i = 0; i < 10 && !g_stop.load(std::memory_order_relaxed); ++i)
+    // Reconnect quickly after a working stream. Unavailable or rejected
+    // sessions retain the longer delay to avoid hammering the relay.
+    const int retry_ticks = delivered_media ? 2 : 10;
+    for (int i = 0; i < retry_ticks && !g_stop.load(std::memory_order_relaxed); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   return 0;
