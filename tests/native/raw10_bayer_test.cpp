@@ -53,4 +53,15 @@ int main()
   assert(raw != red_709);
   assert(cr::camhook::nv21_to_bggr10(gray, 4, 2, raw, 4, 2, {}, true, true));
   assert(unpack(0, 0) < green + 64);
+
+  cr::camhook::Raw10StreamCalibration history;
+  const int wide = 0, other = 1;
+  constexpr int64_t observed = 20'000'000'000LL;
+  history.remember(&wide, 0, observed, calibrated);
+  history.remember(&wide, 0, observed - 1, {});
+  assert(history.recall(&wide, 0, observed + 7'000'000'000LL) == calibrated);
+  assert(!history.recall(&wide, 0, observed + 12'000'000'001LL));
+  assert(!history.recall(&wide, 0, observed - 1));
+  assert(!history.recall(&wide, 1, observed));
+  assert(!history.recall(&other, 0, observed));
 }

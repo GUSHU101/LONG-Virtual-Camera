@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 
 namespace cr::camhook
 {
@@ -17,6 +18,52 @@ struct Raw10Color
   Matrix odd = even;
 
   bool operator==(const Raw10Color&) const = default;
+};
+
+class Raw10StreamCalibration
+{
+public:
+  void remember(const void* stream, size_t profile, int64_t timestamp, const Raw10Color& color)
+  {
+    if (!stream || timestamp <= 0)
+      return;
+    auto slot = find(stream, profile);
+    if (slot == entries_.end())
+      slot = std::min_element(entries_.begin(), entries_.end(),
+          [](const Entry& a, const Entry& b) { return a.timestamp < b.timestamp; });
+    else if (slot->timestamp > timestamp)
+      return;
+    *slot = {stream, profile, timestamp, color};
+  }
+
+  std::optional<Raw10Color> recall(const void* stream, size_t profile, int64_t timestamp)
+  {
+    if (!stream || timestamp <= 0)
+      return {};
+    const auto slot = find(stream, profile);
+    constexpr int64_t kMaxCalibrationAgeNs = 12'000'000'000LL;
+    if (slot == entries_.end() || timestamp < slot->timestamp ||
+        timestamp - slot->timestamp > kMaxCalibrationAgeNs)
+      return {};
+    return slot->color;
+  }
+
+private:
+  struct Entry
+  {
+    const void* stream = nullptr;
+    size_t profile = 0;
+    int64_t timestamp = 0;
+    Raw10Color color;
+  };
+  std::array<Entry, 8> entries_{};
+
+  std::array<Entry, 8>::iterator find(const void* stream, size_t profile)
+  {
+    return std::find_if(entries_.begin(), entries_.end(), [&](const Entry& entry) {
+      return entry.stream == stream && entry.profile == profile;
+    });
+  }
 };
 
 inline bool invert_sensor_color(const std::array<float, 9>& ccm,

@@ -1147,6 +1147,8 @@ static bool g_pixel5_raw10 = false;
 static std::atomic<unsigned> g_raw10_written{0};
 static std::atomic<unsigned> g_raw10_lock_failed{0};
 static std::atomic<unsigned> g_raw10_no_color{0};
+static std::atomic<unsigned> g_raw10_bad_layout{0};
+static std::atomic<unsigned> g_raw10_fence_timeout{0};
 
 // Android 14 camera_capture_result and camera_metadata_ro_entry ABIs on
 // the reviewed Pixel 5 build. Read only the metadata owned by this callback.
@@ -1196,6 +1198,10 @@ static std::mutex g_capture_colors_mutex;
 static std::array<CaptureColor, 64> g_capture_colors;
 static size_t g_capture_color_next = 0;
 static thread_local int64_t g_return_sensor_timestamp = 0;
+static thread_local const void* g_return_camera_stream = nullptr;
+
+static cr::camhook::Raw10StreamCalibration g_stream_colors;
+static std::atomic<unsigned> g_raw10_reused_color{0};
 
 static std::optional<cr::camhook::Raw10Color> capture_color(const void* metadata)
 {
@@ -1271,10 +1277,13 @@ static int32_t proxy_camera_return(void* stream, const void* buffer, int64_t tim
   if (!original)
     return -ENOSYS;
   const int64_t previous = g_return_sensor_timestamp;
+  const void* previous_stream = g_return_camera_stream;
   g_return_sensor_timestamp = timestamp;
+  g_return_camera_stream = stream;
   const auto status = original(stream, buffer, timestamp, readout, output, transform,
                                surface_ids, release_fence);
   g_return_sensor_timestamp = previous;
+  g_return_camera_stream = previous_stream;
   return status;
 }
 
@@ -1290,17 +1299,33 @@ static std::optional<cr::camhook::Raw10Color> camera_color_for_buffer(size_t pro
     if (color.timestamp <= 0)
       continue;
     const int64_t distance = std::abs(color.timestamp - g_return_sensor_timestamp);
-    if (distance < nearest)
+    const bool calibrated = (profile < color.rear.size() && color.rear[profile]) ||
+                             color.logical.has_value();
+    if (calibrated && distance < nearest)
     {
       best = &color;
       nearest = distance;
     }
   }
-  if (!best)
-    return {};
-  if (profile < best->rear.size() && best->rear[profile])
-    return best->rear[profile];
-  return best->logical;
+  if (best)
+  {
+    const auto value = profile < best->rear.size() && best->rear[profile] ?
+                         best->rear[profile] : best->logical;
+    g_stream_colors.remember(g_return_camera_stream, profile, best->timestamp, *value);
+    return value;
+  }
+
+  // Night Sight can emit RAW buffers with no matching color result during
+  // a long exposure burst. Reuse the same stream's reviewed calibration.
+  auto previous = g_stream_colors.recall(g_return_camera_stream, profile,
+                                        g_return_sensor_timestamp);
+  if (previous)
+  {
+    const auto used = ++g_raw10_reused_color;
+    if (used <= 5 || used % 60 == 0)
+      LOGI("camera RAW10: reused same-stream color (profile=%zu total=%u)", profile, used);
+  }
+  return previous;
 }
 
 static void remove_camera_color_hooks()
@@ -1345,8 +1370,32 @@ struct Raw10Frame
 {
   std::unique_ptr<uint8_t[]> pixels;
   uint32_t generation = 0;
+  uint64_t sequence = 0;
   int64_t prepared = 0;
 };
+
+static std::shared_ptr<Raw10Frame> render_raw10(size_t profile, PinnedSlot& source,
+                                               const cr::camhook::Raw10Color& color,
+                                               std::vector<uint8_t>& input)
+{
+  const auto [width, height, stride] = kPixel5RawLayouts[profile];
+  const size_t input_bytes =
+      static_cast<size_t>(source.width) * source.height * 3 / 2;
+  input.assign(source.data, source.data + input_bytes);
+  source.release_read();
+  const size_t size = static_cast<size_t>(width / 4) * 5 * height;
+  auto result = std::make_shared<Raw10Frame>();
+  result->pixels.reset(new uint8_t[size]);
+  result->generation = source.generation;
+  result->sequence = source.frame_seq;
+  if (!cr::camhook::nv21_to_bggr10(input, source.width, source.height,
+                                  {result->pixels.get(), size}, width, height,
+                                  color, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
+                                  (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0))
+    return {};
+  result->prepared = monotonic_ns();
+  return result;
+}
 
 class Raw10Cache
 {
@@ -1372,36 +1421,66 @@ public:
     slots_ = {};
   }
 
-  std::shared_ptr<const Raw10Frame> get(size_t profile, const PinnedSlot& source,
+  std::shared_ptr<const Raw10Frame> get(size_t profile, PinnedSlot& source,
                                         const cr::camhook::Raw10Color& color)
   {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (!enabled_)
       return {};
     auto& slot = slots_[profile];
     const auto now = monotonic_ns();
-    constexpr int64_t kRefreshNs = 250'000'000LL;
-    if (slot.generation != source.generation ||
-        ((slot.sequence != source.frame_seq || slot.color != color) &&
-         now - slot.requested >= kRefreshNs))
-    {
-      if (!worker_.joinable())
-        worker_ = std::thread(&Raw10Cache::run, this);
-      slot.generation = source.generation;
-      slot.sequence = source.frame_seq;
-      slot.color = color;
-      slot.requested = now;
-      slot.pending = true;
-      changed_.notify_one();
-    }
     constexpr int64_t kMaxRawAgeNs = 750'000'000LL;
     if (slot.frame && slot.frame->generation == source.generation &&
         now - slot.frame->prepared <= kMaxRawAgeNs)
+    {
+      constexpr int64_t kRefreshNs = 250'000'000LL;
+      if ((slot.sequence != source.frame_seq || slot.color != color) &&
+          now - slot.requested >= kRefreshNs)
+      {
+        if (!worker_.joinable())
+          worker_ = std::thread(&Raw10Cache::run, this);
+        slot.sequence = source.frame_seq;
+        slot.color = color;
+        slot.requested = now;
+        slot.pending = true;
+        changed_.notify_one();
+      }
       return slot.frame;
-    return {};
+    }
+
+    // Night Sight can stop delivering RAW for several seconds and then
+    // immediately submit a burst. The first buffer may be used in the saved
+    // shot. Prepare that frame now when no valid cache entry is available.
+    slot.generation = source.generation;
+    slot.sequence = source.frame_seq;
+    slot.color = color;
+    slot.requested = now;
+    slot.pending = false;
+    lock.unlock();
+    std::vector<uint8_t> input;
+    auto frame = render_raw10(profile, source, color, input);
+    if (frame)
+    {
+      publish(profile, frame);
+      const auto miss = ++cold_preparations_;
+      if (miss <= 8 || miss % 60 == 0)
+        LOGI("camera RAW10: prepared first buffer after pause (profile=%zu, %lld ms, total=%u)",
+             profile, static_cast<long long>((monotonic_ns() - now) / 1'000'000), miss);
+    }
+    return frame;
   }
 
 private:
+  void publish(size_t profile, const std::shared_ptr<Raw10Frame>& frame)
+  {
+    std::lock_guard lock(mutex_);
+    auto& slot = slots_[profile];
+    if (enabled_ && slot.generation == frame->generation &&
+        (!slot.frame || slot.frame->generation != frame->generation ||
+         slot.frame->sequence <= frame->sequence))
+      slot.frame = frame;
+  }
+
   struct Slot
   {
     std::shared_ptr<const Raw10Frame> frame;
@@ -1438,30 +1517,14 @@ private:
       }
       try
       {
-        const auto [width, height, stride] = kPixel5RawLayouts[profile];
         PinnedSlot source;
         if (access("/data/cr/photo_mode", R_OK) != 0 ||
             !g_shm.pin_current(source) || source.generation != generation ||
             atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
                 CR_CHANNEL_STATE_READY)
           continue;
-        const size_t input_bytes =
-            static_cast<size_t>(source.width) * source.height * 3 / 2;
-        input.assign(source.data, source.data + input_bytes);
-        source.release_read();
-        const size_t size = static_cast<size_t>(width / 4) * 5 * height;
-        auto result = std::make_shared<Raw10Frame>();
-        result->pixels.reset(new uint8_t[size]);
-        result->generation = generation;
-        if (!cr::camhook::nv21_to_bggr10(input, source.width,
-                                        source.height, {result->pixels.get(), size}, width, height,
-                                        color, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
-                                        (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0))
-          continue;
-        result->prepared = monotonic_ns();
-        std::lock_guard lock(mutex_);
-        if (enabled_ && slots_[profile].generation == generation)
-          slots_[profile].frame = std::move(result);
+        if (auto result = render_raw10(profile, source, color, input))
+          publish(profile, result);
       }
       catch (const std::exception&)
       {
@@ -1474,6 +1537,7 @@ private:
   std::condition_variable changed_;
   std::array<Slot, kPixel5RawLayouts.size()> slots_{};
   std::thread worker_;
+  std::atomic<unsigned> cold_preparations_{0};
   size_t next_ = 0;
   bool enabled_ = false;
 };
@@ -1502,7 +1566,13 @@ static bool overwrite_raw10(ANWB* anb, const ANWBInfo& bi, int fence)
         return item.width == width && item.height == height && item.stride == bi.stride;
       });
   if (layout == kPixel5RawLayouts.end())
+  {
+    const auto skipped = ++g_raw10_bad_layout;
+    if (skipped <= 8 || skipped % 60 == 0)
+      LOGW("camera RAW10: unsupported layout %dx%d stride=%d (total=%u)",
+           width, height, bi.stride, skipped);
     return false;
+  }
   auto* ahb = static_cast<AHardwareBuffer*>(g_get_hardware_buffer(anb));
   if (!ahb)
     return false;
@@ -1523,8 +1593,9 @@ static bool overwrite_raw10(ANWB* anb, const ANWBInfo& bi, int fence)
   if (!color)
   {
     const auto skipped = ++g_raw10_no_color;
-    if (skipped <= 3)
-      LOGW("camera RAW10: waiting for capture color calibration");
+    if (skipped <= 8 || skipped % 60 == 0)
+      LOGW("camera RAW10: capture color unavailable (profile=%zu timestamp=%lld total=%u)",
+           profile, static_cast<long long>(g_return_sensor_timestamp), skipped);
     return false;
   }
   const auto cache = g_raw10_cache.get(profile, source, *color);
@@ -1533,7 +1604,14 @@ static bool overwrite_raw10(ANWB* anb, const ANWBInfo& bi, int fence)
     return false;
   const size_t row_bytes = static_cast<size_t>(width / 4) * 5;
 
-  if (!wait_for_fence(fence, 8) || access("/data/cr/photo_mode", R_OK) != 0 ||
+  if (!wait_for_fence(fence, 8))
+  {
+    const auto skipped = ++g_raw10_fence_timeout;
+    if (skipped <= 8 || skipped % 60 == 0)
+      LOGW("camera RAW10: release fence timed out (profile=%zu total=%u)", profile, skipped);
+    return false;
+  }
+  if (access("/data/cr/photo_mode", R_OK) != 0 ||
       atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
           CR_CHANNEL_STATE_READY ||
       atomic_load_explicit(&source.header->generation, memory_order_acquire) != source.generation)
