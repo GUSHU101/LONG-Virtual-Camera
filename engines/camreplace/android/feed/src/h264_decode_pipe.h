@@ -63,6 +63,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "shm.h"
 #include "nv21_blit.h"
 #include "media_codec_runtime.h"
@@ -193,7 +197,10 @@ struct ShmOut
     return true;
   }
 
-  bool publish_nv21(const uint8_t* src, uint32_t color_flags = 0)
+  // The writer fills an owned slot synchronously. Readers only see the slot
+  // after the complete image is committed.
+  template<typename Write>
+  bool write_nv21(uint32_t color_flags, const Write& write)
   {
     if (!map)
       return false;
@@ -201,18 +208,25 @@ struct ShmOut
     uint32_t next = 0;
     if (!cr_feed_claim_write(hd, cur_wi, &next))
       return false;
+    write(slot0 + (size_t) next * CR_FEED_MAX_NV21_BYTES);
     if (__atomic_load_n(&hd->format, __ATOMIC_RELAXED) != color_flags)
     {
       atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_NONE, memory_order_release);
       __atomic_store_n(&hd->format, color_flags, __ATOMIC_RELEASE);
       atomic_store(&hd->generation, cr_feed_next_generation(atomic_load(&hd->generation)));
     }
-    memcpy(slot0 + (size_t) next * CR_FEED_MAX_NV21_BYTES, src, slot_bytes);
     cr_feed_publish(hd, next);
     atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_READY,
                           memory_order_release);
     cur_wi = next;
     return true;
+  }
+
+  bool publish_nv21(const uint8_t* src, uint32_t color_flags = 0)
+  {
+    return write_nv21(color_flags, [&](uint8_t* dest) {
+      memcpy(dest, src, slot_bytes);
+    });
   }
 
   void revoke_frame()
@@ -245,22 +259,36 @@ struct ShmOut
 
 // Colour-format converters (NV12 → NV21 / I420 → NV21). Same code that was
 // inline in tcp_h264_feed.cpp.
+inline void copy_decoder_luma(const uint8_t* src, int width, int height,
+                              int stride, uint8_t* dst)
+{
+  if (stride == width)
+  {
+    memcpy(dst, src, static_cast<size_t>(width) * height);
+    return;
+  }
+  for (int y = 0; y < height; ++y)
+    memcpy(dst + static_cast<size_t>(y) * width,
+           src + static_cast<size_t>(y) * stride, static_cast<size_t>(width));
+}
+
 inline void nv12_to_nv21(const uint8_t* src_y, const uint8_t* src_uv,
                          int ww, int hh, int src_y_stride,
                          int src_uv_stride, uint8_t* dst)
 {
-  for (int y = 0; y < hh; ++y)
-  {
-    memcpy(dst + (size_t) y * ww,
-           src_y + (size_t) y * src_y_stride, (size_t) ww);
-  }
+  copy_decoder_luma(src_y, ww, hh, src_y_stride, dst);
   uint8_t* dst_vu = dst + (size_t) ww * hh;
   const int uv_rows = hh / 2;
   for (int y = 0; y < uv_rows; ++y)
   {
     const uint8_t* s = src_uv + (size_t) y * src_uv_stride;
     uint8_t* d = dst_vu + (size_t) y * ww;
-    for (int x = 0; x < ww; x += 2)
+    int x = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    for (; x <= ww - 16; x += 16)
+      vst1q_u8(d + x, vrev16q_u8(vld1q_u8(s + x)));
+#endif
+    for (; x < ww; x += 2)
     {
       d[x + 0] = s[x + 1];
       d[x + 1] = s[x + 0];
@@ -273,18 +301,22 @@ inline void i420_to_nv21(const uint8_t* src_y, const uint8_t* src_u,
                          int src_y_stride, int src_u_stride,
                          int src_v_stride, uint8_t* dst)
 {
-  for (int y = 0; y < hh; ++y)
-  {
-    memcpy(dst + (size_t) y * ww,
-           src_y + (size_t) y * src_y_stride, (size_t) ww);
-  }
+  copy_decoder_luma(src_y, ww, hh, src_y_stride, dst);
   uint8_t* dst_vu = dst + (size_t) ww * hh;
   for (int y = 0; y < hh / 2; ++y)
   {
     const uint8_t* u = src_u + (size_t) y * src_u_stride;
     const uint8_t* v = src_v + (size_t) y * src_v_stride;
     uint8_t* out = dst_vu + (size_t) y * ww;
-    for (int x = 0; x < ww / 2; ++x)
+    int x = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    for (; x <= ww / 2 - 16; x += 16)
+    {
+      const uint8x16x2_t vu{vld1q_u8(v + x), vld1q_u8(u + x)};
+      vst2q_u8(out + x * 2, vu);
+    }
+#endif
+    for (; x < ww / 2; ++x)
     {
       out[x * 2 + 0] = v[x];
       out[x * 2 + 1] = u[x];
@@ -384,10 +416,8 @@ public:
       dec = nullptr;
       return false;
     }
-    nv21.assign((size_t) w * h * 3 / 2, 0);
     if (output_w != w || output_h != h)
-      scaled_nv21.assign(static_cast<size_t>(output_w) * output_h * 3 / 2,
-                         0);
+      nv21.resize(static_cast<size_t>(w) * h * 3 / 2);
     return true;
   }
 
@@ -401,7 +431,6 @@ public:
     }
     shm.shutdown();
     nv21.clear();
-    scaled_nv21.clear();
     output_w = 0;
     output_h = 0;
   }
@@ -517,7 +546,7 @@ public:
                                                 cap, info.offset, info.size, window);
         const uint8_t* base = window_ok ? out_buf + window.offset : nullptr;
         const size_t available = window_ok ? window.bytes : 0;
-        bool converted = false;
+        bool published = false;
 
         if (!base || sy < w || suv < w || slice < h || sy <= 0 || suv <= 0)
         {
@@ -535,9 +564,9 @@ public:
                   available, (uint32_t) w, (uint32_t) h, (uint32_t) sy,
                   (uint32_t) slice, (uint32_t) suv, layout))
           {
-            nv12_to_nv21(base, base + layout.u_or_uv.offset, w, h, sy, suv,
-                         nv21.data());
-            converted = true;
+            published = publish_decoded([&](uint8_t* dest) {
+              nv12_to_nv21(base, base + layout.u_or_uv.offset, w, h, sy, suv, dest);
+            });
           }
           else
           {
@@ -556,10 +585,10 @@ public:
                                        (uint32_t) sy, (uint32_t) slice,
                                        (uint32_t) chroma_stride, layout))
           {
-            i420_to_nv21(base, base + layout.u_or_uv.offset,
-                         base + layout.v.offset, w, h, sy, chroma_stride,
-                         chroma_stride, nv21.data());
-            converted = true;
+            published = publish_decoded([&](uint8_t* dest) {
+              i420_to_nv21(base, base + layout.u_or_uv.offset, base + layout.v.offset,
+                           w, h, sy, chroma_stride, chroma_stride, dest);
+            });
           }
           else
           {
@@ -576,25 +605,12 @@ public:
             CR_FEED_LOGW(OBF("h264 pipe unsupported output format color=0x%x off=%d size=%d cap=%zu").c_str(),
                          color_format, (int) info.offset, (int) info.size, cap);
         }
-        if (converted)
+        if (published)
         {
-          const uint8_t* published = nv21.data();
-          if (!scaled_nv21.empty())
-          {
-            uint8_t* scaled_y = scaled_nv21.data();
-            uint8_t* scaled_vu = scaled_y +
-                static_cast<size_t>(output_w) * output_h;
-            cr_nv21_blit(nv21.data(), w, h, scaled_y, scaled_vu,
-                         output_w, output_h, output_w, output_w, 0);
-            published = scaled_nv21.data();
-          }
-          if (shm.publish_nv21(published, color_flags))
-          {
-            ++published_count;
-            if (published_count <= 3 || (published_count % 120) == 0)
-              CR_FEED_LOGI(OBF("h264: published frame #%llu (in=%llu)").c_str(),
-                           (unsigned long long) published_count, (unsigned long long) in_count);
-          }
+          ++published_count;
+          if (published_count <= 3 || (published_count % 120) == 0)
+            CR_FEED_LOGI(OBF("h264: published frame #%llu (in=%llu)").c_str(),
+                         (unsigned long long) published_count, (unsigned long long) in_count);
         }
       }
       AMediaCodec_releaseOutputBuffer(dec, (size_t) out_idx, false);
@@ -612,6 +628,19 @@ public:
   void revoke_frame() { shm.revoke_frame(); }
 
 private:
+  template<typename Convert>
+  bool publish_decoded(const Convert& convert)
+  {
+    if (nv21.empty())
+      return shm.write_nv21(color_flags, convert);
+    return shm.write_nv21(color_flags, [&](uint8_t* dest) {
+      convert(nv21.data());
+      uint8_t* dest_vu = dest + static_cast<size_t>(output_w) * output_h;
+      cr_nv21_blit(nv21.data(), w, h, dest, dest_vu,
+                   output_w, output_h, output_w, output_w, 0);
+    });
+  }
+
   AMediaCodec* dec = nullptr;
   std::string chosen_name;
 
@@ -624,7 +653,6 @@ private:
 
   ShmOut shm;
   std::vector<uint8_t> nv21;
-  std::vector<uint8_t> scaled_nv21;
   uint64_t in_count = 0;
   uint64_t published_count = 0;
   uint32_t color_flags = 0;

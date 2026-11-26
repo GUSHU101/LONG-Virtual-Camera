@@ -1,13 +1,6 @@
 // Fast CPU bilinear NV21 blit.
-// Integer math with 16.16 fixed-point interpolators keeps it branch-lean:
-//   step_x = (src_w << 16) / dst_w     (Q16)
-//   for each dst row y:
-//     sy = (y * src_h) / dst_h
-//     for each dst col x (Q16 accumulator):
-//       sx = accumulator >> 16
-//       fx = accumulator & 0xffff
-//       sample <- blend(src[sy][sx], src[sy][sx+1], fx)
-// UV plane is half-res → same math with dst_w/2 and dst_h/2.
+// Use endpoint-aligned Q16 coordinates and truncate after each pass.
+// Luma and both chroma channels use the same two-pass filter.
 
 #include "nv21_blit.h"
 #include <string.h>
@@ -44,167 +37,262 @@ static inline uint8_t blend(uint8_t a, uint8_t b, uint32_t fx_q16)
   return (uint8_t) ((int32_t) a + ((d * (int32_t) fx_q16) >> 16));
 }
 
-// Must be ≥ the `W > 8192` guard in hook_main.cpp::overwrite_nv21. A Redmi
-// Note 8T in 48 MP still capture mode hands us an 8000-px-wide buffer —
-// the original 4096 stack arrays here overflowed, tripped
-// `-fstack-protector`, and SIGABRT'd cameraserver. Bumped to 8192.
+// Match the destination width cap in the public blit and camera buffer checks.
 #define CR_BLIT_MAX_DST_W 8192
 
-static void scale_plane_bilinear(const uint8_t* src, int src_w, int src_h, int src_stride, uint8_t* dst, int dst_w, int dst_h, int dst_stride)
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define CR_BLIT_NEON 1
+#endif
+
+typedef struct
 {
-  if (dst_w <= 0 || dst_w > CR_BLIT_MAX_DST_W)
-    return;
-  // Need at least 2x2 source samples for bilinear taps. Anything smaller
-  // would force `sx+1` past the buffer and read 1 byte off the end into
-  // the chroma plane — see the bug we hit at right-edge clamp.
-  if (src_w < 2 || src_h < 2)
-    return;
+  uint16_t first;
+  uint16_t second;
+  uint16_t fraction;
+} AxisSample;
 
-  // Map the first and last destination pixels to the first and last source
-  // pixels. The old src/dst step plus an artificial 0xffff edge fraction
-  // rounded a positive one-byte gradient down, duplicating the penultimate
-  // pixel. ReCam uses the same endpoint-aligned mapping.
-  const uint32_t step_x = dst_w > 1
-      ? (uint32_t) (((uint64_t) (src_w - 1) << 16) /
-                    (uint32_t) (dst_w - 1))
-      : 0;
-  const uint32_t step_y = dst_h > 1
-      ? (uint32_t) (((uint64_t) (src_h - 1) << 16) /
-                    (uint32_t) (dst_h - 1))
-      : 0;
+#ifdef CR_BLIT_NEON
+typedef struct
+{
+  uint16_t offset;
+  uint8_t first[8];
+  uint8_t second[8];
+  uint16_t fraction[8];
+} HorizontalBlock;
+#endif
 
-  // Per-column precomputed source x + fractional offset on the stack.
-  // 64 KB combined; cameraserver pthreads have at least 1 MB stack so
-  // this is comfortably safe. We tried `static __thread` but bionic's
-  // lazy DTV allocation for dlopen'd-into-already-running-process libs
-  // is fragile for large TLS sections (>= 64 KB) — observed cameraserver
-  // SIGSEGV on first proxy call into the blit when TLS-allocated.
-  // Stack is the boring-but-bulletproof choice.
-  // The final destination column is explicitly pinned to the final source
-  // sample. All other columns retain a clamped second tap.
-  uint32_t cols_sx[CR_BLIT_MAX_DST_W];
-  uint32_t cols_fx[CR_BLIT_MAX_DST_W];
-  for (int x = 0; x < dst_w; ++x)
+typedef struct
+{
+  AxisSample columns[CR_BLIT_MAX_DST_W];
+#ifdef CR_BLIT_NEON
+  HorizontalBlock blocks[CR_BLIT_MAX_DST_W / 8];
+  int block_count;
+#endif
+} HorizontalPlan;
+
+typedef enum
+{
+  CopyOrder, // Luma or interleaved VU
+  SwapPairs, // Interleaved UV
+  SplitPairs // Separate V and U destinations
+} OutputOrder;
+
+static uint32_t axis_step(int source, int dest)
+{
+  return dest > 1 ? (uint32_t) (((uint64_t) (source - 1) << 16) /
+                                (uint32_t) (dest - 1)) : 0;
+}
+
+static AxisSample axis_sample(int pos, int last_dest, int last_source,
+                              uint32_t step)
+{
+  const uint32_t coordinate = (uint32_t) pos * step;
+  const uint32_t index = coordinate >> 16;
+  if (pos == last_dest || index >= (uint32_t) last_source)
   {
-    uint32_t ax = x * step_x;
-    uint32_t sx = ax >> 16;
-    uint32_t fx = ax & 0xffffu;
-    if (x == dst_w - 1 || sx >= (uint32_t) (src_w - 1))
-    {
-      sx = (uint32_t) (src_w - 1);
-      fx = 0;
-    }
-    cols_sx[x] = sx;
-    cols_fx[x] = fx;
+    const uint16_t end = (uint16_t) last_source;
+    return (AxisSample) {end, end, 0};
   }
+  return (AxisSample) {(uint16_t) index, (uint16_t) (index + 1),
+                       (uint16_t) coordinate};
+}
 
-  for (int y = 0; y < dst_h; ++y)
+#ifdef CR_BLIT_NEON
+static inline uint16x8_t blend_eight(uint16x8_t a, uint16x8_t b,
+                                     uint16x8_t wa, uint16x8_t wb)
+{
+  uint32x4_t low = vmull_u16(vget_low_u16(a), vget_low_u16(wa));
+  uint32x4_t high = vmull_high_u16(a, wa);
+  low = vmlal_u16(low, vget_low_u16(b), vget_low_u16(wb));
+  high = vmlal_high_u16(high, b, wb);
+  return vcombine_u16(vshrn_n_u32(low, 16), vshrn_n_u32(high, 16));
+}
+
+static void prepare_horizontal_blocks(HorizontalPlan* plan, int src_w,
+                                       int dst_w, int channels)
+{
+  const int available = src_w * channels;
+  plan->block_count = 0;
+  if (dst_w < src_w || available < 16)
+    return;
+  for (int x = 0; x <= dst_w * channels - 8; x += 8)
   {
-    uint32_t ay = y * step_y;
-    uint32_t sy = ay >> 16;
-    uint32_t fy = ay & 0xffffu;
-    // Same clamp applies vertically — sy+1 must stay inside the plane.
-    if (y == dst_h - 1 || sy >= (uint32_t) (src_h - 1))
+    HorizontalBlock* block = &plan->blocks[x / 8];
+    const int first = plan->columns[x / channels].first * channels;
+    const int last = plan->columns[(x + 7) / channels].second * channels + channels - 1;
+    const int offset = first < available - 16 ? first : available - 16;
+    if (last - offset >= 16)
+      return; // The scalar path handles any span wider than a table.
+    block->offset = (uint16_t) offset;
+    for (int lane = 0; lane < 8; ++lane)
     {
-      sy = (uint32_t) (src_h - 1);
-      fy = 0;
+      const AxisSample tap = plan->columns[(x + lane) / channels];
+      const int channel = lane % channels;
+      block->first[lane] = (uint8_t) (tap.first * channels + channel - offset);
+      block->second[lane] = (uint8_t) (tap.second * channels + channel - offset);
+      block->fraction[lane] = tap.fraction;
     }
+  }
+  plan->block_count = dst_w * channels / 8;
+}
+#endif
 
-    const uint8_t* r0 = src + (size_t) sy * src_stride;
-    const uint32_t sy1 = sy + 1u < (uint32_t) src_h ? sy + 1u : sy;
-    const uint8_t* r1 = src + (size_t) sy1 * src_stride;
-    uint8_t* drow = dst + (size_t) y * dst_stride;
-
-    for (int x = 0; x < dst_w; ++x)
+static void horizontal_row(const uint8_t* source, uint8_t* scaled,
+                           const HorizontalPlan* plan, int width, int channels)
+{
+  int x = 0;
+#ifdef CR_BLIT_NEON
+  for (int i = 0; i < plan->block_count; ++i)
+  {
+    const HorizontalBlock* block = &plan->blocks[i];
+    const uint8x16_t table = vld1q_u8(source + block->offset);
+    const uint16x8_t first = vmovl_u8(vqtbl1_u8(table, vld1_u8(block->first)));
+    const uint16x8_t second = vmovl_u8(vqtbl1_u8(table, vld1_u8(block->second)));
+    const uint16x8_t fraction = vld1q_u16(block->fraction);
+    const uint16x8_t zero = vdupq_n_u16(0);
+    // 65536 does not fit in 16 bits. Use the first tap for exact samples.
+    const uint16x8_t blended =
+        blend_eight(first, second, vsubq_u16(zero, fraction), fraction);
+    vst1_u8(scaled + i * 8, vmovn_u16(vbslq_u16(
+        vceqq_u16(fraction, zero), first, blended)));
+  }
+  x = plan->block_count * 8 / channels;
+#endif
+  if (channels == 1)
+  {
+    for (; x < width; ++x)
     {
-      uint32_t sx = cols_sx[x];
-      uint32_t fx = cols_fx[x];
-      uint32_t sx1 = sx + 1u < (uint32_t) src_w ? sx + 1u : sx;
-      uint8_t p00 = r0[sx];
-      uint8_t p01 = r0[sx1];
-      uint8_t p10 = r1[sx];
-      uint8_t p11 = r1[sx1];
-      uint8_t top = blend(p00, p01, fx);
-      uint8_t bot = blend(p10, p11, fx);
-      drow[x] = blend(top, bot, fy);
+      const AxisSample s = plan->columns[x];
+      scaled[x] = blend(source[s.first], source[s.second], s.fraction);
+    }
+    return;
+  }
+  for (; x < width; ++x)
+  {
+    const AxisSample s = plan->columns[x];
+    const uint8_t* first = source + 2 * s.first;
+    const uint8_t* second = source + 2 * s.second;
+    scaled[2 * x] = blend(first[0], second[0], s.fraction);
+    scaled[2 * x + 1] = blend(first[1], second[1], s.fraction);
+  }
+}
+
+static void write_row(const uint8_t* top, const uint8_t* bottom,
+                      uint8_t* dest, uint8_t* dest_u, int bytes,
+                      OutputOrder order, uint16_t fraction)
+{
+  if (fraction == 0 && order == CopyOrder)
+  {
+    memcpy(dest, top, (size_t) bytes);
+    return;
+  }
+  int x = 0;
+#ifdef CR_BLIT_NEON
+  const uint16x8_t wa = vdupq_n_u16((uint16_t) (65536u - fraction));
+  const uint16x8_t wb = vdupq_n_u16(fraction);
+  for (; x <= bytes - 16; x += 16)
+  {
+    uint8x16_t values = vld1q_u8(top + x);
+    if (fraction != 0)
+    {
+      const uint8x16_t other = vld1q_u8(bottom + x);
+      // a + ((b-a)*fraction >> 16) is exactly the same truncated Q16 blend.
+      const uint16x8_t low = blend_eight(vmovl_u8(vget_low_u8(values)),
+          vmovl_u8(vget_low_u8(other)), wa, wb);
+      const uint16x8_t high = blend_eight(vmovl_high_u8(values),
+          vmovl_high_u8(other), wa, wb);
+      values = vcombine_u8(vmovn_u16(low), vmovn_u16(high));
+    }
+    if (order == SplitPairs)
+    {
+      const uint8x8_t low = vget_low_u8(values);
+      const uint8x8_t high = vget_high_u8(values);
+      vst1_u8(dest + x / 2, vuzp1_u8(low, high));
+      vst1_u8(dest_u + x / 2, vuzp2_u8(low, high));
+    }
+    else
+    {
+      vst1q_u8(dest + x, order == SwapPairs ? vrev16q_u8(values) : values);
+    }
+  }
+#endif
+  if (order == CopyOrder)
+  {
+    for (; x < bytes; ++x)
+      dest[x] = blend(top[x], bottom[x], fraction);
+    return;
+  }
+  for (; x < bytes; x += 2)
+  {
+    uint8_t v = blend(top[x], bottom[x], fraction);
+    uint8_t u = blend(top[x + 1], bottom[x + 1], fraction);
+    if (order == SplitPairs)
+    {
+      dest[x / 2] = v;
+      dest_u[x / 2] = u;
+    }
+    else
+    {
+      dest[x] = u;
+      dest[x + 1] = v;
     }
   }
 }
 
-// The source contains interleaved VU samples. Scale both channels using
-// the same coordinates, whether the destination is interleaved or planar.
-static void scale_vu_bilinear(const uint8_t* src, int src_w_pairs, int src_h,
-                              int src_stride_bytes, uint8_t* dst_u, uint8_t* dst_v,
-                              int dst_w_pairs, int dst_h,
-                              int dst_stride_bytes, int dst_pixel_stride)
+// Cache the horizontal results of the two source rows used by the vertical
+// blend. Successive upscaled rows reuse them. Use per-call scratch so different
+// camera streams and feed threads can scale at the same time.
+static void scale_bilinear(const uint8_t* src, int src_w, int src_h,
+                           int src_stride, uint8_t* dest, uint8_t* dest_u,
+                           int dst_w, int dst_h, int dst_stride,
+                           int channels, OutputOrder order)
 {
-  const uint32_t step_x = dst_w_pairs > 1
-      ? (uint32_t) (((uint64_t) (src_w_pairs - 1) << 16) /
-                    (uint32_t) (dst_w_pairs - 1))
-      : 0;
-  const uint32_t step_y = dst_h > 1
-      ? (uint32_t) (((uint64_t) (src_h - 1) << 16) /
-                    (uint32_t) (dst_h - 1))
-      : 0;
+  HorizontalPlan plan;
+  uint8_t scratch[2][CR_BLIT_MAX_DST_W];
+  const uint32_t step_x = axis_step(src_w, dst_w);
+  const uint32_t step_y = axis_step(src_h, dst_h);
+  for (int x = 0; x < dst_w; ++x)
+    plan.columns[x] = axis_sample(x, dst_w - 1, src_w - 1, step_x);
+#ifdef CR_BLIT_NEON
+  prepare_horizontal_blocks(&plan, src_w, dst_w, channels);
+#endif
 
-  uint32_t cols_sx[CR_BLIT_MAX_DST_W];
-  uint32_t cols_fx[CR_BLIT_MAX_DST_W];
-  for (int x = 0; x < dst_w_pairs; ++x)
-  {
-    uint32_t ax = x * step_x;
-    uint32_t sx = ax >> 16;
-    uint32_t fx = ax & 0xffffu;
-    if (x == dst_w_pairs - 1 || sx >= (uint32_t) (src_w_pairs - 1))
-    {
-      sx = (uint32_t) (src_w_pairs - 1);
-      fx = 0;
-    }
-    cols_sx[x] = sx;
-    cols_fx[x] = fx;
-  }
-
+  int first = 0;
+  int cached[2] = {-1, -1};
   for (int y = 0; y < dst_h; ++y)
   {
-    uint32_t ay = y * step_y;
-    uint32_t sy = ay >> 16;
-    uint32_t fy = ay & 0xffffu;
-    if (y == dst_h - 1 || sy >= (uint32_t) (src_h - 1))
+    const AxisSample s = axis_sample(y, dst_h - 1, src_h - 1, step_y);
+    if (cached[1 - first] == s.first)
+      first = 1 - first;
+    if (cached[first] != s.first)
     {
-      sy = (uint32_t) (src_h - 1);
-      fy = 0;
+      horizontal_row(src + (size_t) s.first * src_stride, scratch[first],
+                     &plan, dst_w, channels);
+      cached[first] = s.first;
+    }
+    const int second = s.fraction != 0 ? 1 - first : first;
+    if (cached[second] != s.second && s.fraction != 0)
+    {
+      horizontal_row(src + (size_t) s.second * src_stride, scratch[second],
+                     &plan, dst_w, channels);
+      cached[second] = s.second;
     }
 
-    const uint8_t* r0 = src + (size_t) sy * src_stride_bytes;
-    const uint32_t sy1 = sy + 1u < (uint32_t) src_h ? sy + 1u : sy;
-    const uint8_t* r1 = src + (size_t) sy1 * src_stride_bytes;
-    uint8_t* row_u = dst_u + (size_t) y * dst_stride_bytes;
-    uint8_t* row_v = dst_v + (size_t) y * dst_stride_bytes;
-
-    for (int x = 0, offset = 0; x < dst_w_pairs; ++x, offset += dst_pixel_stride)
-    {
-      uint32_t sx = cols_sx[x];
-      uint32_t fx = cols_fx[x];
-      uint32_t sx1 =
-          sx + 1u < (uint32_t) src_w_pairs ? sx + 1u : sx;
-      uint8_t v00 = r0[sx * 2 + 0], u00 = r0[sx * 2 + 1];
-      uint8_t v01 = r0[sx1 * 2 + 0], u01 = r0[sx1 * 2 + 1];
-      uint8_t v10 = r1[sx * 2 + 0], u10 = r1[sx * 2 + 1];
-      uint8_t v11 = r1[sx1 * 2 + 0], u11 = r1[sx1 * 2 + 1];
-      uint8_t vT = blend(v00, v01, fx), vB = blend(v10, v11, fx);
-      uint8_t uT = blend(u00, u01, fx), uB = blend(u10, u11, fx);
-      row_v[offset] = blend(vT, vB, fy);
-      row_u[offset] = blend(uT, uB, fy);
-    }
+    const size_t offset = (size_t) y * dst_stride;
+    write_row(scratch[first], scratch[second], dest + offset,
+              dest_u ? dest_u + offset : NULL, dst_w * channels,
+              order, s.fraction);
   }
 }
 
 static void blit_nv21(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
-                      uint8_t* dst_u, uint8_t* dst_v, int dst_w, int dst_h,
-                      int dst_y_stride, int dst_uv_stride, int dst_pixel_stride)
+                      uint8_t* dst_chroma, uint8_t* dst_u, int dst_w, int dst_h,
+                      int dst_y_stride, int dst_uv_stride, OutputOrder order)
 {
-  if (!src || !dst_y || !dst_u || !dst_v || src_w > 8192 || src_h > 8192 ||
-      dst_w > 8192 || dst_h > 8192 || dst_y_stride < dst_w ||
-      dst_uv_stride < dst_w / 2 * dst_pixel_stride ||
+  if (!src || !dst_y || !dst_chroma || (order == SplitPairs && !dst_u) ||
+      src_w > 8192 || src_h > 8192 || dst_w > CR_BLIT_MAX_DST_W || dst_h > 8192 ||
+      dst_y_stride < dst_w || dst_uv_stride < (order == SplitPairs ? dst_w / 2 : dst_w) ||
       (uint64_t) src_w * (uint64_t) src_h > 32ull * 1024ull * 1024ull ||
       (uint64_t) dst_w * (uint64_t) dst_h > 32ull * 1024ull * 1024ull)
     return;
@@ -219,25 +307,25 @@ static void blit_nv21(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
   // With no scaling, copy the visible luma and preserve all row padding.
   if (crop.width == dst_w && crop.height == dst_h)
   {
-    for (int y = 0; y < dst_h; ++y)
+    if (src_w == dst_w && dst_y_stride == dst_w)
+      memcpy(dst_y, src_y, (size_t) dst_w * dst_h);
+    else
     {
-      memcpy(dst_y + (size_t) y * dst_y_stride,
-             src_y + (size_t) y * src_w,
-             (size_t) dst_w);
+      for (int y = 0; y < dst_h; ++y)
+        memcpy(dst_y + (size_t) y * dst_y_stride,
+               src_y + (size_t) y * src_w, (size_t) dst_w);
+    }
+    if (order == CopyOrder && src_w == dst_w && dst_uv_stride == dst_w)
+    {
+      memcpy(dst_chroma, src_vu, (size_t) dst_w * (dst_h / 2));
+      return;
     }
     for (int y = 0; y < dst_h / 2; ++y)
     {
       const uint8_t* source_row = src_vu + (size_t) y * src_w;
-      uint8_t* row_u = dst_u + (size_t) y * dst_uv_stride;
-      uint8_t* row_v = dst_v + (size_t) y * dst_uv_stride;
-      if (dst_pixel_stride == 2 && row_u == row_v + 1)
-        memcpy(row_v, source_row, (size_t) dst_w);
-      else
-        for (int x = 0, offset = 0; x < dst_w; x += 2, offset += dst_pixel_stride)
-        {
-          row_v[offset] = source_row[x];
-          row_u[offset] = source_row[x + 1];
-        }
+      const size_t offset = (size_t) y * dst_uv_stride;
+      write_row(source_row, source_row, dst_chroma + offset,
+                dst_u ? dst_u + offset : NULL, dst_w, order, 0);
     }
     return;
   }
@@ -246,30 +334,25 @@ static void blit_nv21(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
   // output is served at exactly its requested size, but the source is first
   // centre-cropped to the target aspect ratio. This avoids the old stretched
   // faces while still filling preview, recording and photo buffers fully.
-  scale_plane_bilinear(src_y, crop.width, crop.height, src_w,
-                       dst_y, dst_w, dst_h, dst_y_stride);
-
-  // VU plane — half the pixel count horizontally/vertically, 2 bytes each.
-  scale_vu_bilinear(src_vu, crop.width / 2, crop.height / 2, src_w,
-                    dst_u, dst_v, dst_w / 2, dst_h / 2, dst_uv_stride,
-                    dst_pixel_stride);
+  scale_bilinear(src_y, crop.width, crop.height, src_w,
+                  dst_y, NULL, dst_w, dst_h, dst_y_stride, 1, CopyOrder);
+  scale_bilinear(src_vu, crop.width / 2, crop.height / 2, src_w,
+                  dst_chroma, dst_u, dst_w / 2, dst_h / 2, dst_uv_stride,
+                  2, order);
 }
 
 void cr_nv21_blit(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
                   uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride,
                   int dst_uv_stride, int dst_uv_swapped)
 {
-  if (!dst_vu)
-    return;
-  const int v_offset = dst_uv_swapped ? 1 : 0;
-  blit_nv21(src, src_w, src_h, dst_y, dst_vu + (1 - v_offset), dst_vu + v_offset,
-            dst_w, dst_h, dst_y_stride, dst_uv_stride, 2);
+  blit_nv21(src, src_w, src_h, dst_y, dst_vu, NULL, dst_w, dst_h,
+            dst_y_stride, dst_uv_stride, dst_uv_swapped ? SwapPairs : CopyOrder);
 }
 
 void cr_nv21_blit_planar(const uint8_t* src, int src_w, int src_h,
                          uint8_t* dst_y, uint8_t* dst_u, uint8_t* dst_v,
                          int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride)
 {
-  blit_nv21(src, src_w, src_h, dst_y, dst_u, dst_v, dst_w, dst_h,
-            dst_y_stride, dst_uv_stride, 1);
+  blit_nv21(src, src_w, src_h, dst_y, dst_v, dst_u, dst_w, dst_h,
+            dst_y_stride, dst_uv_stride, SplitPairs);
 }
