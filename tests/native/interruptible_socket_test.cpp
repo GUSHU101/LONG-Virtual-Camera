@@ -41,6 +41,48 @@ static void verify_transfer_deadlines()
   assert(::close(pair[1]) == 0);
 }
 
+static void verify_idle_receive()
+{
+  using namespace std::chrono_literals;
+  using Socket = cr::feed::DeadlineSocket;
+  int pair[2];
+  assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+  std::atomic<bool> stop{false};
+  Socket input(pair[0], stop, 1s, Socket::Clock::time_point::max());
+  assert(::send(pair[1], "a", 1, 0) == 1);
+  struct Idle
+  {
+    int peer;
+    int calls;
+  } progress{pair[1], 0};
+  auto service = [](void* context) noexcept {
+    auto& state = *static_cast<Idle*>(context);
+    ++state.calls;
+    assert(::send(state.peer, "b", 1, 0) == 1);
+  };
+  char bytes[2]{};
+  const auto started = Socket::Clock::now();
+  assert(input.receive(bytes, sizeof(bytes), started + 500ms,
+                       {started + 100ms, service, &progress}));
+  assert(bytes[0] == 'a' && bytes[1] == 'b' && progress.calls == 1);
+  assert(input.received() == 2);
+
+  auto leave_waiting = [](void* context) noexcept {
+    ++*static_cast<int*>(context);
+  };
+  int ticks = 0;
+  const auto bounded = Socket::Clock::now();
+  assert(!input.receive(bytes, 1, bounded + 60ms,
+                        {bounded + 500ms, leave_waiting, &ticks}));
+  assert(errno == ETIMEDOUT && ticks > 0);
+
+  const auto expired = Socket::Clock::now();
+  assert(!input.receive(bytes, 1, expired + 30ms, {expired, service, &progress}));
+  assert(errno == ETIMEDOUT && progress.calls == 1);
+  ::close(pair[0]);
+  ::close(pair[1]);
+}
+
 int main()
 {
   using namespace std::chrono_literals;
@@ -78,4 +120,5 @@ int main()
   assert(std::chrono::steady_clock::now() - started < 2s);
   assert(::close(server) == 0);
   verify_transfer_deadlines();
+  verify_idle_receive();
 }

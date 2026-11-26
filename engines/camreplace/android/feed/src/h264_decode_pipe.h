@@ -60,6 +60,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -440,21 +441,29 @@ public:
     return chosen_name.c_str();
   }
 
-  // Push one Annex-B NAL access unit (00 00 00 01 prefix included). PTS
-  // in microseconds; `is_key` is informational only — MediaCodec rebuilds
-  // its CSD from the SPS/PPS prepended on every IDR.
+  // Push one Annex-B access unit with a microsecond PTS. The caller
+  // prepends SPS/PPS to key frames so the codec can resynchronize.
   bool push(const uint8_t* nal, size_t len, int64_t pts_us)
   {
     if (!dec || !nal || !len)
       return false;
 
-    ssize_t in_idx = AMediaCodec_dequeueInputBuffer(dec, 20 * 1000);
-    if (in_idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER)
+    using Clock = std::chrono::steady_clock;
+    using Microseconds = std::chrono::microseconds;
+    const auto input_deadline = Clock::now() + std::chrono::milliseconds(45);
+    ssize_t in_idx = AMediaCodec_dequeueInputBuffer(dec, 0);
+    while (in_idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER)
     {
-      // Releasing pending outputs may free an input slot. Try once without
-      // another wait before dropping an access unit from the current GOP.
+      // Releasing decoded output can free input capacity asynchronously.
+      // Give the codec short waits instead of discarding the rest of a GOP
+      // just because the first dequeue found it temporarily occupied.
       drain();
-      in_idx = AMediaCodec_dequeueInputBuffer(dec, 0);
+      const auto remaining = std::chrono::duration_cast<Microseconds>(
+          input_deadline - Clock::now());
+      if (remaining <= Microseconds::zero())
+        break;
+      in_idx = AMediaCodec_dequeueInputBuffer(
+          dec, std::min(remaining, Microseconds(3000)).count());
     }
     if (in_idx >= 0)
     {
@@ -487,7 +496,10 @@ public:
     }
     else
     {
-      drain();
+      const uint64_t missed = ++input_deadline_misses;
+      if (missed <= 3 || missed % 120 == 0)
+        CR_FEED_LOGW("h264: input unavailable after bounded retry (status=%zd, total=%llu)",
+                     in_idx, static_cast<unsigned long long>(missed));
       return false;
     }
     drain();
@@ -609,8 +621,11 @@ public:
         {
           ++published_count;
           if (published_count <= 3 || (published_count % 120) == 0)
-            CR_FEED_LOGI(OBF("h264: published frame #%llu (in=%llu)").c_str(),
-                         (unsigned long long) published_count, (unsigned long long) in_count);
+            CR_FEED_LOGI("h264: published frame #%llu (in=%llu slot_busy=%llu input_unavailable=%llu)",
+                         static_cast<unsigned long long>(published_count),
+                         static_cast<unsigned long long>(in_count),
+                         static_cast<unsigned long long>(slot_busy_count),
+                         static_cast<unsigned long long>(input_deadline_misses));
         }
       }
       AMediaCodec_releaseOutputBuffer(dec, (size_t) out_idx, false);
@@ -631,14 +646,20 @@ private:
   template<typename Convert>
   bool publish_decoded(const Convert& convert)
   {
-    if (nv21.empty())
-      return shm.write_nv21(color_flags, convert);
-    return shm.write_nv21(color_flags, [&](uint8_t* dest) {
+    const bool published = shm.write_nv21(color_flags, [&](uint8_t* dest) {
+      if (nv21.empty())
+      {
+        convert(dest);
+        return;
+      }
       convert(nv21.data());
       uint8_t* dest_vu = dest + static_cast<size_t>(output_w) * output_h;
       cr_nv21_blit(nv21.data(), w, h, dest, dest_vu,
                    output_w, output_h, output_w, output_w, 0);
     });
+    if (!published)
+      ++slot_busy_count;
+    return published;
   }
 
   AMediaCodec* dec = nullptr;
@@ -654,6 +675,8 @@ private:
   ShmOut shm;
   std::vector<uint8_t> nv21;
   uint64_t in_count = 0;
+  uint64_t input_deadline_misses = 0;
+  uint64_t slot_busy_count = 0;
   uint64_t published_count = 0;
   uint32_t color_flags = 0;
   uint64_t output_layout_warns = 0;

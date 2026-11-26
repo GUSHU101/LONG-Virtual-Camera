@@ -73,6 +73,13 @@ class DeadlineSocket
 public:
   using Clock = std::chrono::steady_clock;
 
+  struct ReceiveIdle
+  {
+    Clock::time_point until{};
+    void (*service)(void*) noexcept = nullptr;
+    void* context = nullptr;
+  };
+
   DeadlineSocket(int fd, const std::atomic<bool>& stop, Clock::duration io_timeout,
                  Clock::time_point startup_deadline) noexcept
       : fd_(fd), stop_(stop), io_timeout_(io_timeout), deadline_(startup_deadline)
@@ -82,13 +89,19 @@ public:
   bool receive(void* data, std::size_t length,
                Clock::time_point limit = Clock::time_point::max()) const noexcept
   {
+    return receive(data, length, limit, {});
+  }
+
+  bool receive(void* data, std::size_t length, Clock::time_point limit,
+               const ReceiveIdle& idle) const noexcept
+  {
     return transfer(static_cast<unsigned char*>(data), length, POLLIN, limit,
         [this](auto* ptr, std::size_t count) {
           const auto bytes = ::recv(fd_, ptr, count, MSG_DONTWAIT);
           if (bytes > 0)
             received_ += static_cast<std::uint64_t>(bytes);
           return bytes;
-        });
+        }, &idle);
   }
 
   bool send(const void* data, std::size_t length,
@@ -97,7 +110,7 @@ public:
     return transfer(static_cast<const unsigned char*>(data), length, POLLOUT, limit,
         [this](auto* ptr, std::size_t count) {
           return ::send(fd_, ptr, count, MSG_DONTWAIT | MSG_NOSIGNAL);
-        });
+        }, nullptr);
   }
 
   void finish_startup() noexcept { deadline_ = Clock::time_point::max(); }
@@ -111,7 +124,7 @@ public:
 private:
   template <class Byte, class Operation>
   bool transfer(Byte* data, std::size_t length, short event, Clock::time_point limit,
-                Operation operation) const noexcept
+                Operation operation, const ReceiveIdle* idle) const noexcept
   {
     const auto until = std::min(transfer_deadline(), limit);
     while (length != 0)
@@ -121,16 +134,28 @@ private:
         errno = ECANCELED;
         return false;
       }
-      const auto remaining = until - Clock::now();
+      const auto now = Clock::now();
+      const auto remaining = until - now;
       if (remaining <= Clock::duration::zero())
       {
         errno = ETIMEDOUT;
         return false;
       }
-      const auto ms = std::chrono::ceil<std::chrono::milliseconds>(remaining).count();
+      const bool service_idle = idle && idle->service && now < idle->until;
+      const auto cap = service_idle ? std::chrono::milliseconds(8) :
+                                     std::chrono::milliseconds(250);
+      const auto ms = std::min(std::chrono::ceil<std::chrono::milliseconds>(remaining),
+                               cap).count();
       pollfd descriptor{fd_, event, 0};
-      const int ready = ::poll(&descriptor, 1, ms > 250 ? 250 : static_cast<int>(ms));
-      if (ready == 0 || (ready < 0 && errno == EINTR))
+      const int ready = ::poll(&descriptor, 1, static_cast<int>(ms));
+      if (ready == 0)
+      {
+        if (service_idle && Clock::now() < until &&
+            !stop_.load(std::memory_order_relaxed))
+          idle->service(idle->context);
+        continue;
+      }
+      if (ready < 0 && errno == EINTR)
         continue;
       if (ready < 0)
         return false;

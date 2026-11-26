@@ -51,6 +51,7 @@ constexpr size_t kMaxStartupBytes = 1024u * 1024u;
 constexpr auto kStartupTimeout = std::chrono::seconds(12);
 constexpr auto kLiveIoTimeout = std::chrono::seconds(3);
 constexpr auto kTrackPublicationTimeout = std::chrono::seconds(2);
+constexpr auto kDecoderIdleWindow = std::chrono::milliseconds(48);
 
 inline uint32_t be32(const uint8_t* p)
 {
@@ -363,6 +364,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   int pipe_w = 0, pipe_h = 0;
   bool seen_video_keyframe = false;
   cr_feed::H264DecodePipe pipe;
+  auto decoder_idle_until = cr::feed::DeadlineSocket::Clock::time_point{};
 
   // Audio decoding begins after an AAC AudioSpecificConfig.
   cr_feed::AacDecodePipe audio_pipe;
@@ -396,6 +398,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
       LOGI(OBF("rtmp: stream geometry changed %dx%d -> %dx%d; restarting decoder").c_str(),
            pipe_w, pipe_h, stream_w, stream_h);
       pipe.stop();
+      decoder_idle_until = {};
       pipe_started = false;
       seen_video_keyframe = false;
     }
@@ -440,7 +443,14 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
         if (ack_window != 0)
           take = static_cast<size_t>(std::min<uint64_t>(
               size, ack_window - (connection.received() - last_ack)));
-        if (!connection.receive(data, take, deadline))
+        // MediaCodec can finish an input after push()'s nonblocking drain.
+        // Publish ready output while waiting for RTMP bytes, bounded by the
+        // recent-input window and the original socket deadline.
+        const cr::feed::DeadlineSocket::ReceiveIdle idle{
+            decoder_idle_until, [](void* context) noexcept {
+              static_cast<cr_feed::H264DecodePipe*>(context)->drain();
+            }, &pipe};
+        if (!connection.receive(data, take, deadline, idle))
           return false;
         data += take;
         size -= take;
@@ -754,8 +764,12 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
           {
             if (!pipe.push(annexb.data(), annexb.size(), pts_us))
               seen_video_keyframe = false;
-            else if (is_key)
-              seen_video_keyframe = true;
+            else
+            {
+              decoder_idle_until = cr::feed::DeadlineSocket::Clock::now() + kDecoderIdleWindow;
+              if (is_key)
+                seen_video_keyframe = true;
+            }
           }
         }
         break;

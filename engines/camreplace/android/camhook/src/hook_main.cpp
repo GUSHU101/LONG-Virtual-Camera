@@ -89,6 +89,23 @@ struct ShmView
 
   bool pin_current(PinnedSlot& out) const noexcept
   {
+    // A publication can cross the snapshot between reading the index and
+    // taking its pin. Retry immediately instead of passing a physical frame
+    // through on this short-lived collision.
+    for (unsigned attempt = 0; attempt < 3; ++attempt)
+    {
+      if (pin_once(out))
+        return true;
+      if (!header || atomic_load_explicit(&header->channel_state, memory_order_acquire) !=
+                         CR_CHANNEL_STATE_READY)
+        break;
+    }
+    return false;
+  }
+
+private:
+  bool pin_once(PinnedSlot& out) const noexcept
+  {
     if (!header || !slot0)
       return false;
 
