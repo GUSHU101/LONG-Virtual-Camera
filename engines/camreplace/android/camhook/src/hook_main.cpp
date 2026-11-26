@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -359,29 +360,14 @@ static void resolve_photo_mode()
   }
 }
 
-struct CR_ARect
-{
-  int32_t left, top, right, bottom;
-};
+constexpr uint64_t kAhbUsageCpuRW =
+    AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
 
-struct CR_AHB_Plane
-{
-  void* data;
-  uint32_t pixelStride;
-  uint32_t rowStride;
-};
-struct CR_AHB_Planes
-{
-  CR_AHB_Plane planes[4];
-  uint32_t planeCount;
-};
-
-constexpr uint64_t kAhbUsageCpuRW = 0x2ull | 0x30ull;
-
-typedef int (*AHB_lockPlanes_fn)(void* buffer, uint64_t usage, int32_t fence, const CR_ARect* rect, CR_AHB_Planes* outPlanes);
-typedef int (*AHB_unlock_fn)(void* buffer, int32_t* fence);
-
-typedef int (*AHB_lock_fn)(void* buffer, uint64_t usage, int32_t fence, const CR_ARect* rect, void** outVirtualAddress);
+// Resolve these APIs at runtime so older Android builds can use the mapper.
+using AHB_lockPlanes_fn = int (*)(AHardwareBuffer*, uint64_t, int32_t, const ARect*,
+                                  AHardwareBuffer_Planes*);
+using AHB_unlock_fn = int (*)(AHardwareBuffer*, int32_t*);
+using AHB_lock_fn = int (*)(AHardwareBuffer*, uint64_t, int32_t, const ARect*, void**);
 typedef void* (*ANWB_getHardwareBuffer_fn)(void* buffer);
 
 static AHB_lockPlanes_fn g_ahb_lockPlanes = nullptr;
@@ -745,7 +731,7 @@ static bool lock_via_ahb(const void* anb, int W, int H, int fence,
 {
   if (!g_ahb_lockPlanes || !g_ahb_unlock || !g_get_hardware_buffer)
     return false;
-  void* ahb = g_get_hardware_buffer((void*) anb);
+  auto* ahb = static_cast<AHardwareBuffer*>(g_get_hardware_buffer((void*) anb));
   if (!ahb)
     return false;
   int lock_fence = -1;
@@ -758,12 +744,12 @@ static bool lock_via_ahb(const void* anb, int W, int H, int fence,
   // AHardwareBuffer_lockPlanes takes ownership of the fence descriptor,
   // including on failure. The camera framework retains the original fd;
   // only the duplicate is transferred here.
-  CR_ARect rect{0, 0, W, H};
-  CR_AHB_Planes planes{};
+  ARect rect{0, 0, W, H};
+  AHardwareBuffer_Planes planes{};
   int rc = g_ahb_lockPlanes(ahb, kAhbUsageCpuRW, lock_fence, &rect, &planes);
   if (rc != 0)
     return false;
-  if (planes.planeCount < 3)
+  if (planes.planeCount != 3)
   {
     g_ahb_unlock(ahb, nullptr);
     return false;
@@ -853,7 +839,7 @@ static bool lock_via_gbm(const void* anb, const void* handle, int W, int H,
 static bool unlock(const void* handle, void* ahb, const LockedView& view)
 {
   if (view.lock_path == 0 && ahb && g_ahb_unlock)
-    return g_ahb_unlock(ahb, nullptr) == 0;
+    return g_ahb_unlock(static_cast<AHardwareBuffer*>(ahb), nullptr) == 0;
   return view.lock_path == 1 && gbm_call_unlock(handle) == 0;
 }
 
@@ -887,7 +873,7 @@ static bool lock_blob(const void* anb, const void* handle, int W, int H, int fen
   // and never enter the AHB path unless the matching unlock API is available.
   if (g_ahb_lock && g_ahb_unlock && g_get_hardware_buffer)
   {
-    void* ahb = g_get_hardware_buffer((void*) anb);
+    auto* ahb = static_cast<AHardwareBuffer*>(g_get_hardware_buffer((void*) anb));
     int lock_fence = ahb && fence >= 0 ? dup(fence) : -1;
     if (ahb && (fence < 0 || lock_fence >= 0))
     {
@@ -957,7 +943,7 @@ struct BlobLockGuard
     const int previous = path;
     path = -1;
     if (previous == 0 && ahb && g_ahb_unlock)
-      return g_ahb_unlock(ahb, nullptr) == 0;
+      return g_ahb_unlock(static_cast<AHardwareBuffer*>(ahb), nullptr) == 0;
     return previous == 1 && handle && gbm_call_unlock(handle) == 0;
   }
 };
@@ -1239,6 +1225,12 @@ static void* g_orig_qbtc_surfaces = nullptr;
 static void* g_orig_qbtc_legacy = nullptr;
 static void* g_orig_preview_spacer = nullptr;
 static void* g_preview_spacer_stub = nullptr;
+static void* g_video_encoder_usage_stub = nullptr;
+static void* g_orig_video_encoder_usage = nullptr;
+static void* g_video_encoder_format_stub = nullptr;
+static void* g_orig_video_encoder_format = nullptr;
+using SurfaceConsumerUsage = int32_t (*)(const void*, uint64_t*);
+static SurfaceConsumerUsage g_surface_consumer_usage = nullptr;
 static cr::camhook::HookCounters g_hook_counters;
 static cr::camhook::HookCounters g_preview_counters;
 
@@ -1359,6 +1351,93 @@ static void try_hook_preview_spacer()
   LOGW("PreviewFrameSpacer ABI unavailable");
 }
 
+static constexpr uint64_t kQtiUbwcUsage = uint64_t{1} << 28;
+
+static bool recorder_needs_linear_yuv(uint64_t usage)
+{
+  constexpr uint64_t kRecorderUbwc = AHARDWAREBUFFER_USAGE_VIDEO_ENCODE | kQtiUbwcUsage;
+  return (usage & (kRecorderUbwc | AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT)) == kRecorderUbwc &&
+         access("/data/cr/video_mode", R_OK) == 0;
+}
+
+static int32_t proxy_video_encoder_usage(const void* stream, uint64_t* usage)
+{
+  using EndpointUsage = int32_t (*)(const void*, uint64_t*);
+  auto original = reinterpret_cast<EndpointUsage>(
+      __atomic_load_n(&g_orig_video_encoder_usage, __ATOMIC_ACQUIRE));
+  if (!original)
+    return -ENOSYS;
+  const int32_t status = original(stream, usage);
+  if (status == 0 && usage && recorder_needs_linear_yuv(*usage))
+  {
+    *usage = (*usage & ~kQtiUbwcUsage) | kAhbUsageCpuRW;
+  }
+  return status;
+}
+
+static int32_t proxy_video_encoder_format(void* surface, int32_t format)
+{
+  using SetFormat = int32_t (*)(void*, int32_t);
+  const auto original = reinterpret_cast<SetFormat>(
+      __atomic_load_n(&g_orig_video_encoder_format, __ATOMIC_ACQUIRE));
+  if (!original)
+    return -ENOSYS;
+  uint64_t usage = 0;
+  if (format == 0x22 && g_surface_consumer_usage(surface, &usage) == 0 &&
+      recorder_needs_linear_yuv(usage))
+  {
+    // The recorder still contributes its consumer usage to the BufferQueue.
+    // An explicit flexible YUV format selects linear NV12 on this allocator.
+    LOGI("camera recorder requested a linear YUV420 output surface");
+    return original(surface, 0x23);
+  }
+  return original(surface, format);
+}
+
+static void try_hook_video_encoder_buffers()
+{
+  char device[PROP_VALUE_MAX] = {};
+  char sdk[PROP_VALUE_MAX] = {};
+  __system_property_get("ro.product.device", device);
+  __system_property_get("ro.build.version.sdk", sdk);
+  if (strcmp(device, "redfin") != 0 || strcmp(sdk, "34") != 0)
+    return;
+
+  void* gui = dlopen("libgui.so", RTLD_NOW | RTLD_NOLOAD);
+  if (!gui)
+    return;
+  g_surface_consumer_usage = reinterpret_cast<SurfaceConsumerUsage>(
+      dlsym(gui, "_ZNK7android7Surface16getConsumerUsageEPm"));
+  dlclose(gui);
+  if (!g_surface_consumer_usage)
+    return;
+
+  __atomic_store_n(&g_orig_video_encoder_format, nullptr, __ATOMIC_RELAXED);
+  void* format_hook = shadowhook_hook_sym_name("libgui.so",
+      "_ZN7android7Surface16setBuffersFormatEi", reinterpret_cast<void*>(proxy_video_encoder_format),
+      &g_orig_video_encoder_format);
+  if (!format_hook || !__atomic_load_n(&g_orig_video_encoder_format, __ATOMIC_ACQUIRE))
+  {
+    if (format_hook)
+      shadowhook_unhook(format_hook);
+    return;
+  }
+  const auto symbol = OBF("_ZNK7android7camera319Camera3OutputStream16getEndpointUsageEPm");
+  __atomic_store_n(&g_orig_video_encoder_usage, nullptr, __ATOMIC_RELAXED);
+  void* stub = shadowhook_hook_sym_name("libcameraservice.so", symbol.c_str(),
+      reinterpret_cast<void*>(proxy_video_encoder_usage), &g_orig_video_encoder_usage);
+  if (stub && __atomic_load_n(&g_orig_video_encoder_usage, __ATOMIC_ACQUIRE))
+  {
+    g_video_encoder_usage_stub = stub;
+    g_video_encoder_format_stub = format_hook;
+    return;
+  }
+  shadowhook_unhook(format_hook);
+  if (stub)
+    shadowhook_unhook(stub);
+  LOGW("Camera3 recorder endpoint usage ABI unavailable");
+}
+
 static int try_hook_primary()
 {
   shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
@@ -1463,6 +1542,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
   if (try_hook_primary() == 0)
   {
     try_hook_preview_spacer();
+    try_hook_video_encoder_buffers();
     hook_rc = 0;
   }
   else
@@ -1511,6 +1591,16 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_sh
   {
     shadowhook_unhook(g_preview_spacer_stub);
     g_preview_spacer_stub = nullptr;
+  }
+  if (g_video_encoder_usage_stub)
+  {
+    shadowhook_unhook(g_video_encoder_usage_stub);
+    g_video_encoder_usage_stub = nullptr;
+  }
+  if (g_video_encoder_format_stub)
+  {
+    shadowhook_unhook(g_video_encoder_format_stub);
+    g_video_encoder_format_stub = nullptr;
   }
   if (g_hook_stub)
   {

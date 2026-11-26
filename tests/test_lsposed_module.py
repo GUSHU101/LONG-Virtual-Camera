@@ -230,6 +230,8 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertIn('hook_pid cameraserver "$CAM_READY"', script)
         self.assertIn('strcmp(process, "cameraserver") != 0', native)
         self.assertIn("Camera3OutputStream21queueBufferToConsumer", native)
+        self.assertIn("AHardwareBuffer_Planes planes{}", native)
+        self.assertNotIn("struct CR_AHB_Planes", native)
         init = native.split("int cr_camhook_init(const char* feed_url)", 1)[1].split(
             "int cr_camhook_shutdown()", 1
         )[0]
