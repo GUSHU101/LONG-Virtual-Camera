@@ -992,19 +992,60 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   if (!handle)
     return false;
 
+  void* vaddr = nullptr;
+  void* ahb_handle = nullptr;
+  int lock_path = -1;
+  if (!lock_blob(anb, handle, W, H, fence, vaddr, ahb_handle, lock_path))
+  {
+    const int n = ++g_stat_blob_lock_fail;
+    if (n <= 5 || (n % 60) == 0)
+      LOGW("blob: could not lock %zu-byte JPEG buffer", buf_capacity);
+    return false;
+  }
+  int target_w = 0, target_h = 0;
+  {
+    BlobLockGuard blob_lock(handle, ahb_handle, lock_path);
+    if (cr_camera_jpeg_dimensions(static_cast<const uint8_t*>(vaddr), buf_capacity,
+                                  &target_w, &target_h) != 0 || !blob_lock.unlock())
+      return false;
+  }
+  const size_t target_pixels = static_cast<size_t>(target_w) * target_h;
+  constexpr size_t kMaxJpegPixels = 16u * 1024u * 1024u;
+  cr_nv21_crop_rect crop;
+  if (target_w < 8 || target_h < 8 || target_w > 8192 || target_h > 8192 ||
+      target_pixels > kMaxJpegPixels ||
+      !cr_nv21_center_crop(src_w, src_h, target_w, target_h, &crop))
+  {
+    LOGW("blob: unsupported JPEG dimensions %dx%d", target_w, target_h);
+    return false;
+  }
+
   EncodedJpeg jpeg;
   {
     std::lock_guard<std::mutex> guard(g_jpeg_cache_mutex);
     if (g_jpeg_cache.data && g_jpeg_cache.generation == source.generation &&
-        g_jpeg_cache.frame == cur_frame && g_jpeg_cache.width == source.width &&
-        g_jpeg_cache.height == source.height)
+        g_jpeg_cache.frame == cur_frame &&
+        g_jpeg_cache.width == static_cast<uint32_t>(target_w) &&
+        g_jpeg_cache.height == static_cast<uint32_t>(target_h))
       jpeg = g_jpeg_cache;
   }
   const bool cache_hit = static_cast<bool>(jpeg.data);
   if (!cache_hit)
   {
+    const uint8_t* pixels = source.data;
+    size_t pixel_bytes = source.slot_size;
+    std::vector<uint8_t> scaled;
+    if (src_w != target_w || src_h != target_h)
+    {
+      scaled.resize(target_pixels + target_pixels / 2);
+      // Use the same aspect-preserving crop as the live camera outputs.
+      cr_nv21_blit(source.data, src_w, src_h, scaled.data(), scaled.data() + target_pixels,
+                    target_w, target_h, target_w, target_w, 0);
+      pixels = scaled.data();
+      pixel_bytes = scaled.size();
+    }
     uint8_t* encoded = nullptr;
-    const int result = cr_nv21_to_jpeg(source.data, source.slot_size, src_w, src_h,
+    const int result = cr_nv21_to_jpeg(pixels, pixel_bytes, target_w, target_h,
                                       encode_cap, 85, &encoded, &jpeg.size);
     if (result != 0)
     {
@@ -1016,24 +1057,19 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     jpeg.data = std::shared_ptr<const uint8_t>(encoded, std::free);
     jpeg.generation = source.generation;
     jpeg.frame = cur_frame;
-    jpeg.width = source.width;
-    jpeg.height = source.height;
+    jpeg.width = target_w;
+    jpeg.height = target_h;
     std::lock_guard<std::mutex> guard(g_jpeg_cache_mutex);
     g_jpeg_cache = jpeg;
   }
   if (jpeg.size > encode_cap)
     return false;
 
-  void* vaddr = nullptr;
-  void* ahb_handle = nullptr;
-  int lock_path = -1;
-  if (!lock_blob(anb, handle, W, H, fence, vaddr, ahb_handle, lock_path))
+  // This buffer has not been queued to its consumer yet and the first
+  // lock already waited for the producer fence.
+  if (!lock_blob(anb, handle, W, H, -1, vaddr, ahb_handle, lock_path))
   {
-    int n = ++g_stat_blob_lock_fail;
-    if (n <= 5 || (n % 60) == 0)
-    {
-      LOGW(OBF("blob lock failed (%dx%d cap=%zu fmt=0x%x ahb_lock=%p gbm_lock_v1=%p gbm_lock_v2=%p)").c_str(), W, H, buf_capacity, anb->format, (void*) g_ahb_lock, (void*) g_gbm_lock_v1, (void*) g_gbm_lock_v2);
-    }
+    ++g_stat_blob_lock_fail;
     return false;
   }
   BlobLockGuard blob_lock(handle, ahb_handle, lock_path);
@@ -1051,7 +1087,8 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   int n = ++g_stat_blob_ok;
   if (n <= 5 || (n % 30) == 0)
   {
-    LOGI(OBF("blob#%d substituted: %zu JPEG bytes (src %dx%d -> buf %dx%d) via=%s %s").c_str(), n, jpeg.size, src_w, src_h, W, H, lock_path == 0 ? OBF("AHB").c_str() : OBF("GBM").c_str(), cache_hit ? OBF("(cache hit)").c_str() : OBF("(re-encoded)").c_str());
+    LOGI("blob#%d substituted: %zu JPEG bytes (src %dx%d -> JPEG %dx%d)",
+         n, jpeg.size, src_w, src_h, target_w, target_h);
   }
   return true;
 }

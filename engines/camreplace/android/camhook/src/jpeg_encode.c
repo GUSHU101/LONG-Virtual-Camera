@@ -194,7 +194,8 @@ static uint8_t tiff_orientation(const uint8_t* tiff, size_t size)
   return 0;
 }
 
-static uint8_t camera_jpeg_orientation(const uint8_t* jpeg, size_t size)
+static void read_jpeg_metadata(const uint8_t* jpeg, size_t size,
+                               int* width, int* height, uint8_t* orientation)
 {
   size_t position = 2;
   while (position < size && jpeg[position] == 0xff)
@@ -207,34 +208,71 @@ static uint8_t camera_jpeg_orientation(const uint8_t* jpeg, size_t size)
     const size_t length = exif_u16(jpeg + position, 0);
     if (length < 2 || length > size - position)
       break;
-    if (marker == 0xe1 && length >= 8 && memcmp(jpeg + position + 2, "Exif\0\0", 6) == 0)
+    if (orientation && marker == 0xe1 && length >= 8 &&
+        memcmp(jpeg + position + 2, "Exif\0\0", 6) == 0)
     {
-      const uint8_t orientation = tiff_orientation(jpeg + position + 8, length - 8);
-      if (orientation != 0)
-        return orientation;
+      const uint8_t value = tiff_orientation(jpeg + position + 8, length - 8);
+      if (value != 0)
+      {
+        *orientation = value;
+        if (!width || !height)
+          return;
+      }
+    }
+    if (width && height && marker >= 0xc0 && marker <= 0xcf &&
+        marker != 0xc4 && marker != 0xc8 && marker != 0xcc && length >= 8)
+    {
+      *height = exif_u16(jpeg + position + 3, 0);
+      *width = exif_u16(jpeg + position + 5, 0);
+      return;
     }
     position += length;
   }
-  return 1;
+}
+
+static size_t camera_jpeg_size(const uint8_t* blob, size_t blob_size)
+{
+  struct CameraJpegTrailer trailer;
+  if (!blob || blob_size < sizeof(trailer))
+    return 0;
+  const size_t capacity = blob_size - sizeof(trailer);
+  memcpy(&trailer, blob + capacity, sizeof(trailer));
+  if (trailer.id != 0x00ff || trailer.size > capacity || trailer.size < 2 ||
+      blob[0] != 0xff || blob[1] != 0xd8)
+    return 0;
+  return trailer.size;
+}
+
+int cr_camera_jpeg_dimensions(const uint8_t* blob, size_t blob_size,
+                               int* width, int* height)
+{
+  if (!width || !height)
+    return -1;
+  *width = 0;
+  *height = 0;
+  const size_t size = camera_jpeg_size(blob, blob_size);
+  if (size == 0)
+    return -1;
+  read_jpeg_metadata(blob, size, width, height, NULL);
+  return *width > 0 && *height > 0 ? 0 : -1;
 }
 
 int cr_replace_camera_jpeg(uint8_t* dst, size_t dst_size,
                            const uint8_t* jpeg, size_t jpeg_size)
 {
   const uint16_t jpeg_id = 0x00ff;
-  struct CameraJpegTrailer previous;
-  if (!dst || !jpeg || dst_size < sizeof(previous) ||
-      jpeg_size > dst_size - sizeof(previous) || jpeg_size > UINT32_MAX ||
+  if (!dst || !jpeg || dst_size < sizeof(struct CameraJpegTrailer) ||
+      jpeg_size > dst_size - sizeof(struct CameraJpegTrailer) || jpeg_size > UINT32_MAX ||
       !has_jpeg_markers(jpeg, jpeg_size))
     return -1;
 
-  const size_t capacity = dst_size - sizeof(previous);
-  memcpy(&previous, dst + capacity, sizeof(previous));
-  if (previous.id != jpeg_id || previous.size > capacity ||
-      previous.size < 2 || dst[0] != 0xff || dst[1] != 0xd8)
+  const size_t previous_size = camera_jpeg_size(dst, dst_size);
+  if (previous_size == 0)
     return -1;
 
-  const uint8_t orientation = camera_jpeg_orientation(dst, previous.size);
+  const size_t capacity = dst_size - sizeof(struct CameraJpegTrailer);
+  uint8_t orientation = 1;
+  read_jpeg_metadata(dst, previous_size, NULL, NULL, &orientation);
   const uint8_t exif[] = {
       0xff, 0xe1, 0x00, 0x22, 'E', 'x', 'i', 'f', 0, 0,
       'I', 'I', 42, 0, 8, 0, 0, 0,

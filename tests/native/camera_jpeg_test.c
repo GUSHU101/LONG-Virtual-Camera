@@ -45,7 +45,10 @@ int main(void)
   assert(cr_replace_camera_jpeg(blob, sizeof(blob), jpeg, length) != 0);
   assert(memcmp(blob, original, sizeof(blob)) == 0);
 
+  int capture_width = 0, capture_height = 0;
+  assert(cr_camera_jpeg_dimensions(blob, sizeof(blob), &capture_width, &capture_height) != 0);
   memcpy(blob + tail, trailer, sizeof(trailer));
+  assert(cr_camera_jpeg_dimensions(blob, sizeof(blob), &capture_width, &capture_height) != 0);
   memcpy(original, blob, sizeof(blob));
   assert(cr_replace_camera_jpeg(blob, sizeof(blob), jpeg, length - 1) != 0);
   assert(memcmp(blob, original, sizeof(blob)) == 0);
@@ -56,6 +59,12 @@ int main(void)
   uint32_t written = 0;
   memcpy(&written, blob + tail + 4, sizeof(written));
   assert(written == length);
+  assert(cr_camera_jpeg_dimensions(blob, sizeof(blob), &capture_width, &capture_height) == 0);
+  assert(capture_width == WIDTH && capture_height == HEIGHT);
+  const uint32_t truncated_size = 6;
+  memcpy(blob + tail + 4, &truncated_size, sizeof(truncated_size));
+  assert(cr_camera_jpeg_dimensions(blob, sizeof(blob), &capture_width, &capture_height) != 0);
+  assert(capture_width == 0 && capture_height == 0);
 
   const uint8_t rotated_jpeg[] = {
       0xff, 0xd8, 0xff, 0xe1, 0, 0x22, 'E', 'x', 'i', 'f', 0, 0,

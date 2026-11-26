@@ -22,6 +22,10 @@ extern "C"
   int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int src_w, int src_h,
                       size_t dst_cap, int quality, uint8_t** out, size_t* out_written);
 
+  // Returns the encoded pixel dimensions of the original Camera3 JPEG.
+  int cr_camera_jpeg_dimensions(const uint8_t* blob, size_t blob_size,
+                               int* width, int* height);
+
   // Replace only a valid Android Camera3 JPEG BLOB, preserving the buffer on failure.
   int cr_replace_camera_jpeg(uint8_t* dst, size_t dst_size,
                              const uint8_t* jpeg, size_t jpeg_size);
