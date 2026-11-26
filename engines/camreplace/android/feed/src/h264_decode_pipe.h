@@ -193,19 +193,20 @@ struct ShmOut
     return true;
   }
 
-  void publish_nv21(const uint8_t* src)
+  bool publish_nv21(const uint8_t* src)
   {
     if (!map)
-      return;
+      return false;
     auto* hd = (cr_feed_header*) map;
     uint32_t next = 0;
     if (!cr_feed_claim_write(hd, cur_wi, &next))
-      return;
+      return false;
     memcpy(slot0 + (size_t) next * CR_FEED_MAX_NV21_BYTES, src, slot_bytes);
     cr_feed_publish(hd, next);
     atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_READY,
                           memory_order_release);
     cur_wi = next;
+    return true;
   }
 
   void revoke_frame()
@@ -412,6 +413,13 @@ public:
       return false;
 
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(dec, 20 * 1000);
+    if (in_idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER)
+    {
+      // Releasing pending outputs may free an input slot. Try once without
+      // another wait before dropping an access unit from the current GOP.
+      drain();
+      in_idx = AMediaCodec_dequeueInputBuffer(dec, 0);
+    }
     if (in_idx >= 0)
     {
       size_t cap = 0;
@@ -565,11 +573,12 @@ public:
                          output_w, output_h, output_w, output_w, 0);
             published = scaled_nv21.data();
           }
-          shm.publish_nv21(published);
-          ++out_count;
-          if (out_count <= 3 || (out_count % 120) == 0)
+          if (shm.publish_nv21(published))
           {
-            CR_FEED_LOGI(OBF("h264: decoded frame #%llu (in=%llu)").c_str(), (unsigned long long) out_count, (unsigned long long) in_count);
+            ++published_count;
+            if (published_count <= 3 || (published_count % 120) == 0)
+              CR_FEED_LOGI(OBF("h264: published frame #%llu (in=%llu)").c_str(),
+                           (unsigned long long) published_count, (unsigned long long) in_count);
           }
         }
       }
@@ -581,9 +590,9 @@ public:
   {
     return in_count;
   }
-  uint64_t output_count() const noexcept
+  uint64_t frames_published() const noexcept
   {
-    return out_count;
+    return published_count;
   }
   void revoke_frame() { shm.revoke_frame(); }
 
@@ -602,7 +611,7 @@ private:
   std::vector<uint8_t> nv21;
   std::vector<uint8_t> scaled_nv21;
   uint64_t in_count = 0;
-  uint64_t out_count = 0;
+  uint64_t published_count = 0;
   uint64_t output_layout_warns = 0;
 };
 

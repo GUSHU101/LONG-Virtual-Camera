@@ -16,6 +16,37 @@ static int crop_contract(void)
   return 0;
 }
 
+static int planar_contract(const uint8_t* source, int width, int height)
+{
+  uint8_t y[10 * 8], u[6 * 4], v[6 * 4];
+  uint8_t reference_y[sizeof(y)], reference_vu[12 * 4];
+  memset(y, 0xee, sizeof(y));
+  memset(u, 0xee, sizeof(u));
+  memset(v, 0xee, sizeof(v));
+  memset(reference_y, 0xee, sizeof(reference_y));
+
+  cr_nv21_blit(source, 8, 4, reference_y, reference_vu, width, height, 10, 12, 0);
+  cr_nv21_blit_planar(source, 8, 4, y, u, v, width, height, 10, 6);
+  if (memcmp(y, reference_y, sizeof(y)) != 0) return 20;
+  for (int row = 0; row < height / 2; ++row)
+  {
+    for (int x = 0; x < width / 2; ++x)
+    {
+      if (u[row * 6 + x] != reference_vu[row * 12 + x * 2 + 1] ||
+          v[row * 6 + x] != reference_vu[row * 12 + x * 2])
+        return 21;
+    }
+    if (u[row * 6 + width / 2] != 0xee || v[row * 6 + width / 2] != 0xee)
+      return 22;
+  }
+  memset(y, 0xee, sizeof(y));
+  memset(u, 0xee, sizeof(u));
+  memset(v, 0xee, sizeof(v));
+  cr_nv21_blit_planar(source, 8, 4, y, u, v, width, height, 10, width / 2 - 1);
+  if (y[0] != 0xee || u[0] != 0xee || v[0] != 0xee) return 23;
+  return 0;
+}
+
 static int blit_contract(void)
 {
   // 8x4 (2:1) -> 4x4 (1:1) must crop x=2..5 rather than stretch x=0..7.
@@ -47,7 +78,9 @@ static int blit_contract(void)
   cr_nv21_blit(source, 8, 4, y_plane, vu_plane, 4, 4, 6, 6, 1);
   if (vu_plane[0] != 103 || vu_plane[1] != 102 ||
       vu_plane[2] != 105 || vu_plane[3] != 104) return 13;
-  return 0;
+  const int planar_crop = planar_contract(source, 4, 4);
+  if (planar_crop) return planar_crop;
+  return planar_contract(source, 6, 6);
 }
 
 int main(void)

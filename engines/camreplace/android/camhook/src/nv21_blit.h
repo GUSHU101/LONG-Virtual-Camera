@@ -45,6 +45,12 @@ extern "C"
   // turn grey/blue — see the bug we hit on 2026-04-22.
   void cr_nv21_blit(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped);
 
+  // Three-plane YUV420 destination with a one-byte chroma pixel stride.
+  // The U and V planes each have dst_w/2 samples per row.
+  void cr_nv21_blit_planar(const uint8_t* src, int src_w, int src_h,
+                           uint8_t* dst_y, uint8_t* dst_u, uint8_t* dst_v,
+                           int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride);
+
   // Sprint E: Lanczos2 alternative. Same signature as cr_nv21_blit, lives
   // in nv21_blit_lanczos.c. Sharper edges on big up-scales at the cost of
   // CPU time per frame (scalar implementation; NEON SIMD is the obvious

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -78,9 +79,10 @@ public:
   {
   }
 
-  bool receive(void* data, std::size_t length) const noexcept
+  bool receive(void* data, std::size_t length,
+               Clock::time_point limit = Clock::time_point::max()) const noexcept
   {
-    return transfer(static_cast<unsigned char*>(data), length, POLLIN,
+    return transfer(static_cast<unsigned char*>(data), length, POLLIN, limit,
         [this](auto* ptr, std::size_t count) {
           const auto bytes = ::recv(fd_, ptr, count, MSG_DONTWAIT);
           if (bytes > 0)
@@ -89,9 +91,10 @@ public:
         });
   }
 
-  bool send(const void* data, std::size_t length) const noexcept
+  bool send(const void* data, std::size_t length,
+            Clock::time_point limit = Clock::time_point::max()) const noexcept
   {
-    return transfer(static_cast<const unsigned char*>(data), length, POLLOUT,
+    return transfer(static_cast<const unsigned char*>(data), length, POLLOUT, limit,
         [this](auto* ptr, std::size_t count) {
           return ::send(fd_, ptr, count, MSG_DONTWAIT | MSG_NOSIGNAL);
         });
@@ -99,14 +102,18 @@ public:
 
   void finish_startup() noexcept { deadline_ = Clock::time_point::max(); }
   void set_io_timeout(Clock::duration timeout) noexcept { io_timeout_ = timeout; }
+  Clock::time_point transfer_deadline() const noexcept
+  {
+    return std::min(deadline_, Clock::now() + io_timeout_);
+  }
   std::uint64_t received() const noexcept { return received_; }
 
 private:
   template <class Byte, class Operation>
-  bool transfer(Byte* data, std::size_t length, short event, Operation operation) const noexcept
+  bool transfer(Byte* data, std::size_t length, short event, Clock::time_point limit,
+                Operation operation) const noexcept
   {
-    const auto per_io = Clock::now() + io_timeout_;
-    const auto until = deadline_ < per_io ? deadline_ : per_io;
+    const auto until = std::min(transfer_deadline(), limit);
     while (length != 0)
     {
       if (stop_.load(std::memory_order_relaxed))

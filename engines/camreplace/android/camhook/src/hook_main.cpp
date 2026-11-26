@@ -651,7 +651,6 @@ static std::atomic<int> g_stat_skip_fmt{0};
 static std::atomic<int> g_stat_skip_raw10{0};
 static std::atomic<int> g_stat_skip_handle{0};
 static std::atomic<int> g_stat_lock_fail{0};
-static std::atomic<int> g_stat_no_vu{0};
 static std::atomic<int> g_stat_blit_ok{0};
 
 static bool inspect_anwb(const ANWB* anb, ANWBInfo& out)
@@ -706,11 +705,51 @@ struct LockedView
 {
   uint8_t* y = nullptr;
   uint8_t* vu = nullptr;
+  uint8_t* cb = nullptr;
+  uint8_t* cr = nullptr;
   size_t ystride = 0;
   size_t uvstride = 0;
   bool uv_swapped = false;
   int lock_path = -1;
+  int ahb_status = -ENOTSUP;
+  int gbm_status = -ENOTSUP;
+  uint32_t ahb_plane_count = 0;
 };
+
+static bool describe_yuv420(LockedView& view, int width, int height,
+                            void* y, void* cb, void* cr,
+                            size_t ystride, size_t cstride, size_t chroma_step)
+{
+  if (!y || !cb || !cr || (chroma_step != 1 && chroma_step != 2) ||
+      ystride < static_cast<size_t>(width) ||
+      cstride < static_cast<size_t>(width / 2) * chroma_step ||
+      ystride > std::numeric_limits<int>::max() ||
+      cstride > std::numeric_limits<int>::max())
+    return false;
+
+  const auto u = reinterpret_cast<uintptr_t>(cb);
+  const auto v = reinterpret_cast<uintptr_t>(cr);
+  const auto distance = u > v ? u - v : v - u;
+  if (chroma_step == 2)
+  {
+    if (distance != 1)
+      return false;
+    view.vu = static_cast<uint8_t*>(v < u ? cr : cb);
+    view.uv_swapped = u < v;
+  }
+  else
+  {
+    const size_t chroma_span = static_cast<size_t>(height / 2 - 1) * cstride + width / 2;
+    if (distance < chroma_span)
+      return false;
+    view.cb = static_cast<uint8_t*>(cb);
+    view.cr = static_cast<uint8_t*>(cr);
+  }
+  view.y = static_cast<uint8_t*>(y);
+  view.ystride = ystride;
+  view.uvstride = cstride;
+  return true;
+}
 
 static bool wait_for_fence(int fence)
 {
@@ -739,100 +778,63 @@ static bool lock_via_ahb(const void* anb, int W, int H, int fence,
   {
     lock_fence = dup(fence);
     if (lock_fence < 0)
+    {
+      view.ahb_status = -errno;
       return false;
+    }
   }
   // AHardwareBuffer_lockPlanes takes ownership of the fence descriptor,
   // including on failure. The camera framework retains the original fd;
   // only the duplicate is transferred here.
   ARect rect{0, 0, W, H};
   AHardwareBuffer_Planes planes{};
-  int rc = g_ahb_lockPlanes(ahb, kAhbUsageCpuRW, lock_fence, &rect, &planes);
-  if (rc != 0)
+  view.ahb_status = g_ahb_lockPlanes(ahb, kAhbUsageCpuRW, lock_fence, &rect, &planes);
+  view.ahb_plane_count = planes.planeCount;
+  if (view.ahb_status != 0)
     return false;
-  if (planes.planeCount != 3)
+
+  const auto& p0 = planes.planes[0];
+  const auto& p1 = planes.planes[1];
+  const auto& p2 = planes.planes[2];
+  if (planes.planeCount != 3 || p0.pixelStride != 1 ||
+      p1.pixelStride != p2.pixelStride || p1.rowStride != p2.rowStride ||
+      !describe_yuv420(view, W, H, p0.data, p1.data, p2.data,
+                       p0.rowStride, p1.rowStride, p1.pixelStride))
   {
+    view.ahb_status = -EINVAL;
     g_ahb_unlock(ahb, nullptr);
     return false;
-  }
-
-  auto& p0 = planes.planes[0];
-  auto& p1 = planes.planes[1];
-  auto& p2 = planes.planes[2];
-
-  const uintptr_t cb = reinterpret_cast<uintptr_t>(p1.data);
-  const uintptr_t cr = reinterpret_cast<uintptr_t>(p2.data);
-  const uintptr_t chroma_delta = cb > cr ? cb - cr : cr - cb;
-  if (!p0.data || !p1.data || !p2.data || p0.pixelStride != 1 ||
-      p1.pixelStride != 2 || p2.pixelStride != 2 ||
-      p0.rowStride < static_cast<uint32_t>(W) ||
-      p1.rowStride < static_cast<uint32_t>(W) ||
-      p0.rowStride > std::numeric_limits<int>::max() ||
-      p1.rowStride > std::numeric_limits<int>::max() ||
-      p2.rowStride != p1.rowStride || chroma_delta != 1u)
-  {
-    g_ahb_unlock(ahb, nullptr);
-    return false;
-  }
-  view.y = static_cast<uint8_t*>(p0.data);
-  view.ystride = p0.rowStride;
-  view.uvstride = p1.rowStride;
-  if (cr < cb)
-  {
-    view.vu = (uint8_t*) p2.data;
-    view.uv_swapped = false;
-  }
-  else
-  {
-    view.vu = (uint8_t*) p1.data;
-    view.uv_swapped = true;
   }
   view.lock_path = 0;
   out_handle = ahb;
   return true;
 }
 
-static bool lock_via_gbm(const void* anb, const void* handle, int W, int H,
+static bool lock_via_gbm(const void* handle, int W, int H,
                          int fence, LockedView& view)
 {
-  if (!gbm_ready() || !wait_for_fence(fence))
+  if (!gbm_ready())
     return false;
+  if (!wait_for_fence(fence))
+  {
+    view.gbm_status = -EIO;
+    return false;
+  }
   Rect bounds{0, 0, W, H};
   android_ycbcr yc = {};
 
-  int rc = g_gbm_lockYCbCr(g_gbm, handle, 0x33u, bounds, &yc);
-  if (rc != 0)
+  view.gbm_status = g_gbm_lockYCbCr(g_gbm, handle, 0x33u, bounds, &yc);
+  if (view.gbm_status != 0)
     return false;
 
-  const uintptr_t cb = reinterpret_cast<uintptr_t>(yc.cb);
-  const uintptr_t cr = reinterpret_cast<uintptr_t>(yc.cr);
-  const uintptr_t chroma_delta = cb > cr ? cb - cr : cr - cb;
-  if (yc.y && yc.cb && yc.cr && yc.chroma_step == 2 &&
-      yc.ystride >= static_cast<size_t>(W) &&
-      yc.cstride >= static_cast<size_t>(W) &&
-      yc.ystride <= std::numeric_limits<int>::max() &&
-      yc.cstride <= std::numeric_limits<int>::max() && chroma_delta == 1u)
+  if (!describe_yuv420(view, W, H, yc.y, yc.cb, yc.cr,
+                       yc.ystride, yc.cstride, yc.chroma_step))
   {
-    view.y = static_cast<uint8_t*>(yc.y);
-    view.ystride = yc.ystride;
-    view.uvstride = yc.cstride;
-    if (cr < cb)
-    {
-      view.vu = (uint8_t*) yc.cr;
-      view.uv_swapped = false;
-    }
-    else
-    {
-      view.vu = (uint8_t*) yc.cb;
-      view.uv_swapped = true;
-    }
-  }
-  else
-  {
+    view.gbm_status = -EINVAL;
     gbm_call_unlock(handle);
     return false;
   }
   view.lock_path = 1;
-  (void) anb;
   return true;
 }
 
@@ -1160,53 +1162,53 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
   bool locked = lock_via_ahb(anb, W, H, fence, ahb, view);
   if (!locked)
   {
-    locked = lock_via_gbm(anb, handle, W, H, fence, view);
+    locked = lock_via_gbm(handle, W, H, fence, view);
   }
   if (!locked)
   {
     int n = ++g_stat_lock_fail;
     if (n <= 5 || (n % 60) == 0)
     {
-      LOGW(OBF("lock failed (%dx%d fmt=0x%x handle=%p)").c_str(), W, H, fmt, handle);
+      const auto usage = anb->common.version >= static_cast<int32_t>(sizeof(ANWB))
+                             ? static_cast<unsigned long long>(anb->usage) : 0;
+      LOGW(OBF("lock failed (%dx%d fmt=0x%x usage=0x%llx ahb=%d planes=%u mapper=%d)").c_str(),
+           W, H, fmt, usage, view.ahb_status, view.ahb_plane_count, view.gbm_status);
     }
     return cr::camhook::ReplacementOutcome::AttemptedFailed;
   }
 
-  bool replaced = false;
-  if (view.y && view.vu)
+  PinnedSlot source;
+  if (!g_shm.pin_current(source))
   {
-    PinnedSlot source;
-    if (!g_shm.pin_current(source))
-    {
-      unlock(handle, ahb, view);
-      return cr::camhook::ReplacementOutcome::AttemptedFailed;
-    }
-    if (!frame_is_fresh(source))
-    {
-      ++g_stat_skip_stale;
-      unlock(handle, ahb, view);
-      return cr::camhook::ReplacementOutcome::PassThrough;
-    }
-    cr_nv21_crop_rect crop;
-    if (!cr_nv21_center_crop(source.width, source.height, W, H, &crop) ||
-        access("/data/cr/video_mode", R_OK) != 0 ||
-        atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
-            CR_CHANNEL_STATE_READY)
-    {
-      unlock(handle, ahb, view);
-      return cr::camhook::ReplacementOutcome::PassThrough;
-    }
+    unlock(handle, ahb, view);
+    return cr::camhook::ReplacementOutcome::AttemptedFailed;
+  }
+  if (!frame_is_fresh(source))
+  {
+    ++g_stat_skip_stale;
+    unlock(handle, ahb, view);
+    return cr::camhook::ReplacementOutcome::PassThrough;
+  }
+  cr_nv21_crop_rect crop;
+  if (!cr_nv21_center_crop(source.width, source.height, W, H, &crop) ||
+      access("/data/cr/video_mode", R_OK) != 0 ||
+      atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
+          CR_CHANNEL_STATE_READY)
+  {
+    unlock(handle, ahb, view);
+    return cr::camhook::ReplacementOutcome::PassThrough;
+  }
+
+  if (view.vu)
     blit_adaptive(source.data, (int) source.width, (int) source.height,
                   view.y, view.vu, W, H, (int) view.ystride,
                   (int) view.uvstride, view.uv_swapped ? 1 : 0);
-    replaced = true;
-  }
   else
-  {
-    ++g_stat_no_vu;
-  }
+    cr_nv21_blit_planar(source.data, (int) source.width, (int) source.height,
+                        view.y, view.cb, view.cr, W, H,
+                        (int) view.ystride, (int) view.uvstride);
 
-  replaced = unlock(handle, ahb, view) && replaced;
+  const bool replaced = unlock(handle, ahb, view);
   if (replaced && !deferred)
     ++g_stat_blit_ok;
   return replaced ? cr::camhook::ReplacementOutcome::YuvWritten
@@ -1273,7 +1275,7 @@ static void report_queue_stats() noexcept
 
   if ((n % 60) == 0)
   {
-    LOGI(OBF("stats: callbacks=%llu attempted=%llu pass=%llu queue_failed=%llu skip_channel=%d skip_noframe=%d skip_stale=%d skip_noshm=%d skip_fmt=%d skip_lock=%d blit_ok=%d blob_ok=%d blob_cache_hit=%d noanb=%d layout=%d nogbm=%d dims=%d hnd=%d novu=%d").c_str(),
+    LOGI(OBF("stats: callbacks=%llu attempted=%llu pass=%llu queue_failed=%llu skip_channel=%d skip_noframe=%d skip_stale=%d skip_noshm=%d skip_fmt=%d skip_lock=%d blit_ok=%d blob_ok=%d blob_cache_hit=%d noanb=%d layout=%d nogbm=%d dims=%d hnd=%d").c_str(),
          (unsigned long long) g_hook_counters.callback_seen.load(),
          (unsigned long long) g_hook_counters.replacement_attempted.load(),
          (unsigned long long) g_hook_counters.pass_through.load(),
@@ -1291,8 +1293,7 @@ static void report_queue_stats() noexcept
          g_stat_skip_layout.load(),
          g_stat_skip_nogbm.load(),
          g_stat_skip_dims.load(),
-         g_stat_skip_handle.load(),
-         g_stat_no_vu.load());
+         g_stat_skip_handle.load());
   }
 }
 

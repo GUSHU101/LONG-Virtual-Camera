@@ -23,6 +23,18 @@ static void verify_transfer_deadlines()
   input.finish_startup();
   assert(input.send(&sample, 1));
   assert(::recv(pair[1], bytes, 1, 0) == 1 && bytes[0] == sample);
+
+  // A complete chunk may need several reads and an acknowledgement.
+  // Finishing one transfer must not extend the deadline for the next.
+  const auto chunk_deadline = Socket::Clock::now() + 100ms;
+  assert(::send(pair[1], &sample, 1, 0) == 1);
+  assert(input.receive(bytes, 1, chunk_deadline) && bytes[0] == sample);
+  std::this_thread::sleep_until(chunk_deadline);
+  assert(::send(pair[1], &sample, 1, 0) == 1);
+  assert(!input.receive(bytes, 1, chunk_deadline) && errno == ETIMEDOUT);
+  assert(!input.send(&sample, 1, chunk_deadline) && errno == ETIMEDOUT);
+  assert(input.receive(bytes, 1) && bytes[0] == sample);
+
   stop.store(true, std::memory_order_relaxed);
   assert(!input.receive(bytes, 1) && errno == ECANCELED);
   assert(::close(pair[0]) == 0);

@@ -131,22 +131,13 @@ static void scale_plane_bilinear(const uint8_t* src, int src_w, int src_h, int s
   }
 }
 
-// The VU plane is two interleaved chroma bytes per sample, so scale them as
-// a single 16-bit quantity (conceptually one "VU pixel"). `dst_swap` flips
-// the two bytes per pair — use it when the destination is NV12 (U first)
-// while our source is NV21 (V first).
+// The source contains interleaved VU samples. Scale both channels using
+// the same coordinates, whether the destination is interleaved or planar.
 static void scale_vu_bilinear(const uint8_t* src, int src_w_pairs, int src_h,
-                              int src_stride_bytes, uint8_t* dst,
+                              int src_stride_bytes, uint8_t* dst_u, uint8_t* dst_v,
                               int dst_w_pairs, int dst_h,
-                              int dst_stride_bytes, int dst_swap)
+                              int dst_stride_bytes, int dst_pixel_stride)
 {
-  // Treat the source and destination as arrays of VU pairs (2 bytes each).
-  // Source stride is src_w_pairs*2 bytes; dst stride is dst_stride_bytes.
-  if (dst_w_pairs <= 0 || dst_w_pairs > CR_BLIT_MAX_DST_W)
-    return;
-  if (src_w_pairs < 2 || src_h < 2)
-    return;
-
   const uint32_t step_x = dst_w_pairs > 1
       ? (uint32_t) (((uint64_t) (src_w_pairs - 1) << 16) /
                     (uint32_t) (dst_w_pairs - 1))
@@ -172,9 +163,6 @@ static void scale_vu_bilinear(const uint8_t* src, int src_w_pairs, int src_h,
     cols_fx[x] = fx;
   }
 
-  const int off_v = dst_swap ? 1 : 0;
-  const int off_u = dst_swap ? 0 : 1;
-
   for (int y = 0; y < dst_h; ++y)
   {
     uint32_t ay = y * step_y;
@@ -189,9 +177,10 @@ static void scale_vu_bilinear(const uint8_t* src, int src_w_pairs, int src_h,
     const uint8_t* r0 = src + (size_t) sy * src_stride_bytes;
     const uint32_t sy1 = sy + 1u < (uint32_t) src_h ? sy + 1u : sy;
     const uint8_t* r1 = src + (size_t) sy1 * src_stride_bytes;
-    uint8_t* drow = dst + (size_t) y * dst_stride_bytes;
+    uint8_t* row_u = dst_u + (size_t) y * dst_stride_bytes;
+    uint8_t* row_v = dst_v + (size_t) y * dst_stride_bytes;
 
-    for (int x = 0; x < dst_w_pairs; ++x)
+    for (int x = 0, offset = 0; x < dst_w_pairs; ++x, offset += dst_pixel_stride)
     {
       uint32_t sx = cols_sx[x];
       uint32_t fx = cols_fx[x];
@@ -203,17 +192,19 @@ static void scale_vu_bilinear(const uint8_t* src, int src_w_pairs, int src_h,
       uint8_t v11 = r1[sx1 * 2 + 0], u11 = r1[sx1 * 2 + 1];
       uint8_t vT = blend(v00, v01, fx), vB = blend(v10, v11, fx);
       uint8_t uT = blend(u00, u01, fx), uB = blend(u10, u11, fx);
-      drow[x * 2 + off_v] = blend(vT, vB, fy);
-      drow[x * 2 + off_u] = blend(uT, uB, fy);
+      row_v[offset] = blend(vT, vB, fy);
+      row_u[offset] = blend(uT, uB, fy);
     }
   }
 }
 
-void cr_nv21_blit(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped)
+static void blit_nv21(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
+                      uint8_t* dst_u, uint8_t* dst_v, int dst_w, int dst_h,
+                      int dst_y_stride, int dst_uv_stride, int dst_pixel_stride)
 {
-  if (!src || !dst_y || !dst_vu || src_w > 8192 || src_h > 8192 ||
+  if (!src || !dst_y || !dst_u || !dst_v || src_w > 8192 || src_h > 8192 ||
       dst_w > 8192 || dst_h > 8192 || dst_y_stride < dst_w ||
-      dst_uv_stride < dst_w ||
+      dst_uv_stride < dst_w / 2 * dst_pixel_stride ||
       (uint64_t) src_w * (uint64_t) src_h > 32ull * 1024ull * 1024ull ||
       (uint64_t) dst_w * (uint64_t) dst_h > 32ull * 1024ull * 1024ull)
     return;
@@ -221,37 +212,31 @@ void cr_nv21_blit(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint
   if (!cr_nv21_center_crop(src_w, src_h, dst_w, dst_h, &crop))
     return;
 
-  // Stride-aware equal-resolution fast path. The original gate required
-  // `dst_y_stride == dst_w && dst_uv_stride == dst_w` which is rarely
-  // true on Qualcomm gralloc — it pads strides up to 64-byte boundaries
-  // (e.g. dst_w=1280 → dst_y_stride=1344). The padded case used to
-  // fall through to the bilinear scaler even though source and dest
-  // dimensions matched, wasting CPU on a no-op resize.
-  // New gate: same resolution, no chroma swap. Per-row memcpy works
-  // regardless of how big the stride padding is — we just memcpy
-  // `dst_w` (or `dst_w` for the VU pair = 2 * (dst_w/2)) bytes per row
-  // and skip the rest of the stride padding.
+  const uint8_t* src_y = src + (size_t) crop.y * src_w + crop.x;
+  const uint8_t* src_vu = src + (size_t) src_w * src_h +
+                          (size_t) (crop.y / 2) * src_w + crop.x;
+
+  // With no scaling, copy the visible luma and preserve all row padding.
   if (crop.width == dst_w && crop.height == dst_h)
   {
     for (int y = 0; y < dst_h; ++y)
     {
       memcpy(dst_y + (size_t) y * dst_y_stride,
-             src + (size_t) (crop.y + y) * src_w + crop.x,
+             src_y + (size_t) y * src_w,
              (size_t) dst_w);
     }
-    const uint8_t* src_vu = src + (size_t) src_w * src_h +
-                            (size_t) (crop.y / 2) * src_w + crop.x;
     for (int y = 0; y < dst_h / 2; ++y)
     {
       const uint8_t* source_row = src_vu + (size_t) y * src_w;
-      uint8_t* destination_row = dst_vu + (size_t) y * dst_uv_stride;
-      if (!dst_uv_swapped)
-        memcpy(destination_row, source_row, (size_t) dst_w);
+      uint8_t* row_u = dst_u + (size_t) y * dst_uv_stride;
+      uint8_t* row_v = dst_v + (size_t) y * dst_uv_stride;
+      if (dst_pixel_stride == 2 && row_u == row_v + 1)
+        memcpy(row_v, source_row, (size_t) dst_w);
       else
-        for (int x = 0; x < dst_w; x += 2)
+        for (int x = 0, offset = 0; x < dst_w; x += 2, offset += dst_pixel_stride)
         {
-          destination_row[x] = source_row[x + 1];
-          destination_row[x + 1] = source_row[x];
+          row_v[offset] = source_row[x];
+          row_u[offset] = source_row[x + 1];
         }
     }
     return;
@@ -261,14 +246,30 @@ void cr_nv21_blit(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint
   // output is served at exactly its requested size, but the source is first
   // centre-cropped to the target aspect ratio. This avoids the old stretched
   // faces while still filling preview, recording and photo buffers fully.
-  const uint8_t* src_y = src + (size_t) crop.y * src_w + crop.x;
   scale_plane_bilinear(src_y, crop.width, crop.height, src_w,
                        dst_y, dst_w, dst_h, dst_y_stride);
 
   // VU plane — half the pixel count horizontally/vertically, 2 bytes each.
-  const uint8_t* src_vu = src + (size_t) src_w * src_h +
-                          (size_t) (crop.y / 2) * src_w + crop.x;
   scale_vu_bilinear(src_vu, crop.width / 2, crop.height / 2, src_w,
-                    dst_vu, dst_w / 2, dst_h / 2, dst_uv_stride,
-                    dst_uv_swapped);
+                    dst_u, dst_v, dst_w / 2, dst_h / 2, dst_uv_stride,
+                    dst_pixel_stride);
+}
+
+void cr_nv21_blit(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
+                  uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride,
+                  int dst_uv_stride, int dst_uv_swapped)
+{
+  if (!dst_vu)
+    return;
+  const int v_offset = dst_uv_swapped ? 1 : 0;
+  blit_nv21(src, src_w, src_h, dst_y, dst_vu + (1 - v_offset), dst_vu + v_offset,
+            dst_w, dst_h, dst_y_stride, dst_uv_stride, 2);
+}
+
+void cr_nv21_blit_planar(const uint8_t* src, int src_w, int src_h,
+                         uint8_t* dst_y, uint8_t* dst_u, uint8_t* dst_v,
+                         int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride)
+{
+  blit_nv21(src, src_w, src_h, dst_y, dst_u, dst_v, dst_w, dst_h,
+            dst_y_stride, dst_uv_stride, 1);
 }

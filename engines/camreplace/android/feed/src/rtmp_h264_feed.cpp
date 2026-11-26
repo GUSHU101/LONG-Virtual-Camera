@@ -335,34 +335,20 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   uint32_t ack_window = 0;
   uint32_t advertised_peer_window = 0;
   uint64_t last_ack = 0;
-  auto acknowledge = [&]()
+  std::vector<uint8_t> ack_packet;
+  auto acknowledge = [&](cr::feed::DeadlineSocket::Clock::time_point deadline)
   {
     const uint64_t received = connection.received();
     if (ack_window == 0 || received - last_ack < ack_window)
       return true;
     uint8_t ack[4];
     put_be32(ack, static_cast<uint32_t>(received));
-    if (!send_message(connection, 0x03, 0, ack, sizeof(ack)))
+    ack_packet.clear();
+    build_rtmp_message(ack_packet, 2, 0, 0x03, 0, ack, sizeof(ack), 128);
+    if (!connection.send(ack_packet.data(), ack_packet.size(), deadline))
       return false;
     last_ack = received;
     return true;
-  };
-  auto read_with_ack = [&](uint8_t* data, size_t size)
-  {
-    while (size != 0)
-    {
-      if (!acknowledge())
-        return false;
-      size_t take = size;
-      if (ack_window != 0)
-        take = static_cast<size_t>(std::min<uint64_t>(
-            size, ack_window - (connection.received() - last_ack)));
-      if (!connection.receive(data, take))
-        return false;
-      data += take;
-      size -= take;
-    }
-    return acknowledge();
   };
 
   std::vector<uint8_t> sps_pps_annexb;
@@ -383,7 +369,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   bool connection_accepted = false;
   uint32_t play_stream_id = 0;
   bool receiving_media = false;
-  uint64_t last_decoded = 0;
+  uint64_t last_published = 0;
   auto last_frame = std::chrono::steady_clock::time_point::min();
   bool video_ready = false;
 
@@ -429,10 +415,50 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
 
   while (!g_stop.load(std::memory_order_relaxed))
   {
+    // Audio, keepalives and partial messages can outlive video.
+    const auto frame_count = pipe.frames_published();
+    const auto now = std::chrono::steady_clock::now();
+    if (frame_count != last_published)
+    {
+      last_published = frame_count;
+      last_frame = now;
+      video_ready = frame_count != 0;
+    }
+    else if (video_ready && now - last_frame >= kVideoFrameTimeout)
+    {
+      pipe.revoke_frame();
+      video_ready = false;
+      LOGW("rtmp: no new video published in two seconds, waiting for a fresh frame");
+    }
+
     cr::feed::RtmpMessage message;
+    // One deadline covers the entire chunk, including header fields and
+    // transfers split by an acknowledgement boundary.
+    const auto deadline = connection.transfer_deadline();
+    auto read_with_ack = [&](uint8_t* data, size_t size)
+    {
+      while (size != 0)
+      {
+        if (!acknowledge(deadline))
+          return false;
+        size_t take = size;
+        if (ack_window != 0)
+          take = static_cast<size_t>(std::min<uint64_t>(
+              size, ack_window - (connection.received() - last_ack)));
+        if (!connection.receive(data, take, deadline))
+          return false;
+        data += take;
+        size -= take;
+      }
+      return acknowledge(deadline);
+    };
     const auto result = reader.read(read_with_ack, message);
     if (result == cr::feed::RtmpChunkResult::Closed)
+    {
+      if (errno == ETIMEDOUT)
+        LOGW("rtmp: timed out receiving a chunk, reconnecting");
       break;
+    }
     if (result == cr::feed::RtmpChunkResult::Invalid)
     {
       LOGW("rtmp: invalid chunk headers or receive budget exceeded");
@@ -744,24 +770,11 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
         break;
       }
     }
-    // Audio or keepalives can outlive the video. Publish unavailable once
-    // until a complete decoded frame has advanced the shared ring again.
-    const auto frame_count = pipe.output_count();
-    if (frame_count != last_decoded)
-    {
-      last_decoded = frame_count;
-      last_frame = std::chrono::steady_clock::now();
-      video_ready = frame_count != 0;
-    }
-    else if (video_ready && std::chrono::steady_clock::now() - last_frame >= kVideoFrameTimeout)
-    {
-      pipe.revoke_frame();
-      video_ready = false;
-      LOGW("rtmp: no decoded video in two seconds, waiting for a fresh frame");
-    }
   }
 done:
-  LOGI(OBF("rtmp: reader disconnected (decoded in=%llu out=%llu, audio=%s)").c_str(), (unsigned long long) pipe.input_count(), (unsigned long long) pipe.output_count(), audio_pipe_started ? "on" : OBF("off").c_str());
+  LOGI(OBF("rtmp: reader disconnected (input=%llu published=%llu audio=%s)").c_str(),
+       (unsigned long long) pipe.input_count(), (unsigned long long) pipe.frames_published(),
+       audio_pipe_started ? "on" : OBF("off").c_str());
   pipe.stop();
   audio_pipe.stop();
   return true;
