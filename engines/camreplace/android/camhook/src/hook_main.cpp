@@ -1496,8 +1496,8 @@ static void* g_video_encoder_usage_stub = nullptr;
 static void* g_orig_video_encoder_usage = nullptr;
 static void* g_video_encoder_format_stub = nullptr;
 static void* g_orig_video_encoder_format = nullptr;
-static void* g_display_usage_stub = nullptr;
-static void* g_orig_display_usage = nullptr;
+static void* g_camera_surface_usage_stub = nullptr;
+static void* g_orig_camera_surface_usage = nullptr;
 using SurfaceConsumerUsage = int32_t (*)(const void*, uint64_t*);
 static SurfaceConsumerUsage g_surface_consumer_usage = nullptr;
 static cr::camhook::HookCounters g_hook_counters;
@@ -1677,11 +1677,11 @@ static int32_t proxy_video_encoder_format(void* surface, int32_t format)
   return original(surface, format);
 }
 
-static int32_t proxy_camera_display_usage(void* surface, uint64_t usage)
+static int32_t proxy_camera_surface_usage(void* surface, uint64_t usage)
 {
   using SetUsage = int32_t (*)(void*, uint64_t);
   const auto original = reinterpret_cast<SetUsage>(
-      __atomic_load_n(&g_orig_display_usage, __ATOMIC_ACQUIRE));
+      __atomic_load_n(&g_orig_camera_surface_usage, __ATOMIC_ACQUIRE));
   if (!original)
     return -ENOSYS;
   constexpr uint64_t kCameraOutput = uint64_t{1} << 17;
@@ -1691,12 +1691,19 @@ static int32_t proxy_camera_display_usage(void* surface, uint64_t usage)
   if ((usage & (kQtiUbwcUsage | kCameraOutput | AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT)) ==
           (kQtiUbwcUsage | kCameraOutput) &&
       access("/data/cr/video_mode", R_OK) == 0 &&
-      g_surface_consumer_usage(surface, &consumer) == 0 && consumer == kDisplay)
+      g_surface_consumer_usage(surface, &consumer) == 0)
   {
-    // Keep the stream's PRIVATE format and the HAL's negotiated usage.
-    // Only change the display BufferQueue's producer allocation request.
-    LOGI("camera display requested CPU-writable allocation");
-    usage = (usage & ~kQtiUbwcUsage) | kAhbUsageCpuRW;
+    // The time-lapse ImageReader uses VIDEO_ENCODE with CPU access but
+    // does not request UBWC. The camera producer adds the compressed usage.
+    constexpr uint64_t kCpuUsageMask = 0xff;
+    const bool recorder_reader = (consumer & ~kCpuUsageMask) == AHARDWAREBUFFER_USAGE_VIDEO_ENCODE;
+    if (consumer == kDisplay || recorder_reader)
+    {
+      // Preserve PRIVATE and the HAL negotiation. Adjust the BufferQueue's
+      // producer allocation only, leaving the direct encoder format path intact.
+      LOGI("camera %s requested CPU-writable allocation", recorder_reader ? "recorder reader" : "display");
+      usage = (usage & ~kQtiUbwcUsage) | kAhbUsageCpuRW;
+    }
   }
   return original(surface, usage);
 }
@@ -1721,13 +1728,13 @@ static void try_hook_video_encoder_buffers()
 
   if (pixel5_stock_android14())
   {
-    __atomic_store_n(&g_orig_display_usage, nullptr, __ATOMIC_RELAXED);
-    void* display_hook = shadowhook_hook_sym_name("libgui.so", "_ZN7android7Surface8setUsageEm",
-        reinterpret_cast<void*>(proxy_camera_display_usage), &g_orig_display_usage);
-    if (display_hook && __atomic_load_n(&g_orig_display_usage, __ATOMIC_ACQUIRE))
-      g_display_usage_stub = display_hook;
-    else if (display_hook)
-      shadowhook_unhook(display_hook);
+    __atomic_store_n(&g_orig_camera_surface_usage, nullptr, __ATOMIC_RELAXED);
+    void* usage_hook = shadowhook_hook_sym_name("libgui.so", "_ZN7android7Surface8setUsageEm",
+        reinterpret_cast<void*>(proxy_camera_surface_usage), &g_orig_camera_surface_usage);
+    if (usage_hook && __atomic_load_n(&g_orig_camera_surface_usage, __ATOMIC_ACQUIRE))
+      g_camera_surface_usage_stub = usage_hook;
+    else if (usage_hook)
+      shadowhook_unhook(usage_hook);
   }
 
   __atomic_store_n(&g_orig_video_encoder_format, nullptr, __ATOMIC_RELAXED);
@@ -1909,10 +1916,10 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_sh
   if (!g_installed.exchange(false))
     return 0;
   g_raw10_cache.stop();
-  if (g_display_usage_stub)
+  if (g_camera_surface_usage_stub)
   {
-    shadowhook_unhook(g_display_usage_stub);
-    g_display_usage_stub = nullptr;
+    shadowhook_unhook(g_camera_surface_usage_stub);
+    g_camera_surface_usage_stub = nullptr;
   }
   if (g_preview_spacer_stub)
   {

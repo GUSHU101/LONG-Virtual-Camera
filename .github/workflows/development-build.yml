@@ -7,7 +7,7 @@ on:
       version:
         description: Development build version (vMAJOR.MINOR.PATCH)
         required: true
-        default: v2.0.19
+        default: v2.0.20
         type: string
 
 permissions:
