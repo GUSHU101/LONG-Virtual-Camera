@@ -113,6 +113,7 @@ struct VideoFrame
   int32_t width = 0;
   int32_t height = 0;
   int64_t pts_us = 0;
+  uint32_t color_flags = 0;
 
   VideoFrame() = default;
   VideoFrame(const VideoFrame&) = delete;
@@ -191,6 +192,7 @@ public:
 
     AMediaFormat_getInt32(selected, AMEDIAFORMAT_KEY_WIDTH, &coded_width_);
     AMediaFormat_getInt32(selected, AMEDIAFORMAT_KEY_HEIGHT, &coded_height_);
+    track_color_.update(selected);
     int32_t fps = 0;
     if (AMediaFormat_getInt32(selected, AMEDIAFORMAT_KEY_FRAME_RATE, &fps) &&
         fps >= 1 && fps <= 240)
@@ -230,6 +232,8 @@ public:
   {
     output_layout_ = {};
     output_format_known_ = false;
+    track_color_ = {};
+    output_color_flags_ = 0;
     if (codec_)
     {
       AMediaCodec_stop(codec_);
@@ -399,9 +403,15 @@ private:
         cr::media::padded_yuv420_crop(stride_, slice_height_, crop_left_, crop_top_,
                                     crop_right_, crop_bottom_, kMaxDecoderFrameBytes,
                                     output_layout_);
+    // Decoder output takes precedence. Keep container values when a codec does
+    // not expose them. Untagged local media keeps its previous SDR defaults.
+    auto output_color = track_color_;
+    output_color.update(format);
+    output_color_flags_ = output_color.flags(false);
     __android_log_print(valid ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, TAG,
-        OBF("local video output: color=0x%x stride=%d slice=%d crop=%d,%d-%d,%d valid=%d").c_str(),
-        color_, stride_, slice_height_, crop_left_, crop_top_, crop_right_, crop_bottom_, valid);
+        OBF("local video output: color=0x%x stride=%d slice=%d crop=%d,%d-%d,%d valid=%d color_flags=%u").c_str(),
+        color_, stride_, slice_height_, crop_left_, crop_top_, crop_right_, crop_bottom_, valid,
+        output_color_flags_);
     AMediaFormat_delete(format);
   }
 
@@ -434,6 +444,7 @@ private:
     }
     out.width = output_layout_.width;
     out.height = output_layout_.height;
+    out.color_flags = output_color_flags_;
     out.y = {base + static_cast<size_t>(crop_top_) * stride_ + crop_left_,
              stride_, 1};
     out.u = {base + u_offset, chroma_stride, pixel_stride};
@@ -455,6 +466,8 @@ private:
   int32_t rotation_ = 0;
   uint64_t nominal_frame_interval_us_ = 33333;
   cr::media::Yuv420Crop output_layout_;
+  cr_feed::SdrColorAspects track_color_;
+  uint32_t output_color_flags_ = 0;
   bool output_format_known_ = false;
   bool looped_ = false;
   bool input_eos_ = false;
@@ -586,6 +599,7 @@ private:
           return false;
         }
         output.pts_us = frame.pts_us;
+        output.color_flags = frame.color_flags;
         slot.looped = decoder_.take_looped();
         return true;
       }
@@ -1010,7 +1024,7 @@ extern "C" int cr_feed_run_file_video(const char* path)
     }
     if (g_stop.load(std::memory_order_relaxed))
       break;
-    shared.publish_nv21(frame.data.data());
+    shared.publish_nv21(frame.data.data(), frame.color_flags);
     playback.release(slot);
     previous_pts = pts;
     previous_target = target;

@@ -5,6 +5,9 @@ lsposed-module/**/*.sh text eol=lf
 lsposed-module/**/*.gradle text eol=lf
 lsposed-module/**/META-INF/xposed/* text eol=lf
 .github/workflows/*.yml text eol=lf
+.github/actions/**/action.yml text eol=lf
+.github/scripts/*.sh text eol=lf
+tests/release_workflow_test.sh text eol=lf
 
 lsposed-module/**/*.bat text eol=crlf
 lsposed-module/**/*.jar binary

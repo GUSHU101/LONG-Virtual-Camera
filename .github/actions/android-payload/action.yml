@@ -1,0 +1,66 @@
+name: Build Android ARM64 payload
+description: Set up the shared Android toolchain and build the native APK payload
+inputs:
+  gradle-cache:
+    description: Enable Gradle dependency caching
+    default: 'true'
+outputs:
+  build-tools:
+    description: Absolute Android build-tools directory
+    value: ${{ steps.sdk.outputs.build-tools }}
+  payload:
+    description: Absolute native payload directory
+    value: ${{ steps.native.outputs.path }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+      with:
+        distribution: temurin
+        java-version: '21'
+        cache: ${{ inputs.gradle-cache == 'true' && 'gradle' || '' }}
+        cache-dependency-path: |
+          lsposed-module/**/*.gradle
+          lsposed-module/**/gradle.properties
+          lsposed-module/gradle/wrapper/gradle-wrapper.properties
+    - id: sdk
+      name: Ensure pinned Android SDK components
+      shell: bash
+      env:
+        NDK_VERSION: 27.3.13750724
+        PLATFORM: android-37.0
+        BUILD_TOOLS_VERSION: 37.0.0
+      run: |
+        set -euo pipefail
+        ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
+        build_tools="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+        packages=()
+        [[ -f "$ndk/build/cmake/android.toolchain.cmake" ]] ||
+          packages+=("ndk;$NDK_VERSION")
+        [[ -f "$ANDROID_HOME/platforms/$PLATFORM/android.jar" ]] ||
+          packages+=("platforms;$PLATFORM")
+        [[ -x "$build_tools/aapt2" && -x "$build_tools/apksigner" ]] ||
+          packages+=("build-tools;$BUILD_TOOLS_VERSION")
+        if (( ${#packages[@]} )); then
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "${packages[@]}"
+        fi
+        printf 'ndk=%s\nbuild-tools=%s\n' "$ndk" "$build_tools" >> "$GITHUB_OUTPUT"
+    - id: native
+      name: Build phone-native payload
+      shell: bash
+      env:
+        ANDROID_NDK_ROOT: ${{ steps.sdk.outputs.ndk }}
+      run: |
+        set -euo pipefail
+        native_build="$GITHUB_WORKSPACE/build/camreplace-android"
+        cmake -S engines/camreplace/android -B "$native_build" \
+          -G "Unix Makefiles" \
+          -DCMAKE_TOOLCHAIN_FILE="$PWD/engines/camreplace/toolchains/android-ndk.cmake" \
+          -DANDROID_NDK_ROOT="$ANDROID_NDK_ROOT" \
+          -DCR_FEED_ENABLE_RTMP_DIRECT=ON \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build "$native_build" --parallel "$(nproc)"
+        for file in cr_injector cr_feed_proc libcr_hooks.so; do
+          test -s "$native_build/out/$file"
+        done
+        printf 'path=%s\n' "$native_build/out" >> "$GITHUB_OUTPUT"

@@ -47,7 +47,9 @@ Windows 开发机可用 `lsposed-module\gradlew.bat` 执行相同 Gradle 任务�
 
 运行 **Publish signed APK** 或推送版本标签会走正式发布。提前在仓库的 **Settings → Secrets and variables → Actions** 配置 `LONGVC_ANDROID_KEYSTORE_BASE64`、`LONGVC_ANDROID_KEYSTORE_PASSWORD`、`LONGVC_ANDROID_KEY_ALIAS`、`LONGVC_ANDROID_KEY_PASSWORD`。正式版更新必须继续使用同一签名密钥。
 
-每个正式版本只发布一次。工作流会在上传前校验 APK 的 SHA-256，并校验已存在的版本标签是否指向 APK 的构建提交。发布新版 APK 时使用新的版本号。
+同一正式版本的发布任务串行执行。构建前会检查版本标签和已有发布，发布前会按构建返回的制品 ID 下载，并再次校验 APK 的 SHA-256。GitHub 草稿里的 APK 与校验文件均匹配后才公开发布。同一次运行上传中断时，可以用 **Re-run failed jobs** 从该运行的草稿继续。已有正式版本请继续使用新版本号。
+
+正式发布可以在 Actions Variables 设置 `LONGVC_ANDROID_CERT_SHA256`，锁定现有正式签名证书的 SHA-256。开发构建摘要内提供 APK 下载入口、构建提交和 SHA-256。
 
 当前测试覆盖桌面端移除、APK 契约、恢复故障注入和原生像素布局。设备上的相机、麦克风以及 OBS 全链路仍需在对应固件实测。
 

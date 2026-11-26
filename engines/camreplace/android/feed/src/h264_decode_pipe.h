@@ -309,7 +309,7 @@ public:
     (void) ensure_media_codec_binder_pool();
     w = ww;
     h = hh;
-    color_flags = (w >= 1280 || h >= 720) ? CR_FEED_COLOR_BT709 : 0u;
+    color_flags = SdrColorAspects{}.flags(w >= 1280 || h >= 720);
     if (!fit_source_geometry(w, h, output_w, output_h))
     {
       CR_FEED_LOGE(OBF("h264 pipe: rejected source geometry %dx%d").c_str(),
@@ -486,15 +486,12 @@ public:
         AMediaFormat_getInt32(of, OBF("stride").c_str(), &y_stride);
         AMediaFormat_getInt32(of, OBF("slice-height").c_str(), &slice_height);
         uv_stride = y_stride;
-        // MediaFormat COLOR_STANDARD_BT709=1, COLOR_RANGE_FULL=1.
+        SdrColorAspects color;
+        color.update(of);
         // Some codecs omit color-standard on untagged SDR H.264.
-        int32_t standard = 0, range = 0;
-        AMediaFormat_getInt32(of, "color-standard", &standard);
-        AMediaFormat_getInt32(of, "color-range", &range);
-        const bool hd = (w >= 1280 || h >= 720);
-        color_flags = (standard == 1 || (standard == 0 && hd) ? CR_FEED_COLOR_BT709 : 0u) |
-                      (range == 1 ? CR_FEED_COLOR_FULL_RANGE : 0u);
-        CR_FEED_LOGI("h264 color standard=%d range=%d shared_flags=%u", standard, range, color_flags);
+        color_flags = color.flags(w >= 1280 || h >= 720);
+        CR_FEED_LOGI("h264 color standard=%d range=%d shared_flags=%u",
+                     color.standard, color.range, color_flags);
         CR_FEED_LOGI(OBF("h264 out fmt: color=0x%x stride=%d slice=%d").c_str(), color_format, y_stride, slice_height);
         AMediaFormat_delete(of);
         continue;

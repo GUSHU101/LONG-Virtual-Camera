@@ -7,11 +7,15 @@ on:
       version:
         description: Development build version (vMAJOR.MINOR.PATCH)
         required: true
-        default: v2.0.21
+        default: v2.0.22
         type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: development-apk-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
 
 jobs:
   build:

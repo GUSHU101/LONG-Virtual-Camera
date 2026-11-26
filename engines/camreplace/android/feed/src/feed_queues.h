@@ -45,6 +45,7 @@ struct Nv21Frame
   int width = 0;
   int height = 0;
   int64_t pts_us = 0;
+  uint32_t color_flags = 0;
 };
 
 // Small, MPSC-friendly bounded ring with three knobs:
