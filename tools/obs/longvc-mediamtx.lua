@@ -63,6 +63,7 @@ local DEFAULT_PORT = 1935
 local DEFAULT_PATH = "longvc"
 local LOOPBACK_IP = "127.0.0.1"
 local LOOPBACK_ADDRESS = 0x0100007f
+local LAN_READER_NETWORKS = "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 local TIMER_MS = 250
 local STARTUP_MS = 7000
 local HEALTHY_MS = 30000
@@ -112,7 +113,7 @@ local function read_settings(data)
         exe = obs.obs_data_get_string(data, "mediamtx_exe"),
         port = obs.obs_data_get_int(data, "port"),
         path = obs.obs_data_get_string(data, "stream_path"),
-        phone = obs.obs_data_get_string(data, "phone_ip"):match("^%s*(.-)%s*$"),
+        lan_readers = obs.obs_data_get_bool(data, "lan_readers"),
     }
 end
 
@@ -220,10 +221,6 @@ local function prepare(spec)
     if not valid_path(endpoint.path) then
         return nil, "流路径只接受字母、数字、下划线、连字符及分隔斜杠。"
     end
-    if spec.phone ~= "" and not private_ipv4(spec.phone) then
-        return nil, "请填写电脑看到的拉流来源 IPv4，或留空仅允许本机读取。"
-    end
-
     local directory = script_path():gsub("/", "\\")
     if directory:sub(-1) ~= "\\" then directory = directory .. "\\" end
     local exe = spec.exe == "" and (directory .. "mediamtx.exe") or spec.exe:gsub("/", "\\")
@@ -238,7 +235,7 @@ local function prepare(spec)
     if not exe_w or not file_exists(exe_w) then return nil, "找不到 mediamtx.exe，请在脚本中选择。" end
     if not config_w or not file_exists(config_w) then return nil, "请将 mediamtx-obs.yml 放到 Lua 脚本同一目录。" end
     local bind_ip, bind_address = endpoint.host, endpoint.address
-    if endpoint.host == LOOPBACK_IP and spec.phone ~= "" then
+    if endpoint.host == LOOPBACK_IP and spec.lan_readers then
         bind_ip, bind_address = "0.0.0.0", 0
     end
     return {
@@ -249,7 +246,7 @@ local function prepare(spec)
         publisher_ip = endpoint.host,
         bind_ip = bind_ip,
         bind_address = bind_address,
-        phone = spec.phone,
+        lan_readers = spec.lan_readers,
     }
 end
 
@@ -258,12 +255,11 @@ local function environment(spec)
     local root_length = tonumber(win.GetWindowsDirectoryW(root, 32768))
     if root_length == 0 or root_length >= 32768 then return nil end
 
-    local allowed = spec.publisher_ip
-    if spec.phone ~= "" and spec.phone ~= allowed then allowed = allowed .. "," .. spec.phone end
+    local readers = spec.lan_readers and LAN_READER_NETWORKS or spec.publisher_ip
     local fields = {
         "MTX_AUTHINTERNALUSERS_0_IPS=" .. spec.publisher_ip,
         "MTX_AUTHINTERNALUSERS_0_PERMISSIONS_0_PATH=" .. spec.path,
-        "MTX_AUTHINTERNALUSERS_1_IPS=" .. allowed,
+        "MTX_AUTHINTERNALUSERS_1_IPS=" .. readers,
         "MTX_AUTHINTERNALUSERS_1_PERMISSIONS_0_PATH=" .. spec.path,
         "MTX_RTMPADDRESS=" .. spec.bind_ip .. ":" .. spec.port,
         "SystemRoot=",
@@ -427,7 +423,7 @@ local function apply_settings()
     if child and child.job then
         local active = child.spec
         if active.command == next_relay.command and active.port == next_relay.port
-            and active.path == next_relay.path and active.phone == next_relay.phone
+            and active.path == next_relay.path and active.lan_readers == next_relay.lan_readers
             and active.publisher_ip == next_relay.publisher_ip then
             info("中继已使用这套设置。")
             return false
@@ -458,8 +454,7 @@ local function report_status()
     if child and child.job and child.ready_at then
         local active = child.spec
         local endpoint, reason = obs_endpoint()
-        local access = active.phone ~= "" and "指定拉流来源 IPv4"
-            or (active.publisher_ip == LOOPBACK_IP and "本机与 USB" or "本机网卡")
+        local access = active.lan_readers and "局域网可拉流" or "仅本机可拉流"
         info("中继正在监听 TCP " .. active.port .. "（" .. access .. "）。")
         if not endpoint then
             warn(reason)
@@ -508,13 +503,14 @@ function script_defaults(data)
     obs.obs_data_set_default_int(data, "port", DEFAULT_PORT)
     obs.obs_data_set_default_string(data, "stream_path", DEFAULT_PATH)
     obs.obs_data_set_default_bool(data, "follow_obs", false)
+    obs.obs_data_set_default_bool(data, "lan_readers", false)
 end
 
 function script_description()
     return "LONG Virtual Camera · MediaMTX 中继<br>"
         .. "使用「沿用 OBS 本机推流地址」可以读取 OBS 的端口和流路径。<br>"
         .. "OBS 使用自定义 RTMP，推流码留空，编码选 H.264。<br>"
-        .. "使用局域网时填写电脑看到的拉流来源 IPv4。使用 USB 时请让 OBS 推流到 127.0.0.1。"
+        .. "使用 Wi-Fi 时开启「允许局域网拉流」。使用 USB 时请让 OBS 推流到 127.0.0.1。"
 end
 
 function script_properties()
@@ -526,7 +522,8 @@ function script_properties()
     obs.obs_properties_add_int(props, "port", "RTMP 端口", 1024, 65535, 1)
     obs.obs_properties_add_text(props, "stream_path", "流路径", obs.OBS_TEXT_DEFAULT)
     obs.obs_property_set_modified_callback(follow, update_endpoint_fields)
-    obs.obs_properties_add_text(props, "phone_ip", "允许拉流的来源 IPv4（可选）", obs.OBS_TEXT_DEFAULT)
+    local readers = obs.obs_properties_add_bool(props, "lan_readers", "允许局域网拉流（无需填写 IP）")
+    obs.obs_property_set_long_description(readers, "可访问端口的私有 IPv4 设备可以读取当前画面。")
     obs.obs_properties_add_bool(props, "auto_start", "随 OBS 自动启动中继")
     obs.obs_properties_add_button(props, "apply", "启动 / 应用中继设置", apply_settings)
     obs.obs_properties_add_button(props, "stop", "停止中继", stop_relay)

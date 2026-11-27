@@ -17,14 +17,14 @@ LONG Virtual Camera 是面向自有或明确授权测试设备的 Android ARM64 
 Windows x64 的 OBS 可用 Lua 脚本自动管理本机 MediaMTX。解压官方 MediaMTX 后，在 OBS「工具 → 脚本」加载 `longvc-mediamtx.lua`，选择 `mediamtx.exe`，再点「启动 / 应用中继设置」。勾选「沿用 OBS 本机推流地址」可从已有 OBS 设置读取端口与流路径。脚本配置随 OBS 场景集合保存。 [配置与排查](tools/obs/README.md) · [MediaMTX 下载](https://mediamtx.org/docs/kickoff/install)
 
 1. 在 OBS「设置 → 直播」选择「自定义」，服务器填 `rtmp://127.0.0.1:1935/longvc`，推流码留空。视频使用 H.264，然后开始推流。 [OBS 推流示例](https://mediamtx.org/docs/publish/obs-studio)
-2. 用 USB 时，在电脑执行 `adb reverse tcp:1935 tcp:1935`。用局域网时，在脚本填电脑看到的拉流来源 IPv4 并应用，中继会允许该地址拉流。
+2. 用 USB 时，在电脑执行 `adb reverse tcp:1935 tcp:1935`。用局域网时，在脚本勾选「允许局域网拉流」并应用。
 3. 在 APK 的「电脑 OBS 拉流」填 `rtmp://127.0.0.1:1935/longvc`（USB）或 `rtmp://<电脑局域网 IP>:1935/longvc`（局域网）。保存后开启相机或照片替换。需要 OBS 音频时，选中 OBS AAC 并打开虚拟麦克风。
 
 也可连接自行管理的 MediaMTX。若该中继启用了读取认证，手机地址可加 `?user=用户名&pass=密码`。RTMP 为明文，适用于可信网络。 [MediaMTX 读取认证](https://mediamtx.org/docs/features/authentication)
 
 低延迟可先用 H.264、30 fps 和 1 秒关键帧间隔。连接稳定时，可用 720p 约 8 Mbps 或 1080p 约 14 Mbps 的 CBR 测试清晰度。OBS 的「视频」中将输出分辨率设为目标尺寸，并检查源素材是否有足够的原始分辨率。使用 x264 时可选 `zerolatency`。使用 NVENC 时可选低延迟调优、关闭 Look-ahead 并设 B 帧为 0。网络持续丢帧时，先降到 720p 并检查 Wi-Fi 或切换 USB。 [OBS 丢帧排查](https://obsproject.com/kb/stream-connection-troubleshooting) [H.264 码率参考](https://support.google.com/youtube/answer/2853702)
 
-本地媒体和 OBS 共用一套 NV21 发布及相机输出管线。支持设备可保留最高 3840 × 2160 或 2160 × 3840 的源画面。预览、录像和拍照依相机实际请求的尺寸生成，并在比例不同时保留比例进行裁切。实际解码分辨率和帧率受设备 MediaCodec、网络和源素材限制。Pixel 的 HDR+ 从替换帧生成的 RAW10 制作照片，成片的清晰度上限取决于源画面在宽高比及数字变焦裁切后保留的细节。
+本地媒体和 OBS 共用一套 NV21 发布及相机输出管线。支持设备可保留最高 3840 × 2160 或 2160 × 3840 的源画面。预览、录像和拍照依相机实际请求的尺寸生成，并在比例不同时保留比例进行裁切。用 OBS 播放照片时，可用构图脚本把完整内容放入手机可见区域。实际解码分辨率和帧率受设备 MediaCodec、网络和源素材限制。Pixel 的 HDR+ 从替换帧生成的 RAW10 制作照片，成片的清晰度上限取决于源画面在宽高比及数字变焦裁切后保留的细节。 [手机画面构图](tools/obs/README.md#手机画面构图)
 
 ## 从源码构建
 
