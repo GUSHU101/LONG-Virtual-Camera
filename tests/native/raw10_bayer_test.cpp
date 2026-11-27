@@ -1,11 +1,30 @@
 #include "Raw10Bayer.h"
 #include "CaptureZoom.h"
+#include "CameraYuvColor.h"
 
 #include <array>
 #include <cassert>
 
 int main()
 {
+  using cr::camhook::YuvEncoding;
+  constexpr auto jfif = cr::camhook::camera_sdr_yuv_encoding(0x08c20000);
+  constexpr auto limited709 = cr::camhook::camera_sdr_yuv_encoding(0x10c10000);
+  static_assert(jfif == YuvEncoding::Bt601Full);
+  static_assert(limited709 == YuvEncoding::Bt709Limited);
+  static_assert(!cr::camhook::camera_sdr_yuv_encoding(0));
+  static_assert(!cr::camhook::camera_sdr_yuv_encoding(0x11c60000));
+  std::array<uint8_t, 12> sdr{16, 235, 63, 63, 16, 235, 63, 63, 128, 128, 240, 102};
+  const auto original_sdr = sdr;
+  cr::camhook::remap_nv21_color(sdr.data(), 4, 2, *limited709, *jfif);
+  assert(sdr[0] == 0 && sdr[1] == 255 && sdr[4] == 0 && sdr[5] == 255);
+  assert(sdr[8] == 128 && sdr[9] == 128);
+  assert(std::abs(sdr[2] - 76) <= 1 && std::abs(sdr[10] - 255) <= 1 &&
+         std::abs(sdr[11] - 85) <= 1);
+  cr::camhook::remap_nv21_color(sdr.data(), 4, 2, *jfif, *limited709);
+  for (size_t i = 0; i < sdr.size(); ++i)
+    assert(std::abs(sdr[i] - original_sdr[i]) <= 1);
+
   assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {469, 353, 2342, 1758}) == 1434);
   assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {0, 2, 3280, 2460}) == CR_NV21_ZOOM_ONE);
   assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {0, 309, 3280, 1846}) == CR_NV21_ZOOM_ONE);

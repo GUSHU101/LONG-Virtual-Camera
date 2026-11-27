@@ -7,6 +7,7 @@
 #include "HookDispatch.h"
 #include "Raw10Bayer.h"
 #include "CaptureZoom.h"
+#include "CameraYuvColor.h"
 #include "shadowhook.h"
 
 #include <android/hardware_buffer.h>
@@ -1177,12 +1178,14 @@ using ProcessCameraResult = void (*)(void*, const CameraCaptureResult*);
 using ReturnCameraBuffer = int32_t (*)(void*, const void*, int64_t, int64_t, bool, int32_t,
                                        const std::vector<size_t>&, void*);
 using DisconnectCameraStream = int32_t (*)(void*);
+using GetCameraDataSpace = uint32_t (*)(const void*);
 static void* g_orig_camera_result = nullptr;
 static void* g_orig_camera_return = nullptr;
 static void* g_orig_camera_disconnect = nullptr;
 static void* g_camera_result_hook = nullptr;
 static void* g_camera_return_hook = nullptr;
 static void* g_camera_disconnect_hook = nullptr;
+static GetCameraDataSpace g_camera_get_dataspace = nullptr;
 static int32_t proxy_camera_disconnect(void* stream);
 
 struct CaptureColor
@@ -1204,6 +1207,7 @@ static std::array<CaptureZoom, 64> g_capture_zooms;
 static size_t g_capture_zoom_next = 0;
 static thread_local int64_t g_return_sensor_timestamp = 0;
 static thread_local const void* g_return_camera_stream = nullptr;
+static thread_local uint32_t g_return_dataspace = 0;
 
 static cr::camhook::Raw10StreamCalibration g_stream_colors;
 static std::atomic<unsigned> g_raw10_reused_color{0};
@@ -1368,12 +1372,15 @@ static int32_t proxy_camera_return(void* stream, const void* buffer, int64_t tim
     return -ENOSYS;
   const int64_t previous = g_return_sensor_timestamp;
   const void* previous_stream = g_return_camera_stream;
+  const uint32_t previous_dataspace = g_return_dataspace;
   g_return_sensor_timestamp = timestamp;
   g_return_camera_stream = stream;
+  g_return_dataspace = g_camera_get_dataspace ? g_camera_get_dataspace(stream) : 0;
   const auto status = original(stream, buffer, timestamp, readout, output, transform,
                                surface_ids, release_fence);
   g_return_sensor_timestamp = previous;
   g_return_camera_stream = previous_stream;
+  g_return_dataspace = previous_dataspace;
   return status;
 }
 
@@ -1455,6 +1462,12 @@ static bool install_camera_color_hooks()
   dlclose(metadata);
   if (!g_find_camera_metadata)
     return false;
+  if (void* camera = shadowhook_dlopen("libcameraservice.so"))
+  {
+    g_camera_get_dataspace = reinterpret_cast<GetCameraDataSpace>(
+        shadowhook_dlsym(camera, "_ZNK7android7camera313Camera3Stream12getDataSpaceEv"));
+    shadowhook_dlclose(camera);
+  }
   g_camera_result_hook = shadowhook_hook_sym_name("libcameraservice.so",
       "_ZN7android7camera320processCaptureResultERNS0_19CaptureOutputStatesEPKNS0_21camera_capture_resultE",
       reinterpret_cast<void*>(proxy_camera_result), &g_orig_camera_result);
@@ -1829,21 +1842,27 @@ struct ScaledCameraFrame
   int width = 0;
   int height = 0;
   unsigned zoom = 0;
+  cr::camhook::YuvEncoding encoding = cr::camhook::YuvEncoding::Bt601Limited;
+  bool lanczos = false;
 };
 
 static std::mutex g_scaled_camera_mutex;
 static std::array<ScaledCameraFrame, 2> g_scaled_camera_frames;
 static size_t g_scaled_camera_next = 0;
 static uint64_t g_scaled_camera_hits = 0, g_scaled_camera_renders = 0;
+static std::atomic<unsigned> g_camera_color_remaps{0};
 
 // The caller holds g_scaled_camera_mutex until it has copied the pixels.
 // A preview and analysis output can consume the same geometry at once.
 static const uint8_t* scaled_camera_frame(const PinnedSlot& source, int width, int height,
-                                          unsigned zoom)
+                                          unsigned zoom, bool lanczos,
+                                          cr::camhook::YuvEncoding input,
+                                          cr::camhook::YuvEncoding output)
 {
   auto match = std::find_if(g_scaled_camera_frames.begin(), g_scaled_camera_frames.end(),
       [=](const ScaledCameraFrame& item) {
-        return item.width == width && item.height == height && item.zoom == zoom;
+        return item.width == width && item.height == height && item.zoom == zoom &&
+               item.encoding == output && item.lanczos == lanczos;
       });
   auto& entry = match != g_scaled_camera_frames.end()
                     ? *match : g_scaled_camera_frames[g_scaled_camera_next];
@@ -1855,7 +1874,7 @@ static const uint8_t* scaled_camera_frame(const PinnedSlot& source, int width, i
   {
     const auto hits = ++g_scaled_camera_hits;
     if (hits == 1 || hits % 300 == 0)
-      LOGI("camera UHD scale cache: reused=%llu rendered=%llu size=%dx%d",
+      LOGI("camera output cache: reused=%llu rendered=%llu size=%dx%d",
            static_cast<unsigned long long>(hits),
            static_cast<unsigned long long>(g_scaled_camera_renders), width, height);
     return entry.pixels.get();
@@ -1871,11 +1890,26 @@ static const uint8_t* scaled_camera_frame(const PinnedSlot& source, int width, i
     entry.pixels = std::move(pixels);
     entry.capacity = bytes;
   }
-  cr_nv21_blit_zoom(source.data, source.width, source.height, entry.pixels.get(),
-                   entry.pixels.get() + luma, width, height, width, width, 0, zoom);
+  if (lanczos)
+    blit_adaptive(source.data, source.width, source.height, entry.pixels.get(),
+                  entry.pixels.get() + luma, width, height, width, width, 0, zoom);
+  else
+    cr_nv21_blit_zoom(source.data, source.width, source.height, entry.pixels.get(),
+                     entry.pixels.get() + luma, width, height, width, width, 0, zoom);
+  if (input != output)
+  {
+    cr::camhook::remap_nv21_color(entry.pixels.get(), width, height, input, output);
+    const auto count = ++g_camera_color_remaps;
+    if (count <= 4 || count % 600 == 0)
+      LOGI("camera SDR color: source=%u target=%u dataspace=0x%x size=%dx%d",
+           static_cast<unsigned>(input), static_cast<unsigned>(output),
+           g_return_dataspace, width, height);
+  }
   entry.width = width;
   entry.height = height;
   entry.zoom = zoom;
+  entry.encoding = output;
+  entry.lanczos = lanczos;
   entry.generation = source.generation;
   entry.sequence = source.frame_seq;
   ++g_scaled_camera_renders;
@@ -2022,12 +2056,21 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
 
   const uint8_t* pixels = source.data;
   int sw = source.width, sh = source.height;
+  const auto input_encoding = cr::camhook::sdr_yuv_encoding(
+      (source.color_flags & CR_FEED_COLOR_BT709) != 0,
+      (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0);
+  const auto output_encoding =
+      cr::camhook::camera_sdr_yuv_encoding(g_return_dataspace).value_or(input_encoding);
+  const bool reuse_uhd_scale = g_blit_fn == cr_nv21_blit && (int64_t) sw * sh > 2560LL * 1440LL &&
+                               (crop.width != W || crop.height != H);
   std::unique_lock<std::mutex> scaled_guard(g_scaled_camera_mutex, std::defer_lock);
-  if (g_blit_fn == cr_nv21_blit && (int64_t) sw * sh > 2560LL * 1440LL &&
-      (int64_t) W * H <= 1920LL * 1080LL && (crop.width != W || crop.height != H))
+  if ((reuse_uhd_scale || input_encoding != output_encoding) &&
+      (int64_t) W * H <= 1920LL * 1080LL)
   {
     scaled_guard.lock();
-    if (const auto* scaled = scaled_camera_frame(source, W, H, zoom))
+    const bool lanczos = view.vu && g_blit_fn == cr_nv21_blit_lanczos;
+    if (const auto* scaled = scaled_camera_frame(source, W, H, zoom, lanczos,
+                                                 input_encoding, output_encoding))
     {
       pixels = scaled;
       sw = W;
