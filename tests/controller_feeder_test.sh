@@ -46,10 +46,13 @@ kill() {
 printf '%s\n' "$LEGACY_FEEDER (deleted)" > "$PROC_ROOT/44/exe"
 [[ $(feeder_start_time 44 '--role obs-video') == 144 ]]
 printf '/unrelated/cr_feed_proc\n' > "$PROC_ROOT/44/exe"
-printf 'schema=2\nvisual_mode=obs\nobs_url=rtmp://relay.local/live?user=test&pass=placeholder\n' > "$SOURCE_CONFIG"
-[[ $(current_obs_url) == 'rtmp://relay.local/live?user=test&pass=placeholder' ]]
+printf 'schema=2\nvisual_mode=obs\nobs_url=rtmp://relay.local/live/path-key?user=test&pass=placeholder\n' > "$SOURCE_CONFIG"
+[[ $(current_obs_url) == 'rtmp://relay.local/live/path-key?user=test&pass=placeholder' ]]
 status=$(print_status)
-[[ "$status" == *$'\nobs_address=rtmp://relay.local/live\n'* ]]
+[[ "$status" == *$'\nobs_configured=1\n'* ]]
+[[ "$status" != *obs_address* ]]
+[[ "$status" != *relay.local* ]]
+[[ "$status" != *path-key* ]]
 [[ "$status" != *placeholder* ]]
 [[ "$status" == *$'\nobs_pull_running=1\n'* ]]
 
@@ -67,4 +70,9 @@ nohup() { :; }
 wait_feeder() { channel_has_header "$DATA/feed" 44465243 48; }
 ! start_feeder test-source video video "$fixture/feeder.log"
 [[ $(read_u32_hex "$DATA/feed" 48) == 00000000 ]]
+for i in {1..20}; do
+  [[ -f "$fixture/feeder.log" ]] && break
+  command sleep 0.05
+done
+[[ $(stat -c %a "$fixture/feeder.log") == 600 ]]
 printf '%s\n' 'Feeder identity, outbound OBS status, and stale channel checks passed'

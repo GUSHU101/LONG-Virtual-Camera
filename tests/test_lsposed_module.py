@@ -209,7 +209,7 @@ class LsposedModuleContractTests(unittest.TestCase):
         feed = ROOT / "engines/camreplace/android/feed/src/rtmp_h264_feed.cpp"
         native = feed.read_text(encoding="utf-8")
         self.assertIn("rtmp:pull:config:", script)
-        self.assertIn(r'say "obs_address=${obs_url%%\?*}"', script)
+        self.assertNotIn("obs_address=", script)
         self.assertIn('say "obs_pull_running=$obs_pull"', script)
         self.assertNotIn("rtmp:listen:", script)
         self.assertNotIn("bind(", native)
@@ -220,11 +220,15 @@ class LsposedModuleContractTests(unittest.TestCase):
         activity = (app / "MainActivity.java").read_text(encoding="utf-8")
         controller = (app / "RootController.java").read_text(encoding="utf-8")
         sources = (app / "MediaSourceManager.java").read_text(encoding="utf-8")
+        layout = (MODULE / "res/layout/activity_main.xml").read_text(encoding="utf-8")
         self.assertIn("obsUrlInput.getText()", activity)
         self.assertIn("obsAudioSwitch.isChecked()", activity)
         self.assertIn('useObsAudio ? "obs" : "local"', sources)
         self.assertIn("obsSettingsMatch(url, obsAudio)", controller)
         self.assertNotIn("obs_token", sources)
+        self.assertNotIn("state.obsAddress", activity)
+        self.assertIn('android:inputType="textPassword"', layout)
+        self.assertIn("flagNoPersonalizedLearning", layout)
 
     def test_camera_hook_targets_only_cameraserver(self) -> None:
         script = (MODULE / "payload/longvc-control.sh").read_text(encoding="utf-8")

@@ -93,6 +93,16 @@ public final class RootLifecycleTest {
         RootShell.Result action = new RootShell.Result(0,
                 "warning: result=ok\naction=stop-all\n", false, false, null);
         check(!action.hasLine("result=ok"), "diagnostic text cannot acknowledge success");
+        RootShell.Result failure = new RootShell.Result(1,
+                "playback rtmp://relay.local/live/path-key?token=query-secret\n"
+                        + "read content://provider/my-private-video",
+                false, false, null);
+        String diagnostic = failure.describe();
+        check(diagnostic.contains("playback") && diagnostic.contains("read"),
+                "retain diagnostic context");
+        check(!diagnostic.contains("relay.local") && !diagnostic.contains("path-key")
+                        && !diagnostic.contains("query-secret") && !diagnostic.contains("my-private-video"),
+                "diagnostics must omit stream and content addresses");
         Thread.currentThread().interrupt();
         try {
             RootShell.checkCancellation();

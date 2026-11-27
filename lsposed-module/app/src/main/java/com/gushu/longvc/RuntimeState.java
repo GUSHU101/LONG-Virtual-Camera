@@ -16,7 +16,6 @@ final class RuntimeState {
     final boolean audioSourceReady;
     final boolean obsConfigured;
     final boolean obsPullRunning;
-    final String obsAddress;
     final boolean cameraEnabled;
     final boolean photoEnabled;
     final boolean micEnabled;
@@ -56,7 +55,6 @@ final class RuntimeState {
         this.audioSourceReady = flag(values, "audio_source_ready");
         this.obsConfigured = flag(values, "obs_configured");
         this.obsPullRunning = flag(values, "obs_pull_running");
-        this.obsAddress = values.getOrDefault("obs_address", "");
         this.cameraEnabled = flag(values, "camera_enabled");
         this.photoEnabled = flag(values, "photo_enabled");
         this.micEnabled = flag(values, "mic_enabled");

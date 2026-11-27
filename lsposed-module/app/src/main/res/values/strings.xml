@@ -23,6 +23,7 @@
     <string name="obs_hint">在电脑上用 OBS 将 H.264 推给 MediaMTX 等 RTMP 服务。这里填写同一个流的电脑地址。</string>
     <string name="obs_url_hint">rtmp://电脑IP:1935/longvc</string>
     <string name="obs_url_saved_hint">输入新地址，留空沿用已保存地址</string>
+    <string name="obs_address_configured">已保存电脑拉流地址</string>
     <string name="obs_audio_opt_in">选择 OBS AAC 作为虚拟麦克风输入</string>
     <string name="obs_not_configured">请输入电脑的 RTMP 拉流地址。</string>
     <string name="configure_obs">保存电脑拉流地址</string>

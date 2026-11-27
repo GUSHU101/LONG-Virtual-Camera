@@ -15,8 +15,11 @@ Those can contain device identifiers, local paths or streaming credentials.
 
 - The project never intentionally disables SELinux enforcement.
 - Runtime files are created with restrictive permissions.
-- OBS binds loopback by default. LAN listening is opt-in and uses
-  unencrypted RTMP with a generated publisher key.
+- The phone makes an outbound RTMP connection to the configured relay. RTMP is
+  unencrypted in transit. Use a trusted network for the configured source.
+- The runtime status reports whether an OBS address is configured without
+  printing the host, stream path or query. Feeder diagnostic files are private
+  to root. Entered addresses are masked in the control panel.
 - Unsupported camera layouts and unknown private ABIs fail closed or pass through.
 - Emergency Stop revokes media and checks recovery. Leaving the control panel
   open or closing it does not control the native service lifetime.

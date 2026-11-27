@@ -90,7 +90,7 @@ bool open_regular_media(const char* path, int& fd, off_t& length)
   fd = ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (fd < 0)
   {
-    LOGE(OBF("local media: open %s failed: %s").c_str(), path, strerror(errno));
+    LOGE(OBF("local media: open failed: %s").c_str(), strerror(errno));
     return false;
   }
   struct stat st{};

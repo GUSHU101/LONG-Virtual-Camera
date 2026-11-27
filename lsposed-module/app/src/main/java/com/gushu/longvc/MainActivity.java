@@ -3,6 +3,7 @@ package com.gushu.longvc;
 import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.method.ScrollingMovementMethod;
 import android.view.View;
@@ -73,7 +74,10 @@ public final class MainActivity extends Activity
         cameraSwitch = findViewById(R.id.camera_switch);
         photoSwitch = findViewById(R.id.photo_switch);
         micSwitch = findViewById(R.id.mic_switch);
-        obsUrlInput = findViewById(R.id.obs_url_input);
+        obsUrlInput = findViewById(R.id.obs_connection_input);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            obsUrlInput.setImportantForContentCapture(View.IMPORTANT_FOR_CONTENT_CAPTURE_NO);
+        }
         obsAudioSwitch = findViewById(R.id.obs_audio_switch);
         rootButton = findViewById(R.id.root_button);
         installButton = findViewById(R.id.install_button);
@@ -577,7 +581,7 @@ public final class MainActivity extends Activity
             input = "H.264 " + (useVideo ? state.videoChannelReady ? "已收到" : "等待视频" : "未启用")
                     + " · AAC " + (useAudio ? state.audioChannelReady ? "已收到" : "等待音频" : "未启用");
         }
-        return "电脑地址  " + state.obsAddress + "\n" + input;
+        return getString(R.string.obs_address_configured) + "\n" + input;
     }
 
     private static String sourceLabel(RuntimeState state) {
@@ -599,6 +603,7 @@ public final class MainActivity extends Activity
     private static String safeMessage(Throwable error) {
         String message = error.getMessage();
         if (message == null || message.isBlank()) message = error.getClass().getSimpleName();
+        message = RootShell.redactDiagnostic(message);
         return message.length() > 1600 ? message.substring(0, 1600) + "…" : message;
     }
 

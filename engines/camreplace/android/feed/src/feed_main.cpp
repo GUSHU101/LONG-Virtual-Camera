@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #include <atomic>
 #include <cctype>
@@ -65,9 +66,17 @@ namespace
 bool read_obs_url(std::string& url)
 {
   char config[4096];
-  const int fd = open("/data/cr/control/source.conf", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const int fd = open("/data/cr/control/source.conf",
+                      O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0)
     return false;
+  struct stat metadata{};
+  if (fstat(fd, &metadata) < 0 || !S_ISREG(metadata.st_mode) ||
+      metadata.st_uid != 0 || (metadata.st_mode & 0077) != 0)
+  {
+    close(fd);
+    return false;
+  }
   const ssize_t count = read(fd, config, sizeof(config));
   close(fd);
   if (count <= 0 || static_cast<size_t>(count) == sizeof(config))
@@ -151,7 +160,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_feed_run(c
       std::string url;
       if ((!video && !audio) || !read_obs_url(url))
       {
-        LOGE("rtmp: desktop playback configuration missing");
+        LOGE("rtmp: desktop playback configuration unavailable or not private");
         return -1;
       }
       return cr_feed_run_rtmp_pull(url.c_str(), video, audio);

@@ -120,14 +120,15 @@
                     android:layout_marginTop="5dp"
                     android:text="@string/obs_hint" />
                 <EditText
-                    android:id="@+id/obs_url_input"
+                    android:id="@+id/obs_connection_input"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
                     android:minHeight="48dp"
                     android:hint="@string/obs_url_hint"
                     android:importantForAutofill="no"
-                    android:inputType="textUri"
+                    android:imeOptions="actionDone|flagNoExtractUi|flagNoPersonalizedLearning"
+                    android:inputType="textPassword"
                     android:saveEnabled="false"
                     android:singleLine="true" />
                 <Switch

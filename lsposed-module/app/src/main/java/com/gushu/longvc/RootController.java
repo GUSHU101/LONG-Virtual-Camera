@@ -106,7 +106,7 @@ final class RootController {
                     + "echo visual_mode=local; echo audio_mode=local; "
                     + "echo visual_kind=none; "
                     + "echo audio_source_ready=0; echo obs_configured=0; "
-                    + "echo obs_pull_running=0; echo obs_address=; "
+                    + "echo obs_pull_running=0; "
                     + "echo camera_enabled=0; echo photo_enabled=0; echo mic_enabled=0; "
                     + "echo video_feeder_ready=0; echo audio_feeder_ready=0; "
                     + "echo camera_hook_ready=0; echo audio_hook_ready=0; "

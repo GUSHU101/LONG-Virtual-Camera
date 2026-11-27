@@ -7,9 +7,12 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 final class RootShell {
     private static final int MAX_CAPTURE_BYTES = 128 * 1024;
+    private static final Pattern DIAGNOSTIC_ADDRESS =
+            Pattern.compile("(?i)\\b(?:rtmps?|https?|content|file)://\\S+");
     static final String TRUSTED_STORAGE = "trusted_path() { "
             + "[ ! -L \"$1\" ] || return 1; "
             + "case \"$(stat -c '%u:%a' \"$1\" 2>/dev/null)\" in "
@@ -50,12 +53,16 @@ final class RootShell {
 
         String describe() {
             if (timedOut) return "root command timed out";
-            if (streamError != null) return "root stream failed: " + streamError.getMessage();
+            if (streamError != null) return "root stream failed: " + redactDiagnostic(streamError.getMessage());
             if (outputTruncated) return "root output exceeded the safety limit";
-            String trimmed = output.trim();
+            String trimmed = redactDiagnostic(output).trim();
             if (trimmed.length() > 1200) trimmed = trimmed.substring(0, 1200) + "…";
             return "exit=" + exitCode + (trimmed.isEmpty() ? "" : ", " + trimmed);
         }
+    }
+
+    static String redactDiagnostic(String message) {
+        return message == null ? "" : DIAGNOSTIC_ADDRESS.matcher(message).replaceAll("[地址已隐藏]");
     }
 
     Result execute(String command, long timeoutSeconds) throws IOException, InterruptedException {

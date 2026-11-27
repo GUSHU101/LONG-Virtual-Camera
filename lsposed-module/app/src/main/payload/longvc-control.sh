@@ -115,6 +115,12 @@ prepare_data() {
   chmod 0711 "$DATA" || return 1
   chmod 0700 "$CONTROL" || return 1
   chmod 0700 "$MEDIA" || return 1
+  # Older deployments may have created these diagnostics with umask 022.
+  for diagnostic in "$VIDEO_LOG" "$AUDIO_LOG" "$OBS_LOG" "$LAST_CAM"; do
+    if [ -f "$diagnostic" ] && [ ! -L "$diagnostic" ]; then
+      chmod 0600 "$diagnostic" || return 1
+    fi
+  done
   touch "$DATA/feed" "$DATA/audio" "$CAM_READY" "$AUD_READY" || return 1
   (chown cameraserver:camera "$DATA/feed" "$CAM_READY" 2>/dev/null ||
     chown 1047:1006 "$DATA/feed" "$CAM_READY") || return 1
@@ -271,14 +277,17 @@ start_feeder() {
       esac
       ;;
   esac
-  rm -f "$start_log"
-  if command -v nohup >/dev/null 2>&1; then
-    LD_LIBRARY_PATH="$BASE" nohup "$FEEDER" --feed "$start_url" --role "$start_role" \
-      >"$start_log" 2>&1 </dev/null 9>&- &
-  else
-    (LD_LIBRARY_PATH="$BASE" "$FEEDER" --feed "$start_url" --role "$start_role" \
-      >"$start_log" 2>&1 </dev/null) 9>&- &
-  fi
+  rm -f "$start_log" || return 1
+  (
+    umask 077
+    set -C
+    export LD_LIBRARY_PATH="$BASE"
+    exec >"$start_log" 2>&1 || exit 1
+    if command -v nohup >/dev/null 2>&1; then
+      exec nohup "$FEEDER" --feed "$start_url" --role "$start_role"
+    fi
+    exec "$FEEDER" --feed "$start_url" --role "$start_role"
+  ) </dev/null 9>&- &
   wait_feeder "$start_tag" "$start_ready"
 }
 
@@ -349,7 +358,7 @@ camera_packages() {
 }
 
 remember_and_close_camera() {
-  camera_packages > "$LAST_CAM"
+  (umask 077; rm -f "$LAST_CAM" && camera_packages > "$LAST_CAM") || return 1
   if [ -s "$LAST_CAM" ]; then
     while IFS= read -r close_pkg; do
       [ -n "$close_pkg" ] || continue
@@ -893,10 +902,7 @@ print_status() {
   visual_mode=$(current_visual_mode)
   audio_mode=$(current_audio_mode)
   source_mode=$(current_source_mode)
-  obs_configured=0
-  if obs_url=$(current_obs_url); then
-    obs_configured=1
-  fi
+  current_obs_url >/dev/null && obs_configured=1 || obs_configured=0
   find_feed_pid "--role obs" >/dev/null 2>&1 && obs_pull=1 || obs_pull=0
 
   visual_kind=$(config_value visual_kind 2>/dev/null)
@@ -950,7 +956,6 @@ print_status() {
   say "audio_source_ready=$audio_source_ready"
   say "obs_configured=$obs_configured"
   say "obs_pull_running=$obs_pull"
-  say "obs_address=${obs_url%%\?*}"
   say "camera_enabled=$camera_enabled"
   say "photo_enabled=$photo_enabled"
   say "mic_enabled=$audio_enabled"
