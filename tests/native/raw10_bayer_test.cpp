@@ -35,6 +35,18 @@ int main()
     assert(upscaled_raw[row * 10 + 4] == 0 && upscaled_raw[row * 10 + 9] == 0xff);
   }
 
+  // A luma edge inside a single source cell must stay a single edge after
+  // upscaling. Copying the cell would alternate bright and dark samples.
+  const std::array<uint8_t, 12> fine_edge{
+      16, 235, 235, 235, 16, 235, 235, 235, 128, 128, 128, 128};
+  assert(cr::camhook::nv21_to_bggr10(fine_edge, 4, 2, upscaled_raw, 8, 4));
+  for (size_t row = 0; row < 4; ++row)
+  {
+    const auto* pixels = upscaled_raw.data() + row * 10;
+    assert(pixels[0] == 16 && pixels[1] == 16);
+    assert(pixels[2] == 255 && pixels[3] == 255 && pixels[4] == 0xf0);
+  }
+
   auto red = neutral;
   red.fill(81);
   red[8] = red[10] = 240;

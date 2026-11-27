@@ -77,6 +77,7 @@ typedef struct
   uint8_t first[8];
   uint8_t second[8];
   uint16_t fraction[8];
+  uint8_t wide_table;
 } HorizontalBlock;
 #endif
 
@@ -132,17 +133,19 @@ static void prepare_horizontal_blocks(HorizontalPlan* plan, int src_w,
 {
   const int available = src_w * channels;
   plan->block_count = 0;
-  if (dst_w < src_w || available < 16)
+  if (available < 16)
     return;
   for (int x = 0; x <= dst_w * channels - 8; x += 8)
   {
     HorizontalBlock* block = &plan->blocks[x / 8];
     const int first = plan->columns[x / channels].first * channels;
     const int last = plan->columns[(x + 7) / channels].second * channels + channels - 1;
-    const int offset = first < available - 16 ? first : available - 16;
-    if (last - offset >= 16)
-      return; // The scalar path handles any span wider than a table.
+    const int table_bytes = last - first < 16 ? 16 : 32;
+    if (table_bytes > available || last - first >= table_bytes)
+      return; // The scalar path handles a wider downscale.
+    const int offset = first < available - table_bytes ? first : available - table_bytes;
     block->offset = (uint16_t) offset;
+    block->wide_table = table_bytes == 32;
     for (int lane = 0; lane < 8; ++lane)
     {
       const AxisSample tap = plan->columns[(x + lane) / channels];
@@ -164,9 +167,24 @@ static void horizontal_row(const uint8_t* source, uint8_t* scaled,
   for (int i = 0; i < plan->block_count; ++i)
   {
     const HorizontalBlock* block = &plan->blocks[i];
-    const uint8x16_t table = vld1q_u8(source + block->offset);
-    const uint16x8_t first = vmovl_u8(vqtbl1_u8(table, vld1_u8(block->first)));
-    const uint16x8_t second = vmovl_u8(vqtbl1_u8(table, vld1_u8(block->second)));
+    const uint8_t* pixels = source + block->offset;
+    const uint8x16_t low = vld1q_u8(pixels);
+    const uint8x8_t first_indices = vld1_u8(block->first);
+    const uint8x8_t second_indices = vld1_u8(block->second);
+    uint8x8_t first_bytes, second_bytes;
+    if (block->wide_table)
+    {
+      const uint8x16x2_t table = {{low, vld1q_u8(pixels + 16)}};
+      first_bytes = vqtbl2_u8(table, first_indices);
+      second_bytes = vqtbl2_u8(table, second_indices);
+    }
+    else
+    {
+      first_bytes = vqtbl1_u8(low, first_indices);
+      second_bytes = vqtbl1_u8(low, second_indices);
+    }
+    const uint16x8_t first = vmovl_u8(first_bytes);
+    const uint16x8_t second = vmovl_u8(second_bytes);
     const uint16x8_t fraction = vld1q_u16(block->fraction);
     const uint16x8_t zero = vdupq_n_u16(0);
     // 65536 does not fit in 16 bits. Use the first tap for exact samples.

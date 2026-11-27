@@ -40,9 +40,12 @@ inline bool nv21_to_bggr10(std::span<const uint8_t> nv21, int sw, int sh,
   if (nv21.size() < luma + luma / 2 || raw.size() < row_bytes * dh)
     return false;
 
-  std::vector<int> columns(dw / 2);
-  for (int x = 0; x < dw / 2; ++x)
-    columns[x] = crop.x + (x * crop.width / dw) * 2;
+  const auto source_coordinate = [](int position, int source, int dest) {
+    return ((2 * position + 1) * source) / (2 * dest);
+  };
+  std::vector<int> columns(dw);
+  for (int x = 0; x < dw; ++x)
+    columns[x] = crop.x + source_coordinate(x, crop.width, dw);
 
   static const auto linear = [] {
     std::array<int32_t, 256> table{};
@@ -66,62 +69,44 @@ inline bool nv21_to_bggr10(std::span<const uint8_t> nv21, int sw, int sh,
                        coefficients[2] * decode(yuv.blue_u * u);
     return 64u + static_cast<unsigned>(std::clamp((sensor + Raw10Color::scale / 2) >> 12, 0, 959));
   };
-  int previous_row = -1;
-  for (int y = 0; y < dh; y += 2)
+  // Sample luma at each sensor pixel center. Repeating an entire source
+  // Bayer cell introduces false fine stripes when its luma values differ.
+  std::array<int, 2> previous_row{-1, -1};
+  for (int y = 0; y < dh; ++y)
   {
-    const int sy = crop.y + (y * crop.height / dh & ~1);
-    uint8_t* even = raw.data() + static_cast<size_t>(y) * row_bytes;
-    uint8_t* odd = even + row_bytes;
-    if (sy == previous_row)
+    const int phase = y & 1;
+    const int sy = crop.y + source_coordinate(y, crop.height, dh);
+    uint8_t* output = raw.data() + static_cast<size_t>(y) * row_bytes;
+    if (sy == previous_row[phase])
     {
-      memcpy(even, even - 2 * row_bytes, 2 * row_bytes);
+      memcpy(output, output - 2 * row_bytes, row_bytes);
       continue;
     }
-    previous_row = sy;
-    const uint8_t* top = nv21.data() + static_cast<size_t>(sy) * sw;
-    const uint8_t* bottom = top + sw;
+    previous_row[phase] = sy;
+    const uint8_t* luma_row = nv21.data() + static_cast<size_t>(sy) * sw;
     const uint8_t* vu = nv21.data() + luma + static_cast<size_t>(sy / 2) * sw;
-    if (dw * 2 < crop.width * 3)
-    {
-      // There are few or no repeated columns in this geometry.
-      for (int group = 0; group < dw / 4; ++group)
+    const auto& matrix = phase ? color.odd : color.even;
+    std::array<int, 2> previous_column{-1, -1};
+    std::array<unsigned, 2> previous_sample{};
+    const auto pixel = [&](int x, int column_phase) {
+      const int sx = columns[x];
+      if (sx != previous_column[column_phase])
       {
-        const int left = columns[group * 2], right = columns[group * 2 + 1];
-        const int u0 = vu[left + 1] - 128, v0 = vu[left] - 128;
-        const int u1 = vu[right + 1] - 128, v1 = vu[right] - 128;
-        pack_raw10(even + group * 5,
-                   sample(top[left], u0, v0, color.even, 2), sample(top[left + 1], u0, v0, color.even, 1),
-                   sample(top[right], u1, v1, color.even, 2), sample(top[right + 1], u1, v1, color.even, 1));
-        pack_raw10(odd + group * 5,
-                   sample(bottom[left], u0, v0, color.odd, 1), sample(bottom[left + 1], u0, v0, color.odd, 0),
-                   sample(bottom[right], u1, v1, color.odd, 1), sample(bottom[right + 1], u1, v1, color.odd, 0));
+        const int cx = sx & ~1;
+        previous_sample[column_phase] =
+            sample(luma_row[sx], vu[cx + 1] - 128, vu[cx] - 128,
+                   matrix, 2 - phase - column_phase);
+        previous_column[column_phase] = sx;
       }
-      continue;
-    }
-
-    // A substantial upscale repeats source 2x2 blocks across adjacent
-    // Bayer cells. Keep both calibrated green values in the cached cell.
-    int previous_column = -1;
-    std::array<unsigned, 4> previous_cell{};
-    const auto cell = [&](int column) {
-      if (column != previous_column)
-      {
-        const int v = vu[column] - 128, u = vu[column + 1] - 128;
-        previous_cell = {
-            sample(top[column], u, v, color.even, 2),
-            sample(top[column + 1], u, v, color.even, 1),
-            sample(bottom[column], u, v, color.odd, 1),
-            sample(bottom[column + 1], u, v, color.odd, 0)};
-        previous_column = column;
-      }
-      return previous_cell;
+      return previous_sample[column_phase];
     };
-    for (int group = 0; group < dw / 4; ++group)
+    for (int x = 0; x < dw; x += 4)
     {
-      const auto left = cell(columns[group * 2]);
-      const auto right = cell(columns[group * 2 + 1]);
-      pack_raw10(even + group * 5, left[0], left[1], right[0], right[1]);
-      pack_raw10(odd + group * 5, left[2], left[3], right[2], right[3]);
+      const auto a = pixel(x, 0);
+      const auto b = pixel(x + 1, 1);
+      const auto c = pixel(x + 2, 0);
+      const auto d = pixel(x + 3, 1);
+      pack_raw10(output + (x / 4) * 5, a, b, c, d);
     }
   }
   return true;

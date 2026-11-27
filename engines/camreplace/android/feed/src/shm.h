@@ -4,21 +4,14 @@
  *   пишет NV21 кадры в triple-buffered slots, camhook читает последний
  *   опубликованный slot внутри cameraserver и подменяет YUV/BLOB buffers.
  *
- * ABI/совместимость:
- *   cr_feed_header обязан оставаться 64 байта. Wire/shm формат v2 использует
- *   бывший reserve для per-slot reader/writer ownership и оставляет
- *   фиксированный per-slot reserve под 1920x1080 или 1080x1920 NV21.
- *
- * Pixel/Android ограничения:
- *   Pixel 6-10 могут отдавать preview/photo pipelines выше 1080p, но текущий
- *   v2 контракт не меняет размер slot на лету. Динамический slot sizing
- *   потребует нового shm version и отдельной миграции.
+ * ABI: the 64-byte header and v2 FHD slot positions are retained for v3.
+ * The larger slots follow the FHD region in the same file.
  */
 
 #pragma once
 
 // Shared-memory layout for /data/cr/feed.
-// One header, followed by N equally-sized NV21 slots. Writers advance
+// One header, followed by two regions of equally-sized NV21 slots. Writers advance
 // write_index after filling a slot; readers pick the latest committed slot
 // via the index (typical single-producer / multiple-reader ring).
 // Kept tiny and POD — readers in other processes (cameraserver hook,
@@ -131,9 +124,11 @@ static inline void cr_feed_recover_dead_writer(cr_feed_header* h)
 // Only an unknown ABI layout is safe to initialize from zero.
 static inline int cr_feed_ownership_layout_valid(const cr_feed_header* h)
 {
-  return h &&
-         __atomic_load_n(&h->version, __ATOMIC_ACQUIRE) ==
-             CR_FEED_SHM_VERSION &&
+  if (!h)
+    return 0;
+  const uint32_t version = __atomic_load_n(&h->version, __ATOMIC_ACQUIRE);
+  return (version == CR_FEED_SHM_VERSION_FHD ||
+          version == CR_FEED_SHM_VERSION) &&
          __atomic_load_n(&h->num_slots, __ATOMIC_ACQUIRE) ==
              CR_FEED_NUM_SLOTS;
 }
@@ -199,16 +194,21 @@ static inline uint64_t cr_feed_publish(cr_feed_header* h, uint32_t slot)
   return sequence;
 }
 
-#define CR_FEED_MAX_WIDTH 1920u
-#define CR_FEED_MAX_HEIGHT 1920u
-#define CR_FEED_MAX_PIXELS (1920u * 1080u)
-
-// Reserved per-slot size. Sized for 1920×1080 NV21 (~3 MB) which is the
-// substituted-camera output we actually use; the file ftruncates up to
-// `sizeof(header) + CR_FEED_NUM_SLOTS * CR_FEED_MAX_NV21_BYTES` (~9 MB
-// total). Older builds used a single 18 MB slot; the bigger reserve is
-// fine on every Android we target but most of it sat unused.
+#define CR_FEED_MAX_WIDTH 3840u
+#define CR_FEED_MAX_HEIGHT 3840u
+#define CR_FEED_MAX_PIXELS (3840u * 2160u)
+#define CR_FEED_FHD_SLOT_BYTES (1920u * 1080u * 3u / 2u)
 #define CR_FEED_MAX_NV21_BYTES ((uint32_t) (CR_FEED_MAX_PIXELS * 3u / 2u))
+#define CR_FEED_MAP_RESERVE (sizeof(cr_feed_header) + (size_t) CR_FEED_NUM_SLOTS * \
+                            (CR_FEED_FHD_SLOT_BYTES + CR_FEED_MAX_NV21_BYTES))
+
+static inline size_t cr_feed_slot_offset(uint32_t slot_size, uint32_t index)
+{
+  if (slot_size <= CR_FEED_FHD_SLOT_BYTES)
+    return sizeof(cr_feed_header) + (size_t) index * CR_FEED_FHD_SLOT_BYTES;
+  return sizeof(cr_feed_header) + (size_t) CR_FEED_NUM_SLOTS * CR_FEED_FHD_SLOT_BYTES +
+         (size_t) index * CR_FEED_MAX_NV21_BYTES;
+}
 
 #ifdef __cplusplus
 }

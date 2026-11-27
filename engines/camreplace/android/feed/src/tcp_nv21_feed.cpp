@@ -5,9 +5,8 @@
  *   процесс только публикует кадры в /data/cr/feed.
  *
  * ABI/совместимость:
- *   Shared memory v2: fixed slots под 1920x1080/1080x1920 NV21. Поток выше
- *   CR_FEED_MAX_NV21_BYTES завершается явно, без частичного frame copy и без
- *   изменения shm layout.
+ *   The shared ring keeps separate FHD and UHD slot regions.
+ *   Input above the ring's pixel budget is rejected before copying frames.
  *
  * Pixel/Android ограничения:
  *   Raw mode требует высокой USB пропускной способности. На USB 2.0 1080p30
@@ -85,7 +84,7 @@ bool nv21_shape_supported(int w, int h, const char* tag)
   const uint64_t bytes = (uint64_t) w * (uint64_t) h * 3ull / 2ull;
   if (bytes > CR_FEED_MAX_NV21_BYTES)
   {
-    LOGE(OBF("%s: %dx%d NV21 needs %llu bytes, v2 pixel cap is %u bytes").c_str(), tag, w, h, (unsigned long long) bytes, CR_FEED_MAX_NV21_BYTES);
+    LOGE(OBF("%s: %dx%d NV21 needs %llu bytes, shared slot cap is %u bytes").c_str(), tag, w, h, (unsigned long long) bytes, CR_FEED_MAX_NV21_BYTES);
     return false;
   }
   return true;
@@ -99,7 +98,6 @@ struct ShmOut
   int fd = -1;
   void* map = nullptr;
   size_t mapped = 0;
-  uint8_t* slot0 = nullptr;
   int w = 0;
   int h = 0;
   size_t slot_bytes = 0;
@@ -120,7 +118,7 @@ struct ShmOut
       LOGE(OBF("nv21 shm init rejected %dx%d: %zu > %u").c_str(), ww, hh, slot_bytes, CR_FEED_MAX_NV21_BYTES);
       return false;
     }
-    const size_t reserve = sizeof(cr_feed_header) + (size_t) CR_FEED_NUM_SLOTS * CR_FEED_MAX_NV21_BYTES;
+    const size_t reserve = CR_FEED_MAP_RESERVE;
 
     fd = open(OBF("/data/cr/feed").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0)
@@ -164,7 +162,6 @@ struct ShmOut
       return false;
     }
     mapped = map_size;
-    slot0 = (uint8_t*) map + sizeof(cr_feed_header);
     w = ww;
     h = hh;
 
@@ -208,7 +205,7 @@ struct ShmOut
     uint32_t next = 0;
     if (!cr_feed_claim_write(hd, cur_wi, &next))
       return true;
-    uint8_t* dst = slot0 + (size_t) next * CR_FEED_MAX_NV21_BYTES;
+    auto* dst = static_cast<uint8_t*>(map) + cr_feed_slot_offset(slot_bytes, next);
     if (!channel.read_exact(dst, slot_bytes))
     {
       cr_feed_abort_write(hd, next);
@@ -241,7 +238,6 @@ struct ShmOut
       munmap(map, mapped);
       map = nullptr;
       mapped = 0;
-      slot0 = nullptr;
     }
     if (fd >= 0)
     {

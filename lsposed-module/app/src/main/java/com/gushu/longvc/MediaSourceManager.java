@@ -5,6 +5,7 @@ import android.content.Context;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.ColorSpace;
 import android.graphics.ImageDecoder;
 import android.graphics.Matrix;
 import android.net.Uri;
@@ -33,9 +34,9 @@ final class MediaSourceManager {
     private static final String CONTROL_DIR = "/data/cr/control";
     private static final String SOURCE_CONFIG = CONTROL_DIR + "/source.conf";
     private static final long MAX_MEDIA_BYTES = 2L * 1024L * 1024L * 1024L;
-    private static final int MAX_IMAGE_WIDTH = 1920;
-    private static final int MAX_IMAGE_HEIGHT = 1920;
-    private static final long MAX_IMAGE_PIXELS = 1920L * 1080L;
+    private static final int MAX_IMAGE_WIDTH = 3840;
+    private static final int MAX_IMAGE_HEIGHT = 3840;
+    private static final long MAX_IMAGE_PIXELS = 3840L * 2160L;
     private static final int LNV1_MAGIC = 0x31564e4c;
 
     private final Context context;
@@ -268,34 +269,37 @@ final class MediaSourceManager {
                     bitmap = cropped;
                 }
             }
-            int[] pixels = new int[width * height];
-            bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
-            byte[] nv21 = new byte[width * height * 3 / 2];
-            int yIndex = 0;
-            int vuIndex = width * height;
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x++) {
-                    int color = pixels[y * width + x];
-                    int r = (color >> 16) & 0xff;
-                    int g = (color >> 8) & 0xff;
-                    int b = color & 0xff;
-                    int yy = clamp(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-                    nv21[yIndex++] = (byte) yy;
-                    if ((y & 1) == 0 && (x & 1) == 0) {
-                        int v = clamp(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
-                        int u = clamp(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-                        nv21[vuIndex++] = (byte) v;
-                        nv21[vuIndex++] = (byte) u;
-                    }
-                }
-            }
-            ByteBuffer output = ByteBuffer.allocate(12 + nv21.length)
+            ByteBuffer output = ByteBuffer.allocate(12 + width * height * 3 / 2)
                     .order(ByteOrder.LITTLE_ENDIAN);
             output.putInt(LNV1_MAGIC);
             output.putInt(width);
             output.putInt(height);
-            output.put(nv21);
-            return output.array();
+            byte[] nv21 = output.array();
+            int[] rows = new int[2 * width];
+            int yIndex = output.position();
+            int vuIndex = yIndex + width * height;
+            for (int y = 0; y < height; y += 2) {
+                bitmap.getPixels(rows, 0, width, 0, y, width, 2);
+                for (int color : rows) {
+                    int r = (color >> 16) & 0xff;
+                    int g = (color >> 8) & 0xff;
+                    int b = color & 0xff;
+                    nv21[yIndex++] = (byte) clamp(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+                }
+                // Each NV21 chroma pair represents the full 2×2 luma block.
+                for (int x = 0; x < width; x += 2) {
+                    int a = rows[x], b = rows[x + 1];
+                    int c = rows[x + width], d = rows[x + width + 1];
+                    int r = (((a >> 16) & 0xff) + ((b >> 16) & 0xff)
+                            + ((c >> 16) & 0xff) + ((d >> 16) & 0xff) + 2) >> 2;
+                    int g = (((a >> 8) & 0xff) + ((b >> 8) & 0xff)
+                            + ((c >> 8) & 0xff) + ((d >> 8) & 0xff) + 2) >> 2;
+                    int blue = ((a & 0xff) + (b & 0xff) + (c & 0xff) + (d & 0xff) + 2) >> 2;
+                    nv21[vuIndex++] = (byte) clamp(((112 * r - 94 * g - 18 * blue + 128) >> 8) + 128);
+                    nv21[vuIndex++] = (byte) clamp(((-38 * r - 74 * g + 112 * blue + 128) >> 8) + 128);
+                }
+            }
+            return nv21;
         } finally {
             if (!bitmap.isRecycled()) bitmap.recycle();
         }
@@ -313,7 +317,7 @@ final class MediaSourceManager {
                     }
                     Size bounded = boundedSizeValid(width, height);
                     decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
-                    decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM);
+                    decoder.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.SRGB));
                     decoder.setTargetSize(bounded.getWidth(), bounded.getHeight());
                 });
             } catch (IllegalArgumentException invalid) {

@@ -91,7 +91,6 @@ struct PinnedSlot
 struct ShmView
 {
   cr_feed_header* header = nullptr;
-  const uint8_t* slot0 = nullptr;
   size_t size = 0;
   int fd = -1;
 
@@ -114,7 +113,7 @@ struct ShmView
 private:
   bool pin_once(PinnedSlot& out) const noexcept
   {
-    if (!header || !slot0)
+    if (!header)
       return false;
 
     const uint32_t magic = __atomic_load_n(&header->magic, __ATOMIC_ACQUIRE);
@@ -156,24 +155,23 @@ private:
       return false;
     }
 
-    const size_t off = (size_t) wi * CR_FEED_MAX_NV21_BYTES;
-    const size_t hdr = sizeof(cr_feed_header);
+    const size_t off = cr_feed_slot_offset(slot_size, wi);
     const uint64_t min_slot =
         static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 3ull /
         2ull;
     if (width == 0 || height == 0 || (width & 1u) || (height & 1u) ||
         width > CR_FEED_MAX_WIDTH || height > CR_FEED_MAX_HEIGHT ||
         stride != width || (format & ~CR_FEED_COLOR_FLAGS) != 0 || slot_size == 0 ||
-        min_slot == 0 || min_slot > slot_size ||
-        slot_size > CR_FEED_MAX_NV21_BYTES || size < hdr || off > (size - hdr) ||
-        slot_size > (size - hdr - off))
+        min_slot != slot_size ||
+        slot_size > CR_FEED_MAX_NV21_BYTES || off > size ||
+        slot_size > size - off)
     {
       cr_feed_slot_release_read(header, wi);
       return false;
     }
     out.header = header;
     out.index = wi;
-    out.data = slot0 + off;
+    out.data = reinterpret_cast<const uint8_t*>(header) + off;
     out.generation = generation;
     out.width = width;
     out.height = height;
@@ -215,21 +213,13 @@ static bool feed_header_sane(const cr_feed_header* h, size_t map_size)
   if (slot_size == 0 || slot_size > CR_FEED_MAX_NV21_BYTES)
     return false;
   const uint64_t min_slot = (uint64_t) width * (uint64_t) height * 3ull / 2ull;
-  if (min_slot == 0 || min_slot > slot_size)
+  if (min_slot != slot_size)
     return false;
 
   if (n == 0 || n > CR_FEED_NUM_SLOTS)
     return false;
 
-  uint64_t required = sizeof(cr_feed_header);
-  if (n <= 1)
-  {
-    required += (uint64_t) slot_size;
-  }
-  else
-  {
-    required += (uint64_t) n * (uint64_t) CR_FEED_MAX_NV21_BYTES;
-  }
+  const size_t required = cr_feed_slot_offset(slot_size, n - 1) + slot_size;
   return required <= map_size &&
          __atomic_load_n(&h->magic, __ATOMIC_ACQUIRE) == magic &&
          __atomic_load_n(&h->version, __ATOMIC_ACQUIRE) == version &&
@@ -499,7 +489,6 @@ static int open_shm()
     return -1;
   }
   g_shm.header = h;
-  g_shm.slot0 = (const uint8_t*) map + sizeof(cr_feed_header);
   g_shm.size = (size_t) st.st_size;
   g_shm.fd = fd;
   g_shm_ready.store(true, std::memory_order_release);

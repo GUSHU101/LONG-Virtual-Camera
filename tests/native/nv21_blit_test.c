@@ -188,6 +188,9 @@ int main(void)
   if (basic) return basic;
   if (exact_scaling(40, 24, 110, 82, CR_NV21_ZOOM_ONE) ||
       exact_scaling(70, 110, 26, 32, CR_NV21_ZOOM_ONE) ||
+      exact_scaling(384, 216, 192, 108, CR_NV21_ZOOM_ONE) ||
+      exact_scaling(384, 216, 108, 60, CR_NV21_ZOOM_ONE) ||
+      exact_scaling(20, 12, 8, 6, CR_NV21_ZOOM_ONE) ||
       exact_scaling(40, 24, 24, 24, CR_NV21_ZOOM_ONE) ||
       exact_scaling(2, 2, 34, 34, CR_NV21_ZOOM_ONE) ||
       exact_scaling(10, 6, 2, 2, CR_NV21_ZOOM_ONE) ||

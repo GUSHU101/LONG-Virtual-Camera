@@ -3,18 +3,17 @@
  *   Общий H.264 -> NV21 -> /data/cr/feed decode pipeline для phone-side feed
  *   variants. Транспортный слой отдаёт Annex-B NAL units, а этот wrapper
  *   выбирает Android decoder, конвертирует output format и публикует NV21 в
- *   shared memory v2.
+ *   shared memory.
  *
  * Hook point и ABI assumptions:
- *   ABI /data/cr/feed не меняется: cr_feed_header + fixed NV21 slots. Этот
- *   файл не экспортирует C symbols; он header-only helper для feed process.
+ *   /data/cr/feed uses cr_feed_header followed by FHD and UHD NV21 slots.
+ *   This header-only helper is shared by the feed process's input paths.
  *   Decoder выбирается через AMediaCodec_createDecoderByType("video/avc")
  *   как primary path, vendor names остаются только fallback.
  *
  * Ограничения Pixel/Android:
- *   Tensor Pixel не гарантирует Qualcomm codec names. Размер кадра должен
- *   укладываться в текущий shm v2 pixel cap 1920x1080/1080x1920 NV21; расширение требует
- *   отдельной версии shared memory.
+ *   Codec availability and maximum decode size depend on the device.
+ *   Source frames within the UHD pixel budget are published at full size.
  *
  * Подтверждено:
  *   Нормальный путь использует Android media codec selection по MIME type.
@@ -92,14 +91,12 @@ inline bool fit_source_geometry(int source_width, int source_height,
       output_width >= 16 && output_height >= 16;
 }
 
-// /data/cr/feed writer. Identical to the inline ShmOut that lived in
-// tcp_h264_feed.cpp pre-extraction.
+// Writer used by the OBS decoder and local media playback.
 struct ShmOut
 {
   int fd = -1;
   void* map = nullptr;
   size_t mapped = 0;
-  uint8_t* slot0 = nullptr;
   int w = 0;
   int h = 0;
   size_t slot_bytes = 0;
@@ -122,7 +119,7 @@ struct ShmOut
       CR_FEED_LOGE(OBF("h264 pipe shm init rejected %dx%d: %zu > %u (%ux%u cap)").c_str(), ww, hh, slot_bytes, CR_FEED_MAX_NV21_BYTES, CR_FEED_MAX_WIDTH, CR_FEED_MAX_HEIGHT);
       return false;
     }
-    const size_t reserve = sizeof(cr_feed_header) + (size_t) CR_FEED_NUM_SLOTS * CR_FEED_MAX_NV21_BYTES;
+    const size_t reserve = CR_FEED_MAP_RESERVE;
 
     fd = open(OBF("/data/cr/feed").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0)
@@ -164,7 +161,6 @@ struct ShmOut
       return false;
     }
     mapped = map_size;
-    slot0 = (uint8_t*) map + sizeof(cr_feed_header);
     w = ww;
     h = hh;
 
@@ -209,7 +205,7 @@ struct ShmOut
     uint32_t next = 0;
     if (!cr_feed_claim_write(hd, cur_wi, &next))
       return false;
-    write(slot0 + (size_t) next * CR_FEED_MAX_NV21_BYTES);
+    write(static_cast<uint8_t*>(map) + cr_feed_slot_offset(slot_bytes, next));
     if (__atomic_load_n(&hd->format, __ATOMIC_RELAXED) != color_flags)
     {
       atomic_store_explicit(&hd->channel_state, CR_CHANNEL_STATE_NONE, memory_order_release);
@@ -248,7 +244,6 @@ struct ShmOut
       munmap(map, mapped);
       map = nullptr;
       mapped = 0;
-      slot0 = nullptr;
     }
     if (fd >= 0)
     {

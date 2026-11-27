@@ -18,9 +18,9 @@ extern "C"
   // clean shutdown.
   int cr_feed_run(const char* feed_url);
 
-// Writable shared-memory layout version exposed to hooks. Bump whenever
-// the header struct changes.
-#define CR_FEED_SHM_VERSION 2
+// Version 3 keeps the v2 header and FHD slots, followed by UHD slots.
+#define CR_FEED_SHM_VERSION_FHD 2
+#define CR_FEED_SHM_VERSION 3
 
 // NV21 remains the byte layout. These bits describe the decoded samples.
 // A zero format is the original contract (BT.601 limited range).

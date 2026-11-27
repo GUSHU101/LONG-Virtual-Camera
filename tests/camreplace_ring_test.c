@@ -97,9 +97,18 @@ int main(void)
   header.version = CR_FEED_SHM_VERSION;
   header.num_slots = CR_FEED_NUM_SLOTS;
   assert(sizeof(header) == 64);
-  assert(CR_FEED_MAX_WIDTH >= 1920u);
-  assert(CR_FEED_MAX_HEIGHT >= 1920u);
-  assert((uint64_t) 1080u * 1920u * 3u / 2u <= CR_FEED_MAX_NV21_BYTES);
+  assert(CR_FEED_MAX_WIDTH >= 3840u);
+  assert(CR_FEED_MAX_HEIGHT >= 3840u);
+  assert((uint64_t) 3840u * 2160u * 3u / 2u == CR_FEED_MAX_NV21_BYTES);
+  assert(cr_feed_slot_offset(CR_FEED_FHD_SLOT_BYTES, 0) == sizeof(header));
+  const size_t fhd_end = cr_feed_slot_offset(CR_FEED_FHD_SLOT_BYTES, 2) +
+                         CR_FEED_FHD_SLOT_BYTES;
+  assert(cr_feed_slot_offset(CR_FEED_FHD_SLOT_BYTES + 1, 0) == fhd_end);
+  assert(cr_feed_slot_offset(CR_FEED_MAX_NV21_BYTES, 2) + CR_FEED_MAX_NV21_BYTES ==
+         CR_FEED_MAP_RESERVE);
+  header.version = CR_FEED_SHM_VERSION_FHD;
+  assert(cr_feed_ownership_layout_valid(&header));
+  header.version = CR_FEED_SHM_VERSION;
 
   uint32_t slot1 = 0;
   assert(cr_feed_claim_write(&header, 0, &slot1));
