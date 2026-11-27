@@ -103,6 +103,21 @@ int main()
   assert(!cr::camhook::nv21_to_bggr10(red, 4, 2, raw, 6, 2));
   assert(raw == before);
 
+  // Reuse only rows whose luma and interleaved chroma both match. The 2x
+  // upscale also exercises repeated rows of the same Bayer phase.
+  std::array<uint8_t, 24> first{
+      16, 40, 60, 80, 20, 44, 64, 84, 24, 48, 68, 88, 28, 52, 72, 92,
+      128, 128, 128, 128, 160, 120, 152, 110};
+  auto next = first;
+  next[2] = 220;
+  next[21] = 200;
+  std::array<uint8_t, 80> previous_raw{}, expected{}, reused{};
+  assert(cr::camhook::nv21_to_bggr10(first, 4, 4, previous_raw, 8, 8));
+  assert(cr::camhook::nv21_to_bggr10(next, 4, 4, expected, 8, 8));
+  assert(cr::camhook::nv21_to_bggr10(next, 4, 4, reused, 8, 8, {}, false, false,
+                                    {first, previous_raw}));
+  assert(reused == expected && reused != previous_raw);
+
   const std::array<float, 9> identity{{1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}};
   cr::camhook::Raw10Color calibrated;
   assert(cr::camhook::invert_sensor_color(identity, {2.f, 1.f, 1.f, 1.5f}, calibrated));

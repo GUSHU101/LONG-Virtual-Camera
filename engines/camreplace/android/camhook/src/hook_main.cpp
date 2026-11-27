@@ -1492,7 +1492,11 @@ static bool install_camera_color_hooks()
 struct Raw10Frame
 {
   std::unique_ptr<uint8_t[]> pixels;
+  std::vector<uint8_t> nv21;
   cr::camhook::Raw10Color color;
+  uint32_t source_width = 0;
+  uint32_t source_height = 0;
+  uint32_t source_color_flags = 0;
   uint32_t generation = 0;
   uint64_t sequence = 0;
   int64_t sampled = 0;
@@ -1501,27 +1505,39 @@ struct Raw10Frame
 
 static std::shared_ptr<Raw10Frame> render_raw10(size_t profile, PinnedSlot& source,
                                                const cr::camhook::Raw10Color& color,
-                                               std::vector<uint8_t>& input)
+                                               std::vector<uint8_t>& input,
+                                               const Raw10Frame* previous)
 {
   const int64_t sampled = monotonic_ns();
   const auto [width, height, stride] = kPixel5RawLayouts[profile];
   const size_t input_bytes =
       static_cast<size_t>(source.width) * source.height * 3 / 2;
-  input.assign(source.data, source.data + input_bytes);
+  auto result = std::make_shared<Raw10Frame>();
+  // Keep at most one 1080p NV21 snapshot per cached sensor profile.
+  constexpr size_t kMaxHistoryBytes = 1920 * 1080 * 3 / 2;
+  auto& snapshot = input_bytes <= kMaxHistoryBytes ? result->nv21 : input;
+  snapshot.assign(source.data, source.data + input_bytes);
   source.release_read();
   const size_t size = static_cast<size_t>(width / 4) * 5 * height;
-  auto result = std::make_shared<Raw10Frame>();
   result->pixels.reset(new uint8_t[size]);
   result->color = color;
   result->generation = source.generation;
   result->sequence = source.frame_seq;
   result->sampled = sampled;
+  result->source_width = source.width;
+  result->source_height = source.height;
+  result->source_color_flags = source.color_flags;
+  cr::camhook::Raw10PreviousFrame history{};
+  if (previous && !previous->nv21.empty() && previous->generation == source.generation &&
+      previous->source_width == source.width && previous->source_height == source.height &&
+      previous->source_color_flags == source.color_flags && previous->color == color)
+    history = {previous->nv21, {previous->pixels.get(), size}};
   // Pixel Camera crops the developed RAW image using its capture settings.
   // Keep the full sensor field here so the saved photo is cropped only once.
-  if (!cr::camhook::nv21_to_bggr10(input, source.width, source.height,
+  if (!cr::camhook::nv21_to_bggr10(snapshot, source.width, source.height,
                                   {result->pixels.get(), size}, width, height,
                                   color, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
-                                  (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0))
+                                  (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0, history))
     return {};
   result->render_time = monotonic_ns() - sampled;
   return result;
@@ -1602,6 +1618,7 @@ public:
     // Night Sight can stop delivering RAW for several seconds and then
     // immediately submit a burst. The first buffer may be used in the saved
     // shot. Prepare that frame now when no valid cache entry is available.
+    const auto previous = slot.stream == stream ? slot.frame : nullptr;
     slot = {};
     slot.stream = stream;
     const uint64_t revision = ++revision_;
@@ -1614,7 +1631,7 @@ public:
     try
     {
       std::vector<uint8_t> input;
-      frame = render_raw10(profile, source, color, input);
+      frame = render_raw10(profile, source, color, input, previous.get());
     }
     catch (const std::exception&)
     {
@@ -1669,6 +1686,7 @@ private:
       uint64_t revision;
       uint32_t generation;
       cr::camhook::Raw10Color color;
+      std::shared_ptr<const Raw10Frame> previous;
       {
         std::unique_lock lock(mutex_);
         const auto has_pending = [](const Slot& slot) { return slot.pending; };
@@ -1685,6 +1703,7 @@ private:
         revision = slots_[profile].revision;
         generation = slots_[profile].generation;
         color = slots_[profile].color;
+        previous = slots_[profile].frame;
         next_ = (profile + 1) % slots_.size();
       }
       std::shared_ptr<Raw10Frame> frame;
@@ -1695,7 +1714,7 @@ private:
             g_shm.pin_current(source) && source.generation == generation &&
             atomic_load_explicit(&source.header->channel_state, memory_order_acquire) ==
                 CR_CHANNEL_STATE_READY)
-          frame = render_raw10(profile, source, color, input);
+          frame = render_raw10(profile, source, color, input, previous.get());
       }
       catch (const std::exception&)
       {
