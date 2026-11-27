@@ -16,9 +16,11 @@
 | 连接 | 操作 | 手机上的拉流地址 |
 | --- | --- | --- |
 | USB | OBS 推流到 `127.0.0.1`，手机 IPv4 留空，电脑运行 `adb reverse tcp:1935 tcp:1935` | `rtmp://127.0.0.1:1935/longvc` |
-| 同一局域网 | 填入手机的局域网 IPv4，再应用脚本设置 | `rtmp://电脑局域网IP:1935/longvc` |
+| 同一局域网 | 填入电脑看到的拉流来源 IPv4，再应用脚本设置 | `rtmp://电脑局域网IP:1935/longvc` |
 
-默认绑定回环。沿用 OBS 的本机网卡地址时，中继直接绑定该地址。在局域网模式下，只有电脑能推流，指定的手机 IPv4 和电脑能读取配置的流路径。手机 IP 变化时，更新脚本里的 IP 并应用。Windows 防火墙如需入站规则，可将 TCP 端口限制在专用网络和该手机 IP。RTMP 为明文。
+默认绑定回环。沿用 OBS 的本机网卡地址时，中继直接绑定该地址。在局域网模式下，只有电脑能推流，指定的来源 IPv4 和电脑能读取配置的流路径。Windows 防火墙如需入站规则，可将 TCP 端口限制在专用网络和该来源 IP。RTMP 为明文。
+
+直连 Wi‑Fi 时，来源通常是手机的 IPv4。若经过地址转换，可在旧中继正常拉流时用 PowerShell 查看 `Get-NetTCPConnection -State Established -LocalPort 1935 | Select-Object LocalAddress,RemoteAddress`。找出手机那条连接，填写其 `RemoteAddress`。如果多台设备共用该来源地址，IP 限制会同时放行这些设备。需要只允许这台手机时，使用 USB 或带读取认证的自管中继。
 
 ## 排查
 

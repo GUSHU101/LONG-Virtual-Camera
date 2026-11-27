@@ -221,7 +221,7 @@ local function prepare(spec)
         return nil, "流路径只接受字母、数字、下划线、连字符及分隔斜杠。"
     end
     if spec.phone ~= "" and not private_ipv4(spec.phone) then
-        return nil, "请填写手机的局域网 IPv4，或留空使用本机和 USB。"
+        return nil, "请填写电脑看到的拉流来源 IPv4，或留空仅允许本机读取。"
     end
 
     local directory = script_path():gsub("/", "\\")
@@ -458,7 +458,7 @@ local function report_status()
     if child and child.job and child.ready_at then
         local active = child.spec
         local endpoint, reason = obs_endpoint()
-        local access = active.phone ~= "" and "指定手机 IPv4"
+        local access = active.phone ~= "" and "指定拉流来源 IPv4"
             or (active.publisher_ip == LOOPBACK_IP and "本机与 USB" or "本机网卡")
         info("中继正在监听 TCP " .. active.port .. "（" .. access .. "）。")
         if not endpoint then
@@ -514,7 +514,7 @@ function script_description()
     return "LONG Virtual Camera · MediaMTX 中继<br>"
         .. "使用「沿用 OBS 本机推流地址」可以读取 OBS 的端口和流路径。<br>"
         .. "OBS 使用自定义 RTMP，推流码留空，编码选 H.264。<br>"
-        .. "使用局域网时填写手机 IPv4。使用 USB 时请让 OBS 推流到 127.0.0.1。"
+        .. "使用局域网时填写电脑看到的拉流来源 IPv4。使用 USB 时请让 OBS 推流到 127.0.0.1。"
 end
 
 function script_properties()
@@ -526,7 +526,7 @@ function script_properties()
     obs.obs_properties_add_int(props, "port", "RTMP 端口", 1024, 65535, 1)
     obs.obs_properties_add_text(props, "stream_path", "流路径", obs.OBS_TEXT_DEFAULT)
     obs.obs_property_set_modified_callback(follow, update_endpoint_fields)
-    obs.obs_properties_add_text(props, "phone_ip", "允许拉流的手机 IPv4（可选）", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(props, "phone_ip", "允许拉流的来源 IPv4（可选）", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_bool(props, "auto_start", "随 OBS 自动启动中继")
     obs.obs_properties_add_button(props, "apply", "启动 / 应用中继设置", apply_settings)
     obs.obs_properties_add_button(props, "stop", "停止中继", stop_relay)

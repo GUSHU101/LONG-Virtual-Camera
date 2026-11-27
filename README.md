@@ -17,7 +17,7 @@ LONG Virtual Camera 是面向自有或明确授权测试设备的 Android ARM64 
 Windows x64 的 OBS 可用 Lua 脚本自动管理本机 MediaMTX。解压官方 MediaMTX 后，在 OBS「工具 → 脚本」加载 `longvc-mediamtx.lua`，选择 `mediamtx.exe`，再点「启动 / 应用中继设置」。勾选「沿用 OBS 本机推流地址」可从已有 OBS 设置读取端口与流路径。脚本配置随 OBS 场景集合保存。 [配置与排查](tools/obs/README.md) · [MediaMTX 下载](https://mediamtx.org/docs/kickoff/install)
 
 1. 在 OBS「设置 → 直播」选择「自定义」，服务器填 `rtmp://127.0.0.1:1935/longvc`，推流码留空。视频使用 H.264，然后开始推流。 [OBS 推流示例](https://mediamtx.org/docs/publish/obs-studio)
-2. 用 USB 时，在电脑执行 `adb reverse tcp:1935 tcp:1935`。用局域网时，在脚本填手机的 IPv4 并应用，中继会允许该地址拉流。
+2. 用 USB 时，在电脑执行 `adb reverse tcp:1935 tcp:1935`。用局域网时，在脚本填电脑看到的拉流来源 IPv4 并应用，中继会允许该地址拉流。
 3. 在 APK 的「电脑 OBS 拉流」填 `rtmp://127.0.0.1:1935/longvc`（USB）或 `rtmp://<电脑局域网 IP>:1935/longvc`（局域网）。保存后开启相机或照片替换。需要 OBS 音频时，选中 OBS AAC 并打开虚拟麦克风。
 
 也可连接自行管理的 MediaMTX。若该中继启用了读取认证，手机地址可加 `?user=用户名&pass=密码`。RTMP 为明文，适用于可信网络。 [MediaMTX 读取认证](https://mediamtx.org/docs/features/authentication)
