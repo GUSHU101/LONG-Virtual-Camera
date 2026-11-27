@@ -1,10 +1,18 @@
 #include "Raw10Bayer.h"
+#include "CaptureZoom.h"
 
 #include <array>
 #include <cassert>
 
 int main()
 {
+  assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {469, 353, 2342, 1758}) == 1434);
+  assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {0, 2, 3280, 2460}) == CR_NV21_ZOOM_ONE);
+  assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {0, 309, 3280, 1846}) == CR_NV21_ZOOM_ONE);
+  assert(cr::camhook::capture_zoom_q10(1.f, 0.f, {469, 353, 2342, 1758}) == CR_NV21_ZOOM_ONE);
+  assert(cr::camhook::capture_zoom_q10(.6f, 2.22f, {469, 353, 2342, 1758}) == CR_NV21_ZOOM_ONE);
+  assert(cr::camhook::capture_zoom_q10(1.4f, 2.57f, {469, 353, 2342, 1758}) == 1434);
+
   std::array<uint8_t, 5> group{};
   cr::camhook::pack_raw10(group.data(), 0x3ff, 0x200, 0x001, 0x002);
   assert((group == std::array<uint8_t, 5>{255, 128, 0, 0, 0x93}));

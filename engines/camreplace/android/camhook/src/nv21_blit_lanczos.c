@@ -313,6 +313,15 @@ static void scale_vu_lanczos(const uint8_t* src, int src_w_pairs, int src_h,
 
 void cr_nv21_blit_lanczos(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped)
 {
+  cr_nv21_blit_lanczos_zoom(src, src_w, src_h, dst_y, dst_vu, dst_w, dst_h,
+                           dst_y_stride, dst_uv_stride, dst_uv_swapped, CR_NV21_ZOOM_ONE);
+}
+
+void cr_nv21_blit_lanczos_zoom(const uint8_t* src, int src_w, int src_h,
+                              uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h,
+                              int dst_y_stride, int dst_uv_stride, int dst_uv_swapped,
+                              unsigned zoom_q10)
+{
   if (!src || !dst_y || !dst_vu || src_w > 8192 || src_h > 8192 ||
       dst_w > 8192 || dst_h > 8192 || dst_y_stride < dst_w ||
       dst_uv_stride < dst_w ||
@@ -320,8 +329,14 @@ void cr_nv21_blit_lanczos(const uint8_t* src, int src_w, int src_h, uint8_t* dst
       (uint64_t) dst_w * (uint64_t) dst_h > 32ull * 1024ull * 1024ull)
     return;
   cr_nv21_crop_rect crop;
-  if (!cr_nv21_center_crop(src_w, src_h, dst_w, dst_h, &crop))
+  if (!cr_nv21_zoom_crop(src_w, src_h, dst_w, dst_h, zoom_q10, &crop))
     return;
+  if (crop.width < CR_LANCZOS_TAPS * 2 || crop.height < CR_LANCZOS_TAPS * 2)
+  {
+    cr_nv21_blit_zoom(src, src_w, src_h, dst_y, dst_vu, dst_w, dst_h,
+                     dst_y_stride, dst_uv_stride, dst_uv_swapped, zoom_q10);
+    return;
+  }
 
   // Same equal-resolution fast path as cr_nv21_blit — Lanczos and
   // bilinear both reduce to memcpy when no scaling is needed.

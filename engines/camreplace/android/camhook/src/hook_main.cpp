@@ -6,6 +6,7 @@
 #include "jpeg_encode.h"
 #include "HookDispatch.h"
 #include "Raw10Bayer.h"
+#include "CaptureZoom.h"
 #include "shadowhook.h"
 
 #include <android/hardware_buffer.h>
@@ -285,16 +286,16 @@ static void resolve_scaler()
   LOGI(OBF("scaler = %s (/data/cr/scaler=\"%s\")").c_str(), blit_name(), buf);
 }
 
-static inline void blit_adaptive(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped)
+static unsigned zoom_for_capture(int64_t timestamp = 0);
+
+static inline void blit_adaptive(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped, unsigned zoom)
 {
-  if (g_blit_fn != cr_nv21_blit && (int64_t) dst_w * (int64_t) dst_h > 1920LL * 1080LL)
-  {
-    cr_nv21_blit(src, src_w, src_h, dst_y, dst_vu, dst_w, dst_h, dst_y_stride, dst_uv_stride, dst_uv_swapped);
-  }
+  if (g_blit_fn == cr_nv21_blit_lanczos && (int64_t) dst_w * dst_h <= 1920LL * 1080LL)
+    cr_nv21_blit_lanczos_zoom(src, src_w, src_h, dst_y, dst_vu, dst_w, dst_h,
+                             dst_y_stride, dst_uv_stride, dst_uv_swapped, zoom);
   else
-  {
-    g_blit_fn(src, src_w, src_h, dst_y, dst_vu, dst_w, dst_h, dst_y_stride, dst_uv_stride, dst_uv_swapped);
-  }
+    cr_nv21_blit_zoom(src, src_w, src_h, dst_y, dst_vu, dst_w, dst_h,
+                     dst_y_stride, dst_uv_stride, dst_uv_swapped, zoom);
 }
 
 static inline int64_t monotonic_ns()
@@ -892,6 +893,7 @@ struct EncodedJpeg
   uint64_t frame = 0;
   uint32_t width = 0;
   uint32_t height = 0;
+  unsigned zoom = CR_NV21_ZOOM_ONE;
 };
 
 static std::mutex g_jpeg_cache_mutex;
@@ -1035,6 +1037,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     return false;
   }
   const uint64_t cur_frame = source.frame_seq;
+  const unsigned zoom = zoom_for_capture();
   const int src_w = static_cast<int>(source.width);
   const int src_h = static_cast<int>(source.height);
   if (src_w < 16 || src_h < 16)
@@ -1044,7 +1047,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   cr_nv21_crop_rect crop;
   if (target_w < 8 || target_h < 8 || target_w > 8192 || target_h > 8192 ||
       target_pixels > kMaxJpegPixels ||
-      !cr_nv21_center_crop(src_w, src_h, target_w, target_h, &crop))
+      !cr_nv21_zoom_crop(src_w, src_h, target_w, target_h, zoom, &crop))
   {
     LOGW("blob: unsupported JPEG dimensions %dx%d", target_w, target_h);
     return false;
@@ -1056,13 +1059,13 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     if (g_jpeg_cache.data && g_jpeg_cache.generation == source.generation &&
         g_jpeg_cache.frame == cur_frame &&
         g_jpeg_cache.width == static_cast<uint32_t>(target_w) &&
-        g_jpeg_cache.height == static_cast<uint32_t>(target_h))
+        g_jpeg_cache.height == static_cast<uint32_t>(target_h) && g_jpeg_cache.zoom == zoom)
       jpeg = g_jpeg_cache;
   }
   const bool cache_hit = static_cast<bool>(jpeg.data);
   if (!cache_hit)
   {
-    const bool same_size = src_w == target_w && src_h == target_h;
+    const bool same_size = src_w == target_w && src_h == target_h && zoom == CR_NV21_ZOOM_ONE;
     const size_t pixel_bytes = target_pixels + target_pixels / 2;
     std::unique_ptr<uint8_t[]> pixels(new (std::nothrow) uint8_t[pixel_bytes]);
     if (!pixels)
@@ -1072,8 +1075,8 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     else
     {
       // Use the same aspect-preserving crop as the live camera outputs.
-      cr_nv21_blit(source.data, src_w, src_h, pixels.get(), pixels.get() + target_pixels,
-                    target_w, target_h, target_w, target_w, 0);
+      cr_nv21_blit_zoom(source.data, src_w, src_h, pixels.get(), pixels.get() + target_pixels,
+                       target_w, target_h, target_w, target_w, 0, zoom);
     }
     source.release_read();
     uint8_t* encoded = nullptr;
@@ -1092,6 +1095,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
     jpeg.frame = cur_frame;
     jpeg.width = target_w;
     jpeg.height = target_h;
+    jpeg.zoom = zoom;
     std::lock_guard<std::mutex> guard(g_jpeg_cache_mutex);
     g_jpeg_cache = jpeg;
   }
@@ -1201,6 +1205,13 @@ struct CaptureColor
 static std::mutex g_capture_colors_mutex;
 static std::array<CaptureColor, 64> g_capture_colors;
 static size_t g_capture_color_next = 0;
+struct CaptureZoom
+{
+  int64_t timestamp = 0;
+  unsigned zoom = CR_NV21_ZOOM_ONE;
+};
+static std::array<CaptureZoom, 64> g_capture_zooms;
+static size_t g_capture_zoom_next = 0;
 static thread_local int64_t g_return_sensor_timestamp = 0;
 static thread_local const void* g_return_camera_stream = nullptr;
 
@@ -1233,8 +1244,11 @@ static std::optional<cr::camhook::Raw10Color> capture_color(const void* metadata
              ? std::optional{color} : std::nullopt;
 }
 
-static void observe_capture_color(const CameraCaptureResult& result)
+static void observe_capture_settings(const CameraCaptureResult& result, bool photo)
 {
+  constexpr uint32_t kZoomRatio = 0x0001002f;
+  constexpr uint32_t kFocalLength = 0x00080002;
+  constexpr uint32_t kCropRegion = 0x000d0000;
   constexpr uint32_t kSensorTimestamp = 0x000e0010;
   CameraMetadataEntry timestamp{};
   if (!result.metadata || g_find_camera_metadata(result.metadata, kSensorTimestamp, &timestamp) != 0 ||
@@ -1244,8 +1258,26 @@ static void observe_capture_color(const CameraCaptureResult& result)
   memcpy(&color.timestamp, timestamp.data, sizeof(color.timestamp));
   if (color.timestamp <= 0)
     return;
-  color.logical = capture_color(result.metadata);
-  if (result.physical_count <= 4 && result.physical_ids && result.physical_metadata)
+  float ratio = 1.f, focal = 0.f;
+  std::array<int, 4> crop{};
+  CameraMetadataEntry entry{};
+  const auto read_value = [&](uint32_t tag, uint8_t type, size_t count, void* dest, size_t bytes) {
+    if (g_find_camera_metadata(result.metadata, tag, &entry) == 0 &&
+        entry.type == type && entry.count == count && entry.data)
+    {
+      memcpy(dest, entry.data, bytes);
+      return true;
+    }
+    return false;
+  };
+  const bool have_ratio = read_value(kZoomRatio, 2, 1, &ratio, sizeof(ratio));
+  const bool have_crop = read_value(kCropRegion, 1, 4, crop.data(), sizeof(crop));
+  if (have_crop)
+    read_value(kFocalLength, 2, 1, &focal, sizeof(focal));
+
+  if (photo)
+    color.logical = capture_color(result.metadata);
+  if (photo && result.physical_count <= 4 && result.physical_ids && result.physical_metadata)
     for (size_t index = 0; index < result.physical_count; ++index)
     {
       const char* id = result.physical_ids[index];
@@ -1254,11 +1286,44 @@ static void observe_capture_color(const CameraCaptureResult& result)
       else if (id && strcmp(id, "3") == 0)
         color.rear[1] = capture_color(result.physical_metadata[index]);
     }
-  if (!color.logical && !color.rear[0] && !color.rear[1])
+  const bool have_color = color.logical || color.rear[0] || color.rear[1];
+  if (!have_ratio && !have_crop && !have_color)
     return;
   std::lock_guard lock(g_capture_colors_mutex);
-  g_capture_colors[g_capture_color_next] = color;
-  g_capture_color_next = (g_capture_color_next + 1) % g_capture_colors.size();
+  if (have_ratio || have_crop)
+  {
+    g_capture_zooms[g_capture_zoom_next] = {
+        color.timestamp, cr::camhook::capture_zoom_q10(ratio, focal, crop)};
+    g_capture_zoom_next = (g_capture_zoom_next + 1) % g_capture_zooms.size();
+  }
+  if (have_color)
+  {
+    g_capture_colors[g_capture_color_next] = color;
+    g_capture_color_next = (g_capture_color_next + 1) % g_capture_colors.size();
+  }
+}
+
+static unsigned zoom_for_capture(int64_t timestamp)
+{
+  if (g_return_sensor_timestamp > 0)
+    timestamp = g_return_sensor_timestamp;
+  if (timestamp <= 0)
+    return CR_NV21_ZOOM_ONE;
+  std::lock_guard lock(g_capture_colors_mutex);
+  unsigned zoom = CR_NV21_ZOOM_ONE;
+  int64_t distance = 130'000'001;
+  for (const auto& setting : g_capture_zooms)
+  {
+    if (setting.timestamp <= 0 || setting.timestamp > timestamp)
+      continue;
+    const int64_t age = timestamp - setting.timestamp;
+    if (age < distance)
+    {
+      zoom = setting.zoom;
+      distance = age;
+    }
+  }
+  return zoom;
 }
 
 static void proxy_camera_result(void* states, const CameraCaptureResult* result)
@@ -1267,8 +1332,12 @@ static void proxy_camera_result(void* states, const CameraCaptureResult* result)
       __atomic_load_n(&g_orig_camera_result, __ATOMIC_ACQUIRE));
   if (!original)
     return;
-  if (result && g_find_camera_metadata && access("/data/cr/photo_mode", R_OK) == 0)
-    observe_capture_color(*result);
+  if (result && result->metadata && g_find_camera_metadata)
+  {
+    const bool photo = access("/data/cr/photo_mode", R_OK) == 0;
+    if (photo || access("/data/cr/video_mode", R_OK) == 0)
+      observe_capture_settings(*result, photo);
+  }
   original(states, result);
 }
 
@@ -1404,6 +1473,8 @@ static std::shared_ptr<Raw10Frame> render_raw10(size_t profile, PinnedSlot& sour
   result->pixels.reset(new uint8_t[size]);
   result->generation = source.generation;
   result->sequence = source.frame_seq;
+  // Pixel Camera crops the developed RAW image using its capture settings.
+  // Keep the full sensor field here so the saved photo is cropped only once.
   if (!cr::camhook::nv21_to_bggr10(input, source.width, source.height,
                                   {result->pixels.get(), size}, width, height,
                                   color, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
@@ -1709,7 +1780,8 @@ static CameraModes read_camera_modes(bool photo_supported)
 }
 
 static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
-                                                       CameraModes modes, bool deferred)
+                                                       CameraModes modes, bool deferred,
+                                                       int64_t timestamp = 0)
 {
   ANWBInfo bi;
   if (!inspect_anwb(anb, bi))
@@ -1838,7 +1910,8 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
   cr_nv21_crop_rect crop;
-  if (!cr_nv21_center_crop(source.width, source.height, W, H, &crop) ||
+  const unsigned zoom = zoom_for_capture(timestamp);
+  if (!cr_nv21_zoom_crop(source.width, source.height, W, H, zoom, &crop) ||
       access("/data/cr/video_mode", R_OK) != 0 ||
       atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
           CR_CHANNEL_STATE_READY)
@@ -1850,11 +1923,11 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
   if (view.vu)
     blit_adaptive(source.data, (int) source.width, (int) source.height,
                   view.y, view.vu, W, H, (int) view.ystride,
-                  (int) view.uvstride, view.uv_swapped ? 1 : 0);
+                  (int) view.uvstride, view.uv_swapped ? 1 : 0, zoom);
   else
-    cr_nv21_blit_planar(source.data, (int) source.width, (int) source.height,
-                        view.y, view.cb, view.cr, W, H,
-                        (int) view.ystride, (int) view.uvstride);
+    cr_nv21_blit_planar_zoom(source.data, (int) source.width, (int) source.height,
+                             view.y, view.cb, view.cr, W, H,
+                             (int) view.ystride, (int) view.uvstride, zoom);
 
   source.release_read();
   const bool replaced = unlock(handle, ahb, view);
@@ -1985,7 +2058,7 @@ static std::int32_t proxy_preview_spacer(void* thiz, std::int64_t timestamp,
 {
   const auto modes = read_camera_modes(false);
   const auto status = cr::camhook::dispatch_queue(
-      g_preview_counters, modes.active(), [=] { return overwrite_nv21(anb, fence, modes, true); },
+      g_preview_counters, modes.active(), [=] { return overwrite_nv21(anb, fence, modes, true, timestamp); },
       reinterpret_cast<preview_spacer_t>(__atomic_load_n(&g_orig_preview_spacer, __ATOMIC_ACQUIRE)),
       thiz, timestamp, readout_timestamp, transform, anb, fence);
   // A successful return acknowledges the spacer's pending queue. Its worker

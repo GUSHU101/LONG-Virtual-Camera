@@ -14,6 +14,10 @@ static int crop_contract(void)
   if (crop.x != 0 || crop.y != 656 || crop.width != 1080 || crop.height != 606)
     return 4;
   if (cr_nv21_center_crop(1919, 1080, 640, 480, &crop)) return 5;
+  if (!cr_nv21_zoom_crop(1920, 1080, 640, 480, 1434, &crop)) return 6;
+  if (crop.x != 446 || crop.y != 154 || crop.width != 1028 || crop.height != 770)
+    return 7;
+  if (cr_nv21_zoom_crop(2, 2, 2, 2, 1434, &crop)) return 8;
   return 0;
 }
 
@@ -111,7 +115,7 @@ static uint8_t reference_sample(const uint8_t* src, int stride, int channels,
   return (uint8_t) reference_blend(a, b, sy);
 }
 
-static int exact_scaling(int sw, int sh, int dw, int dh)
+static int exact_scaling(int sw, int sh, int dw, int dh, unsigned zoom)
 {
   const int y_stride = dw + 5;
   const int uv_stride = dw + 7;
@@ -126,7 +130,7 @@ static int exact_scaling(int sw, int sh, int dw, int dh)
   for (size_t i = 0; i < src_bytes; ++i)
     source[i] = (uint8_t) (i * 97u + (i >> 4));
   cr_nv21_crop_rect crop;
-  if (!cr_nv21_center_crop(sw, sh, dw, dh, &crop))
+  if (!cr_nv21_zoom_crop(sw, sh, dw, dh, zoom, &crop))
     goto done;
   const uint8_t* y_src = source + crop.y * sw + crop.x;
   const uint8_t* vu_src = source + sw * sh + crop.y / 2 * sw + crop.x;
@@ -136,9 +140,9 @@ static int exact_scaling(int sw, int sh, int dw, int dh)
   {
     memset(buffer, 0xee, y_bytes + uv_bytes * 2);
     if (format == 2)
-      cr_nv21_blit_planar(source, sw, sh, buffer, u, vu, dw, dh, y_stride, uv_stride);
+      cr_nv21_blit_planar_zoom(source, sw, sh, buffer, u, vu, dw, dh, y_stride, uv_stride, zoom);
     else
-      cr_nv21_blit(source, sw, sh, buffer, vu, dw, dh, y_stride, uv_stride, format);
+      cr_nv21_blit_zoom(source, sw, sh, buffer, vu, dw, dh, y_stride, uv_stride, format, zoom);
     for (int y = 0; y < dh; ++y)
       for (int x = 0; x < y_stride; ++x)
       {
@@ -182,9 +186,12 @@ int main(void)
   if (crop) return crop;
   const int basic = blit_contract();
   if (basic) return basic;
-  if (exact_scaling(40, 24, 110, 82) || exact_scaling(70, 110, 26, 32) ||
-      exact_scaling(40, 24, 24, 24) || exact_scaling(2, 2, 34, 34) ||
-      exact_scaling(10, 6, 2, 2))
+  if (exact_scaling(40, 24, 110, 82, CR_NV21_ZOOM_ONE) ||
+      exact_scaling(70, 110, 26, 32, CR_NV21_ZOOM_ONE) ||
+      exact_scaling(40, 24, 24, 24, CR_NV21_ZOOM_ONE) ||
+      exact_scaling(2, 2, 34, 34, CR_NV21_ZOOM_ONE) ||
+      exact_scaling(10, 6, 2, 2, CR_NV21_ZOOM_ONE) ||
+      exact_scaling(40, 24, 40, 24, 1434))
     return 30;
   return 0;
 }

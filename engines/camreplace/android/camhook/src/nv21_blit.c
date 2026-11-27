@@ -30,6 +30,24 @@ int cr_nv21_center_crop(int src_w, int src_h, int dst_w, int dst_h,
   return 1;
 }
 
+int cr_nv21_zoom_crop(int src_w, int src_h, int dst_w, int dst_h,
+                        unsigned zoom_q10, cr_nv21_crop_rect* out)
+{
+  if (!cr_nv21_center_crop(src_w, src_h, dst_w, dst_h, out))
+    return 0;
+  if (zoom_q10 <= CR_NV21_ZOOM_ONE)
+    return 1;
+  const int w = (int) ((uint64_t) out->width * CR_NV21_ZOOM_ONE / zoom_q10) & ~1;
+  const int h = (int) ((uint64_t) out->height * CR_NV21_ZOOM_ONE / zoom_q10) & ~1;
+  if (w < 2 || h < 2)
+    return 0;
+  out->x += ((out->width - w) / 2) & ~1;
+  out->y += ((out->height - h) / 2) & ~1;
+  out->width = w;
+  out->height = h;
+  return 1;
+}
+
 static inline uint8_t blend(uint8_t a, uint8_t b, uint32_t fx_q16)
 {
   // fx in [0,65535], blend = a + (b-a)*fx>>16.
@@ -288,7 +306,8 @@ static void scale_bilinear(const uint8_t* src, int src_w, int src_h,
 
 static void blit_nv21(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
                       uint8_t* dst_chroma, uint8_t* dst_u, int dst_w, int dst_h,
-                      int dst_y_stride, int dst_uv_stride, OutputOrder order)
+                      int dst_y_stride, int dst_uv_stride, OutputOrder order,
+                      unsigned zoom_q10)
 {
   if (!src || !dst_y || !dst_chroma || (order == SplitPairs && !dst_u) ||
       src_w > 8192 || src_h > 8192 || dst_w > CR_BLIT_MAX_DST_W || dst_h > 8192 ||
@@ -297,7 +316,7 @@ static void blit_nv21(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
       (uint64_t) dst_w * (uint64_t) dst_h > 32ull * 1024ull * 1024ull)
     return;
   cr_nv21_crop_rect crop;
-  if (!cr_nv21_center_crop(src_w, src_h, dst_w, dst_h, &crop))
+  if (!cr_nv21_zoom_crop(src_w, src_h, dst_w, dst_h, zoom_q10, &crop))
     return;
 
   const uint8_t* src_y = src + (size_t) crop.y * src_w + crop.x;
@@ -345,14 +364,32 @@ void cr_nv21_blit(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y,
                   uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride,
                   int dst_uv_stride, int dst_uv_swapped)
 {
+  cr_nv21_blit_zoom(src, src_w, src_h, dst_y, dst_vu, dst_w, dst_h,
+                   dst_y_stride, dst_uv_stride, dst_uv_swapped, CR_NV21_ZOOM_ONE);
+}
+
+void cr_nv21_blit_zoom(const uint8_t* src, int src_w, int src_h,
+                       uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h,
+                       int dst_y_stride, int dst_uv_stride, int dst_uv_swapped,
+                       unsigned zoom_q10)
+{
   blit_nv21(src, src_w, src_h, dst_y, dst_vu, NULL, dst_w, dst_h,
-            dst_y_stride, dst_uv_stride, dst_uv_swapped ? SwapPairs : CopyOrder);
+            dst_y_stride, dst_uv_stride, dst_uv_swapped ? SwapPairs : CopyOrder, zoom_q10);
 }
 
 void cr_nv21_blit_planar(const uint8_t* src, int src_w, int src_h,
                          uint8_t* dst_y, uint8_t* dst_u, uint8_t* dst_v,
                          int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride)
 {
+  cr_nv21_blit_planar_zoom(src, src_w, src_h, dst_y, dst_u, dst_v, dst_w, dst_h,
+                          dst_y_stride, dst_uv_stride, CR_NV21_ZOOM_ONE);
+}
+
+void cr_nv21_blit_planar_zoom(const uint8_t* src, int src_w, int src_h,
+                              uint8_t* dst_y, uint8_t* dst_u, uint8_t* dst_v,
+                              int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride,
+                              unsigned zoom_q10)
+{
   blit_nv21(src, src_w, src_h, dst_y, dst_v, dst_u, dst_w, dst_h,
-            dst_y_stride, dst_uv_stride, SplitPairs);
+            dst_y_stride, dst_uv_stride, SplitPairs, zoom_q10);
 }

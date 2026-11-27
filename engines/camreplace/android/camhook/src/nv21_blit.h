@@ -12,6 +12,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define CR_NV21_ZOOM_ONE 1024u
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -30,6 +32,8 @@ extern "C"
   // Coordinates and dimensions are even to stay aligned to 4:2:0 chroma.
   int cr_nv21_center_crop(int src_w, int src_h, int dst_w, int dst_h,
                           cr_nv21_crop_rect* out);
+  int cr_nv21_zoom_crop(int src_w, int src_h, int dst_w, int dst_h,
+                        unsigned zoom_q10, cr_nv21_crop_rect* out);
 
   // Source: contiguous Y plane at src + then interleaved VU at src + src_w*src_h
   // (i.e. NV21: V byte first in each chroma pair).
@@ -44,12 +48,20 @@ extern "C"
   // says 0x11 (HAL_PIXEL_FORMAT_YCRCB_420_SP). Without the swap, red objects
   // turn grey/blue — see the bug we hit on 2026-04-22.
   void cr_nv21_blit(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped);
+  void cr_nv21_blit_zoom(const uint8_t* src, int src_w, int src_h,
+                        uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h,
+                        int dst_y_stride, int dst_uv_stride, int dst_uv_swapped,
+                        unsigned zoom_q10);
 
   // Three-plane YUV420 destination with a one-byte chroma pixel stride.
   // The U and V planes each have dst_w/2 samples per row.
   void cr_nv21_blit_planar(const uint8_t* src, int src_w, int src_h,
                            uint8_t* dst_y, uint8_t* dst_u, uint8_t* dst_v,
                            int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride);
+  void cr_nv21_blit_planar_zoom(const uint8_t* src, int src_w, int src_h,
+                               uint8_t* dst_y, uint8_t* dst_u, uint8_t* dst_v,
+                               int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride,
+                               unsigned zoom_q10);
 
   // Sprint E: Lanczos2 alternative. Same signature as cr_nv21_blit, lives
   // in nv21_blit_lanczos.c. Sharper edges on big up-scales at the cost of
@@ -57,6 +69,10 @@ extern "C"
   // follow-up). hook_main.cpp picks one based on the CR_BLIT_SCALER env
   // var (default = bilinear).
   void cr_nv21_blit_lanczos(const uint8_t* src, int src_w, int src_h, uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h, int dst_y_stride, int dst_uv_stride, int dst_uv_swapped);
+  void cr_nv21_blit_lanczos_zoom(const uint8_t* src, int src_w, int src_h,
+                                uint8_t* dst_y, uint8_t* dst_vu, int dst_w, int dst_h,
+                                int dst_y_stride, int dst_uv_stride, int dst_uv_swapped,
+                                unsigned zoom_q10);
 
 #ifdef __cplusplus
 }
