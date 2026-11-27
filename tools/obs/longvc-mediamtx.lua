@@ -65,6 +65,7 @@ local LOOPBACK_IP = "127.0.0.1"
 local LOOPBACK_ADDRESS = 0x0100007f
 local LAN_READER_NETWORKS = "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 local TIMER_MS = 250
+local ENDPOINT_RECHECK_MS = 500
 local STARTUP_MS = 7000
 local HEALTHY_MS = 30000
 local PORT_RECHECK_MS = 2000
@@ -74,11 +75,14 @@ local PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000d
 local CREATE_HIDDEN_WITH_ATTRIBUTES = 0x08080400 -- NO_WINDOW | STARTUPINFOEX | UNICODE_ENVIRONMENT
 
 local settings_now
+local applied_settings
 local desired
 local child
 local retry_at = 0
 local retries = 0
 local waiting_for_port = false
+local next_endpoint_check = 0
+local follow_warning
 
 local function info(message)
     obs.script_log(obs.LOG_INFO, message)
@@ -205,17 +209,20 @@ local function obs_endpoint()
     return {port = port, path = path, host = host, address = address}
 end
 
-local function prepare(spec)
-    local endpoint = {
-        port = spec.port,
-        path = spec.path == "" and DEFAULT_PATH or spec.path,
-        host = LOOPBACK_IP,
-        address = LOOPBACK_ADDRESS,
-    }
-    if spec.follow_obs then
-        local reason
-        endpoint, reason = obs_endpoint()
-        if not endpoint then return nil, reason end
+local function prepare(spec, endpoint)
+    if not endpoint then
+        if spec.follow_obs then
+            local reason
+            endpoint, reason = obs_endpoint()
+            if not endpoint then return nil, reason end
+        else
+            endpoint = {
+                port = spec.port,
+                path = spec.path == "" and DEFAULT_PATH or spec.path,
+                host = LOOPBACK_IP,
+                address = LOOPBACK_ADDRESS,
+            }
+        end
     end
     if not valid_port(endpoint.port) then return nil, "RTMP 端口应为 1024 至 65535。" end
     if not valid_path(endpoint.path) then
@@ -360,6 +367,51 @@ local function stop()
     end
 end
 
+local function replace_relay(next_relay)
+    desired, retry_at, retries = next_relay, 0, 0
+    waiting_for_port = false
+    follow_warning = nil
+    stop()
+end
+
+local function matches_endpoint(relay, endpoint)
+    return relay.port == endpoint.port and relay.path == endpoint.path
+        and relay.publisher_ip == endpoint.host
+end
+
+local function report_follow_warning(message)
+    if follow_warning ~= message then
+        follow_warning = message
+        warn(message)
+    end
+end
+
+local function sync_endpoint(now)
+    if not desired or not applied_settings or not settings_now.follow_obs or now < next_endpoint_check then
+        return
+    end
+    next_endpoint_check = now + ENDPOINT_RECHECK_MS
+    if obs.obs_frontend_streaming_active() then return end
+
+    local endpoint, reason = obs_endpoint()
+    if not endpoint then report_follow_warning(reason); return end
+    if matches_endpoint(desired, endpoint) then
+        follow_warning = nil
+        return
+    end
+    if endpoint.port ~= desired.port and listening(endpoint.port) ~= false then
+        report_follow_warning("OBS 的新推流端口不可用，当前中继继续运行。")
+        return
+    end
+    -- Follow the OBS service independently of unapplied executable or LAN
+    -- settings. A stopped relay stays stopped and a live stream is left alone.
+    local next_relay
+    next_relay, reason = prepare(applied_settings, endpoint)
+    if not next_relay then report_follow_warning(reason); return end
+    info("检测到 OBS 本机推流地址变更，正在同步中继设置。")
+    replace_relay(next_relay)
+end
+
 local function schedule_restart(now)
     if not desired or retries >= MAX_RESTARTS then return false end
     retries = retries + 1
@@ -370,6 +422,7 @@ end
 
 local function tick()
     local now = tonumber(win.GetTickCount64())
+    sync_endpoint(now)
     if child then
         local current = win.WaitForSingleObject(child.process, 0)
         if current == 0 or current == 0xffffffff then
@@ -425,6 +478,7 @@ local function apply_settings()
         if active.command == next_relay.command and active.port == next_relay.port
             and active.path == next_relay.path and active.lan_readers == next_relay.lan_readers
             and active.publisher_ip == next_relay.publisher_ip then
+            applied_settings = settings_now
             info("中继已使用这套设置。")
             return false
         end
@@ -437,9 +491,8 @@ local function apply_settings()
             return false
         end
     end
-    desired, retry_at, retries = next_relay, 0, 0
-    waiting_for_port = false
-    stop()
+    applied_settings = settings_now
+    replace_relay(next_relay)
     return false
 end
 
@@ -458,8 +511,7 @@ local function report_status()
         info("中继正在监听 TCP " .. active.port .. "（" .. access .. "）。")
         if not endpoint then
             warn(reason)
-        elseif endpoint.port ~= active.port or endpoint.path ~= active.path
-            or endpoint.host ~= active.publisher_ip then
+        elseif not matches_endpoint(active, endpoint) then
             warn("OBS 的直播地址、端口或流路径与运行中的中继不同。")
         end
     elseif waiting_for_port and desired then
@@ -552,6 +604,7 @@ function script_unload()
     if not supported then return end
     obs.timer_remove(tick)
     desired = nil
+    applied_settings = nil
     stop()
     if child then
         win.CloseHandle(child.process)

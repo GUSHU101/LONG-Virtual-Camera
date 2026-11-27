@@ -6,7 +6,7 @@
 
 1. 下载本目录的 [longvc-mediamtx.lua](longvc-mediamtx.lua) 和 [mediamtx-obs.yml](mediamtx-obs.yml)，放到同一目录。
 2. 在 OBS「工具 → 脚本」点「+」，选择 `longvc-mediamtx.lua`。在脚本里选择已经解压的 `mediamtx.exe`，或把该程序放在脚本旁边。 [OBS 脚本](https://docs.obsproject.com/scripting) · [MediaMTX 安装](https://mediamtx.org/docs/kickoff/install)
-3. OBS「设置 → 直播」选择「自定义」，服务器可用 `rtmp://127.0.0.1:1935/longvc`，推流码留空，关闭身份验证，视频选择 H.264。已有本机 RTMP 地址时，在脚本勾选「沿用 OBS 本机推流地址」。脚本在启动和应用设置时识别回环地址或本机网卡的局域网 IPv4，并读取端口与流路径。也可手动填写端口和流路径，OBS 推流到 `127.0.0.1`。 [OBS 发布设置](https://mediamtx.org/docs/publish/obs-studio)
+3. OBS「设置 → 直播」选择「自定义」，服务器可用 `rtmp://127.0.0.1:1935/longvc`，推流码留空，关闭身份验证，视频选择 H.264。已有本机 RTMP 地址时，在脚本勾选「沿用 OBS 本机推流地址」。脚本识别回环地址或本机网卡的局域网 IPv4，并读取端口与流路径。停流时更改 OBS 服务器后，中继会同步到新地址，等日志显示就绪后开始推流。也可手动填写端口和流路径，OBS 推流到 `127.0.0.1`。 [OBS 发布设置](https://mediamtx.org/docs/publish/obs-studio)
 4. 点击「启动 / 应用中继设置」，在「脚本日志」确认“中继已就绪”。如果已有中继占用端口，脚本会等待。停流并退出旧实例后，脚本会接手该端口。确认中继就绪后开始推流。
 
 「随 OBS 自动启动中继」默认开启。OBS 会为当前场景集合加载脚本，并在退出或卸载脚本时关闭它创建的中继。子进程启动成功后异常退出时，脚本会尝试重启。相同设置可重复应用，变更运行中的中继设置需要先停止 OBS 推流。
