@@ -58,15 +58,40 @@ inline bool nv21_to_bggr10(std::span<const uint8_t> nv21, int sw, int sh,
     return table;
   }();
   const auto yuv = cr_yuv_coefficients_for(bt709, full_range);
-  const auto sample = [&](int y, int u, int v, const Raw10Color::Matrix& matrix, int row) {
-    const int scaled_y = yuv.y_scale * (y - yuv.y_offset);
-    const auto decode = [&](int offset) {
-      return linear[std::clamp((scaled_y + offset + 128) >> 8, 0, 255)];
-    };
-    const auto* coefficients = matrix.data() + 3 * row;
-    const int sensor = coefficients[0] * decode(yuv.red_v * v) +
-                       coefficients[1] * decode(-yuv.green_u * u - yuv.green_v * v) +
-                       coefficients[2] * decode(yuv.blue_u * u);
+  struct ChromaOffsets
+  {
+    int red, green_v, green_u, blue;
+  };
+  using LinearContributions = std::array<std::array<int32_t, 256>, 3>;
+  std::array<std::array<LinearContributions, 2>, 2> contributions;
+  std::array<int, 256> luma_scaled;
+  std::array<ChromaOffsets, 256> chroma;
+  // Factor the repeated YUV and sensor coefficient multiplications into
+  // byte-sized lookups. Keep the range, rounding and Bayer phases identical.
+  for (int i = 0; i < 256; ++i)
+  {
+    const int delta = i - 128;
+    luma_scaled[i] = yuv.y_scale * (i - yuv.y_offset) + 128;
+    chroma[i] = {yuv.red_v * delta, -yuv.green_v * delta,
+                 -yuv.green_u * delta, yuv.blue_u * delta};
+  }
+  for (int phase = 0; phase < 2; ++phase)
+  {
+    const auto& matrix = phase ? color.odd : color.even;
+    for (int column = 0; column < 2; ++column)
+    {
+      const int row = 2 - phase - column;
+      for (int channel = 0; channel < 3; ++channel)
+        for (int i = 0; i < 256; ++i)
+          contributions[phase][column][channel][i] = matrix[3 * row + channel] * linear[i];
+    }
+  }
+  const auto sample = [&](int y, int u, int v, const LinearContributions& lookup) {
+    const int scaled_y = luma_scaled[y];
+    const auto red = std::clamp((scaled_y + chroma[v].red) >> 8, 0, 255);
+    const auto green = std::clamp((scaled_y + chroma[u].green_u + chroma[v].green_v) >> 8, 0, 255);
+    const auto blue = std::clamp((scaled_y + chroma[u].blue) >> 8, 0, 255);
+    const int sensor = lookup[0][red] + lookup[1][green] + lookup[2][blue];
     return 64u + static_cast<unsigned>(std::clamp((sensor + Raw10Color::scale / 2) >> 12, 0, 959));
   };
   // Sample luma at each sensor pixel center. Repeating an entire source
@@ -85,7 +110,7 @@ inline bool nv21_to_bggr10(std::span<const uint8_t> nv21, int sw, int sh,
     previous_row[phase] = sy;
     const uint8_t* luma_row = nv21.data() + static_cast<size_t>(sy) * sw;
     const uint8_t* vu = nv21.data() + luma + static_cast<size_t>(sy / 2) * sw;
-    const auto& matrix = phase ? color.odd : color.even;
+    const auto& row_contributions = contributions[phase];
     std::array<int, 2> previous_column{-1, -1};
     std::array<unsigned, 2> previous_sample{};
     const auto pixel = [&](int x, int column_phase) {
@@ -94,8 +119,7 @@ inline bool nv21_to_bggr10(std::span<const uint8_t> nv21, int sw, int sh,
       {
         const int cx = sx & ~1;
         previous_sample[column_phase] =
-            sample(luma_row[sx], vu[cx + 1] - 128, vu[cx] - 128,
-                   matrix, 2 - phase - column_phase);
+            sample(luma_row[sx], vu[cx + 1], vu[cx], row_contributions[column_phase]);
         previous_column[column_phase] = sx;
       }
       return previous_sample[column_phase];

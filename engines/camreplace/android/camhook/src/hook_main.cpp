@@ -1443,15 +1443,17 @@ static bool install_camera_color_hooks()
 struct Raw10Frame
 {
   std::unique_ptr<uint8_t[]> pixels;
+  cr::camhook::Raw10Color color;
   uint32_t generation = 0;
   uint64_t sequence = 0;
-  int64_t prepared = 0;
+  int64_t sampled = 0;
 };
 
 static std::shared_ptr<Raw10Frame> render_raw10(size_t profile, PinnedSlot& source,
                                                const cr::camhook::Raw10Color& color,
                                                std::vector<uint8_t>& input)
 {
+  const int64_t sampled = monotonic_ns();
   const auto [width, height, stride] = kPixel5RawLayouts[profile];
   const size_t input_bytes =
       static_cast<size_t>(source.width) * source.height * 3 / 2;
@@ -1460,8 +1462,10 @@ static std::shared_ptr<Raw10Frame> render_raw10(size_t profile, PinnedSlot& sour
   const size_t size = static_cast<size_t>(width / 4) * 5 * height;
   auto result = std::make_shared<Raw10Frame>();
   result->pixels.reset(new uint8_t[size]);
+  result->color = color;
   result->generation = source.generation;
   result->sequence = source.frame_seq;
+  result->sampled = sampled;
   // Pixel Camera crops the developed RAW image using its capture settings.
   // Keep the full sensor field here so the saved photo is cropped only once.
   if (!cr::camhook::nv21_to_bggr10(input, source.width, source.height,
@@ -1469,7 +1473,6 @@ static std::shared_ptr<Raw10Frame> render_raw10(size_t profile, PinnedSlot& sour
                                   color, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
                                   (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0))
     return {};
-  result->prepared = monotonic_ns();
   return result;
 }
 
@@ -1523,15 +1526,15 @@ public:
     const auto now = monotonic_ns();
     constexpr int64_t kMaxRawAgeNs = 750'000'000LL;
     if (slot.stream == stream && slot.frame && slot.frame->generation == source.generation &&
-        now - slot.frame->prepared <= kMaxRawAgeNs)
+        now - slot.frame->sampled <= kMaxRawAgeNs &&
+        cr::camhook::raw10_color_compatible(slot.frame->color, color))
     {
       constexpr int64_t kRefreshNs = 250'000'000LL;
-      if ((slot.sequence != source.frame_seq || slot.color != color) &&
-          now - slot.requested >= kRefreshNs)
+      if (!slot.pending && !slot.rendering && now - slot.requested >= kRefreshNs &&
+          (slot.frame->sequence != source.frame_seq || slot.frame->color != color))
       {
         if (!worker_.joinable())
           worker_ = std::thread(&Raw10Cache::run, this);
-        slot.sequence = source.frame_seq;
         slot.color = color;
         slot.requested = now;
         slot.pending = true;
@@ -1548,33 +1551,45 @@ public:
     const uint64_t revision = ++revision_;
     slot.revision = revision;
     slot.generation = source.generation;
-    slot.sequence = source.frame_seq;
-    slot.color = color;
     slot.requested = now;
+    slot.rendering = true;
     lock.unlock();
-    std::vector<uint8_t> input;
-    auto frame = render_raw10(profile, source, color, input);
-    if (frame)
+    std::shared_ptr<Raw10Frame> frame;
+    try
     {
-      publish(profile, revision, frame);
+      std::vector<uint8_t> input;
+      frame = render_raw10(profile, source, color, input);
+    }
+    catch (const std::exception&)
+    {
+      finish(profile, revision, {});
+      throw;
+    }
+    if (finish(profile, revision, frame))
+    {
       const auto miss = ++cold_preparations_;
       if (miss <= 8 || miss % 60 == 0)
         LOGI("camera RAW10: prepared first buffer after pause (profile=%zu, %lld ms, total=%u)",
              profile, static_cast<long long>((monotonic_ns() - now) / 1'000'000), miss);
+      return frame;
     }
-    return frame;
+    return {};
   }
 
 private:
-  void publish(size_t profile, uint64_t revision,
-               const std::shared_ptr<Raw10Frame>& frame)
+  bool finish(size_t profile, uint64_t revision,
+              const std::shared_ptr<Raw10Frame>& frame)
   {
     std::lock_guard lock(mutex_);
     auto& slot = slots_[profile];
-    if (enabled_ && slot.revision == revision && slot.generation == frame->generation &&
-        (!slot.frame || slot.frame->generation != frame->generation ||
-         slot.frame->sequence <= frame->sequence))
-      slot.frame = frame;
+    if (!enabled_ || slot.revision != revision)
+      return false;
+    slot.rendering = false;
+    if (!frame || slot.generation != frame->generation ||
+        (slot.frame && slot.frame->sequence > frame->sequence))
+      return false;
+    slot.frame = frame;
+    return true;
   }
 
   struct Slot
@@ -1583,9 +1598,9 @@ private:
     const void* stream = nullptr;
     uint64_t revision = 0;
     uint32_t generation = 0;
-    uint64_t sequence = 0;
     int64_t requested = 0;
     bool pending = false;
+    bool rendering = false;
     cr::camhook::Raw10Color color;
   };
 
@@ -1610,26 +1625,27 @@ private:
         while (!slots_[profile].pending)
           profile = (profile + 1) % slots_.size();
         slots_[profile].pending = false;
+        slots_[profile].rendering = true;
         revision = slots_[profile].revision;
         generation = slots_[profile].generation;
         color = slots_[profile].color;
         next_ = (profile + 1) % slots_.size();
       }
+      std::shared_ptr<Raw10Frame> frame;
       try
       {
         PinnedSlot source;
-        if (access("/data/cr/photo_mode", R_OK) != 0 ||
-            !g_shm.pin_current(source) || source.generation != generation ||
-            atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
+        if (access("/data/cr/photo_mode", R_OK) == 0 &&
+            g_shm.pin_current(source) && source.generation == generation &&
+            atomic_load_explicit(&source.header->channel_state, memory_order_acquire) ==
                 CR_CHANNEL_STATE_READY)
-          continue;
-        if (auto result = render_raw10(profile, source, color, input))
-          publish(profile, revision, result);
+          frame = render_raw10(profile, source, color, input);
       }
       catch (const std::exception&)
       {
         // Continue serving the camera if memory is temporarily unavailable.
       }
+      finish(profile, revision, frame);
     }
   }
 
@@ -1768,6 +1784,68 @@ static CameraModes read_camera_modes(bool photo_supported)
           photo_supported && access("/data/cr/photo_mode", R_OK) == 0};
 }
 
+struct ScaledCameraFrame
+{
+  std::unique_ptr<uint8_t[]> pixels;
+  size_t capacity = 0;
+  uint32_t generation = 0;
+  uint64_t sequence = 0;
+  int width = 0;
+  int height = 0;
+  unsigned zoom = 0;
+};
+
+static std::mutex g_scaled_camera_mutex;
+static std::array<ScaledCameraFrame, 2> g_scaled_camera_frames;
+static size_t g_scaled_camera_next = 0;
+static uint64_t g_scaled_camera_hits = 0, g_scaled_camera_renders = 0;
+
+// The caller holds g_scaled_camera_mutex until it has copied the pixels.
+// A preview and analysis output can consume the same geometry at once.
+static const uint8_t* scaled_camera_frame(const PinnedSlot& source, int width, int height,
+                                          unsigned zoom)
+{
+  auto match = std::find_if(g_scaled_camera_frames.begin(), g_scaled_camera_frames.end(),
+      [=](const ScaledCameraFrame& item) {
+        return item.width == width && item.height == height && item.zoom == zoom;
+      });
+  auto& entry = match != g_scaled_camera_frames.end()
+                    ? *match : g_scaled_camera_frames[g_scaled_camera_next];
+  if (match == g_scaled_camera_frames.end())
+    g_scaled_camera_next = (g_scaled_camera_next + 1) % g_scaled_camera_frames.size();
+
+  if (match != g_scaled_camera_frames.end() && entry.generation == source.generation &&
+      entry.sequence == source.frame_seq)
+  {
+    const auto hits = ++g_scaled_camera_hits;
+    if (hits == 1 || hits % 300 == 0)
+      LOGI("camera UHD scale cache: reused=%llu rendered=%llu size=%dx%d",
+           static_cast<unsigned long long>(hits),
+           static_cast<unsigned long long>(g_scaled_camera_renders), width, height);
+    return entry.pixels.get();
+  }
+
+  const size_t luma = static_cast<size_t>(width) * height;
+  const size_t bytes = luma + luma / 2;
+  if (entry.capacity < bytes)
+  {
+    std::unique_ptr<uint8_t[]> pixels(new (std::nothrow) uint8_t[bytes]);
+    if (!pixels)
+      return nullptr;
+    entry.pixels = std::move(pixels);
+    entry.capacity = bytes;
+  }
+  cr_nv21_blit_zoom(source.data, source.width, source.height, entry.pixels.get(),
+                   entry.pixels.get() + luma, width, height, width, width, 0, zoom);
+  entry.width = width;
+  entry.height = height;
+  entry.zoom = zoom;
+  entry.generation = source.generation;
+  entry.sequence = source.frame_seq;
+  ++g_scaled_camera_renders;
+  return entry.pixels.get();
+}
+
 static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
                                                        CameraModes modes, bool deferred,
                                                        int64_t timestamp = 0)
@@ -1899,26 +1977,55 @@ static cr::camhook::ReplacementOutcome overwrite_nv21(ANWB* anb, int fence,
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
   cr_nv21_crop_rect crop;
-  const unsigned zoom = zoom_for_capture(timestamp);
-  if (!cr_nv21_zoom_crop(source.width, source.height, W, H, zoom, &crop) ||
-      access("/data/cr/video_mode", R_OK) != 0 ||
-      atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
-          CR_CHANNEL_STATE_READY)
+  unsigned zoom = zoom_for_capture(timestamp);
+  if (!cr_nv21_zoom_crop(source.width, source.height, W, H, zoom, &crop))
   {
     unlock(handle, ahb, view);
     return cr::camhook::ReplacementOutcome::PassThrough;
   }
 
+  const uint8_t* pixels = source.data;
+  int sw = source.width, sh = source.height;
+  std::unique_lock<std::mutex> scaled_guard(g_scaled_camera_mutex, std::defer_lock);
+  if (g_blit_fn == cr_nv21_blit && (int64_t) sw * sh > 2560LL * 1440LL &&
+      (int64_t) W * H <= 1920LL * 1080LL && (crop.width != W || crop.height != H))
+  {
+    scaled_guard.lock();
+    if (const auto* scaled = scaled_camera_frame(source, W, H, zoom))
+    {
+      pixels = scaled;
+      sw = W;
+      sh = H;
+      zoom = CR_NV21_ZOOM_ONE;
+      source.release_read();
+    }
+    else
+      scaled_guard.unlock();
+  }
+
+  if (access("/data/cr/video_mode", R_OK) != 0 ||
+      atomic_load_explicit(&source.header->channel_state, memory_order_acquire) !=
+          CR_CHANNEL_STATE_READY ||
+      atomic_load_explicit(&source.header->generation, memory_order_acquire) != source.generation)
+  {
+    if (scaled_guard.owns_lock())
+      scaled_guard.unlock();
+    unlock(handle, ahb, view);
+    return cr::camhook::ReplacementOutcome::PassThrough;
+  }
+
   if (view.vu)
-    blit_adaptive(source.data, (int) source.width, (int) source.height,
+    blit_adaptive(pixels, sw, sh,
                   view.y, view.vu, W, H, (int) view.ystride,
                   (int) view.uvstride, view.uv_swapped ? 1 : 0, zoom);
   else
-    cr_nv21_blit_planar_zoom(source.data, (int) source.width, (int) source.height,
+    cr_nv21_blit_planar_zoom(pixels, sw, sh,
                              view.y, view.cb, view.cr, W, H,
                              (int) view.ystride, (int) view.uvstride, zoom);
 
   source.release_read();
+  if (scaled_guard.owns_lock())
+    scaled_guard.unlock();
   const bool replaced = unlock(handle, ahb, view);
   if (replaced && !deferred)
     ++g_stat_blit_ok;

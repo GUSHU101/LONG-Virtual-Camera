@@ -72,6 +72,16 @@ int main()
   assert(std::abs(blue * 1.5 - green) <= 1.5);
   assert(std::abs(red_value * 2.0 - green) <= 1.0);
   const auto saved = calibrated;
+  auto nearby = calibrated;
+  nearby.even[2] += 40;
+  nearby.even[1] -= 40;
+  nearby.odd[6] += 128;
+  assert(cr::camhook::raw10_color_compatible(calibrated, nearby));
+  nearby.even[0] += 49;
+  assert(!cr::camhook::raw10_color_compatible(calibrated, nearby));
+  nearby.even = calibrated.even;
+  ++nearby.odd[6];
+  assert(!cr::camhook::raw10_color_compatible(calibrated, nearby));
   const std::array<float, 9> singular{};
   assert(!cr::camhook::invert_sensor_color(singular, {1.f, 1.f, 1.f, 1.f}, calibrated));
   assert(!cr::camhook::invert_sensor_color(identity, {0.f, 1.f, 1.f, 1.f}, calibrated));

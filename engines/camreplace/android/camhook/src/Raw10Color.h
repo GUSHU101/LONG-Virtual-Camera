@@ -20,6 +20,26 @@ struct Raw10Color
   bool operator==(const Raw10Color&) const = default;
 };
 
+inline bool raw10_color_compatible(const Raw10Color& rendered, const Raw10Color& requested)
+{
+  // Bound the error of each row for any linear RGB sample. Minor quantization
+  // noise can reuse a frame, while a meaningful white balance change cannot.
+  constexpr int32_t kMaxRowError = Raw10Color::scale / 32;
+  const auto within_budget = [](const Raw10Color::Matrix& a, const Raw10Color::Matrix& b) {
+    for (size_t row = 0; row < a.size(); row += 3)
+    {
+      const int64_t error = std::abs(static_cast<int64_t>(a[row]) - b[row]) +
+                            std::abs(static_cast<int64_t>(a[row + 1]) - b[row + 1]) +
+                            std::abs(static_cast<int64_t>(a[row + 2]) - b[row + 2]);
+      if (error > kMaxRowError)
+        return false;
+    }
+    return true;
+  };
+  return within_budget(rendered.even, requested.even) &&
+         within_budget(rendered.odd, requested.odd);
+}
+
 class Raw10StreamCalibration
 {
 public:

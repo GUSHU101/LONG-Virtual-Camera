@@ -363,6 +363,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   bool pipe_started = false;
   int pipe_w = 0, pipe_h = 0;
   bool seen_video_keyframe = false;
+  uint64_t waiting_for_keyframe = 0;
   cr_feed::H264DecodePipe pipe;
   auto decoder_idle_until = cr::feed::DeadlineSocket::Clock::time_point{};
 
@@ -769,7 +770,10 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
           }
           const bool is_key = (frame_type == 1);
           if (!is_key && !seen_video_keyframe)
+          {
+            ++waiting_for_keyframe;
             break;
+          }
           const auto prefix = is_key ? std::span<const uint8_t>(sps_pps_annexb)
                                      : std::span<const uint8_t>();
           if (!cr::media::avcc_access_unit_to_annexb(
@@ -799,8 +803,9 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
     }
   }
 done:
-  LOGI(OBF("rtmp: reader disconnected (input=%llu published=%llu audio=%s)").c_str(),
+  LOGI(OBF("rtmp: reader disconnected (input=%llu published=%llu waiting_idr=%llu audio=%s)").c_str(),
        (unsigned long long) pipe.input_count(), (unsigned long long) pipe.frames_published(),
+       static_cast<unsigned long long>(waiting_for_keyframe),
        audio_pipe_started ? "on" : OBF("off").c_str());
   const bool delivered_media =
       pipe.frames_published() != 0 || audio_pipe.pcm_blocks_published() != 0;
