@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <optional>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 namespace cr::camhook
 {
 
@@ -52,22 +56,23 @@ constexpr Coefficients coefficients(unsigned encoding) noexcept
 inline constexpr int kShift = 12;
 inline constexpr int kUnit = 1 << kShift;
 
-constexpr int fixed(double value) noexcept
+constexpr int16_t fixed(double value) noexcept
 {
   const double scaled = value * kUnit;
-  return static_cast<int>(scaled + (scaled < 0 ? -.5 : .5));
+  return static_cast<int16_t>(scaled + (scaled < 0 ? -.5 : .5));
 }
 
 struct ChromaDelta
 {
-  int y, u, v;
+  int16_t y, u, v;
 };
 
 struct Remap
 {
-  std::array<int, 256> luma{};
-  std::array<ChromaDelta, 256> blue{}, red{};
-  int y_min = 0, y_max = 255, chroma_min = 0, chroma_max = 255;
+  int16_t luma_scale = kUnit;
+  int luma_bias = 0;
+  ChromaDelta blue{}, red{};
+  uint8_t y_min = 0, y_max = 255, chroma_min = 0, chroma_max = 255;
 };
 
 constexpr Remap make_remap(unsigned input, unsigned output) noexcept
@@ -82,23 +87,20 @@ constexpr Remap make_remap(unsigned input, unsigned output) noexcept
   const double out_u_factor = b.chroma_span / (2. * (1. - b.b));
   const double out_v_factor = b.chroma_span / (2. * (1. - b.r));
   Remap result;
-  result.y_min = b.y_min;
-  result.y_max = b.y_min + static_cast<int>(b.y_span);
-  result.chroma_min = b.y_min;
+  result.luma_scale = fixed(b.y_span / a.y_span);
+  result.luma_bias = b.y_min * kUnit - a.y_min * result.luma_scale;
+  result.y_min = static_cast<uint8_t>(b.y_min);
+  result.y_max = static_cast<uint8_t>(b.y_min + b.y_span);
+  result.chroma_min = result.y_min;
   result.chroma_max = b.y_min == 0 ? 255 : 240;
-  for (int i = 0; i < 256; ++i)
-  {
-    const double chroma = (i - 128) / a.chroma_span;
-    result.luma[i] = fixed(b.y_min + (i - a.y_min) * b.y_span / a.y_span);
-    result.blue[i] = {
-        fixed(chroma * out_y_from_u * b.y_span),
-        fixed(chroma * (b_from_u - out_y_from_u) * out_u_factor),
-        fixed(-chroma * out_y_from_u * out_v_factor)};
-    result.red[i] = {
-        fixed(chroma * out_y_from_v * b.y_span),
-        fixed(-chroma * out_y_from_v * out_u_factor),
-        fixed(chroma * (r_from_v - out_y_from_v) * out_v_factor)};
-  }
+  result.blue = {
+      fixed(out_y_from_u * b.y_span / a.chroma_span),
+      fixed((b_from_u - out_y_from_u) * out_u_factor / a.chroma_span),
+      fixed(-out_y_from_u * out_v_factor / a.chroma_span)};
+  result.red = {
+      fixed(out_y_from_v * b.y_span / a.chroma_span),
+      fixed(-out_y_from_v * out_u_factor / a.chroma_span),
+      fixed((r_from_v - out_y_from_v) * out_v_factor / a.chroma_span)};
   return result;
 }
 
@@ -116,6 +118,52 @@ inline uint8_t pack(int value, int low, int high) noexcept
   return static_cast<uint8_t>(std::clamp((value + kUnit / 2) >> kShift, low, high));
 }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+inline uint8x8_t pack_vector(int32x4_t lo, int32x4_t hi, uint8_t low,
+                             uint8_t high) noexcept
+{
+  const auto narrowed = vcombine_u16(vqrshrun_n_s32(lo, kShift), vqrshrun_n_s32(hi, kShift));
+  return vmin_u8(vmax_u8(vqmovn_u16(narrowed), vdup_n_u8(low)), vdup_n_u8(high));
+}
+
+inline void remap_block(uint8_t* top, uint8_t* bottom, uint8_t* vu,
+                        const Remap& map) noexcept
+{
+  const auto chroma = vld2_u8(vu);
+  const auto center = vdupq_n_s16(128);
+  const auto v = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(chroma.val[0])), center);
+  const auto u = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(chroma.val[1])), center);
+  const auto mix_lo = [&](int16_t u_factor, int16_t v_factor, int32_t bias) {
+    return vmlal_n_s16(vmlal_n_s16(vdupq_n_s32(bias), vget_low_s16(u), u_factor),
+                      vget_low_s16(v), v_factor);
+  };
+  const auto mix_hi = [&](int16_t u_factor, int16_t v_factor, int32_t bias) {
+    return vmlal_high_n_s16(vmlal_high_n_s16(vdupq_n_s32(bias), u, u_factor), v, v_factor);
+  };
+  const auto dy_lo = mix_lo(map.blue.y, map.red.y, map.luma_bias);
+  const auto dy_hi = mix_hi(map.blue.y, map.red.y, map.luma_bias);
+  const auto luma = [&](uint8x8_t samples) {
+    const auto in = vreinterpretq_s16_u16(vmovl_u8(samples));
+    return pack_vector(vmlal_n_s16(dy_lo, vget_low_s16(in), map.luma_scale),
+                       vmlal_high_n_s16(dy_hi, in, map.luma_scale), map.y_min, map.y_max);
+  };
+  for (auto* row : {top, bottom})
+  {
+    const auto input = vld2_u8(row);
+    const uint8x8x2_t output{{luma(input.val[0]), luma(input.val[1])}};
+    vst2_u8(row, output);
+  }
+  const auto remap_chroma = [&](int16_t u_factor, int16_t v_factor) {
+    return pack_vector(mix_lo(u_factor, v_factor, 128 * kUnit),
+                       mix_hi(u_factor, v_factor, 128 * kUnit),
+                       map.chroma_min, map.chroma_max);
+  };
+  const uint8x8x2_t output{{remap_chroma(map.blue.v, map.red.v),
+                             remap_chroma(map.blue.u, map.red.u)}};
+  vst2_u8(vu, output);
+}
+#endif
+
 } // namespace yuv_color_detail
 
 // Transform a tightly packed NV21 frame to the consumer's SDR encoding.
@@ -132,17 +180,22 @@ inline void remap_nv21_color(uint8_t* image, int width, int height, YuvEncoding 
   {
     auto* top = image + static_cast<size_t>(y) * width;
     auto* bottom = top + width;
-    for (int x = 0; x < width; x += 2)
+    int x = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    for (; x <= width - 16; x += 16)
+      remap_block(top + x, bottom + x, vu + x, map);
+#endif
+    for (; x < width; x += 2)
     {
-      const auto v = map.red[vu[x]];
-      const auto u = map.blue[vu[x + 1]];
-      const int dy = v.y + u.y;
-      top[x] = pack(map.luma[top[x]] + dy, map.y_min, map.y_max);
-      top[x + 1] = pack(map.luma[top[x + 1]] + dy, map.y_min, map.y_max);
-      bottom[x] = pack(map.luma[bottom[x]] + dy, map.y_min, map.y_max);
-      bottom[x + 1] = pack(map.luma[bottom[x + 1]] + dy, map.y_min, map.y_max);
-      vu[x] = pack(128 * kUnit + v.v + u.v, map.chroma_min, map.chroma_max);
-      vu[x + 1] = pack(128 * kUnit + v.u + u.u, map.chroma_min, map.chroma_max);
+      const int v = vu[x] - 128;
+      const int u = vu[x + 1] - 128;
+      const int dy = map.luma_bias + map.red.y * v + map.blue.y * u;
+      top[x] = pack(map.luma_scale * top[x] + dy, map.y_min, map.y_max);
+      top[x + 1] = pack(map.luma_scale * top[x + 1] + dy, map.y_min, map.y_max);
+      bottom[x] = pack(map.luma_scale * bottom[x] + dy, map.y_min, map.y_max);
+      bottom[x + 1] = pack(map.luma_scale * bottom[x + 1] + dy, map.y_min, map.y_max);
+      vu[x] = pack(128 * kUnit + map.red.v * v + map.blue.v * u, map.chroma_min, map.chroma_max);
+      vu[x + 1] = pack(128 * kUnit + map.red.u * v + map.blue.u * u, map.chroma_min, map.chroma_max);
     }
     vu += width;
   }

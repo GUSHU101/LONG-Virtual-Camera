@@ -25,6 +25,32 @@ int main()
   for (size_t i = 0; i < sdr.size(); ++i)
     assert(std::abs(sdr[i] - original_sdr[i]) <= 1);
 
+  // A width with both full ARM blocks and a tail must match independently
+  // transforming each 2x2 cell through the scalar path.
+  constexpr int width = 34;
+  std::array<uint8_t, width * 3> varied{};
+  for (size_t i = 0; i < varied.size(); ++i)
+    varied[i] = static_cast<uint8_t>((i * 79 + i / 3) & 255);
+  for (unsigned input = 0; input < 4; ++input)
+    for (unsigned output = 0; output < 4; ++output)
+    {
+      const auto src = static_cast<YuvEncoding>(input);
+      const auto dst = static_cast<YuvEncoding>(output);
+      auto whole = varied;
+      cr::camhook::remap_nv21_color(whole.data(), width, 2, src, dst);
+      for (int x = 0; x < width; x += 2)
+      {
+        const std::array<int, 6> offsets{x, x + 1, width + x, width + x + 1,
+                                          2 * width + x, 2 * width + x + 1};
+        std::array<uint8_t, 6> cell{};
+        for (size_t i = 0; i < cell.size(); ++i)
+          cell[i] = varied[offsets[i]];
+        cr::camhook::remap_nv21_color(cell.data(), 2, 2, src, dst);
+        for (size_t i = 0; i < cell.size(); ++i)
+          assert(whole[offsets[i]] == cell[i]);
+      }
+    }
+
   assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {469, 353, 2342, 1758}) == 1434);
   assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {0, 2, 3280, 2460}) == CR_NV21_ZOOM_ONE);
   assert(cr::camhook::capture_zoom_q10(1.f, 2.57f, {0, 309, 3280, 1846}) == CR_NV21_ZOOM_ONE);
