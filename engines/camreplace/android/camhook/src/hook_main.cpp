@@ -1496,6 +1496,7 @@ struct Raw10Frame
   uint32_t generation = 0;
   uint64_t sequence = 0;
   int64_t sampled = 0;
+  int64_t render_time = 0;
 };
 
 static std::shared_ptr<Raw10Frame> render_raw10(size_t profile, PinnedSlot& source,
@@ -1522,6 +1523,7 @@ static std::shared_ptr<Raw10Frame> render_raw10(size_t profile, PinnedSlot& sour
                                   color, (source.color_flags & CR_FEED_COLOR_BT709) != 0,
                                   (source.color_flags & CR_FEED_COLOR_FULL_RANGE) != 0))
     return {};
+  result->render_time = monotonic_ns() - sampled;
   return result;
 }
 
@@ -1578,8 +1580,13 @@ public:
         now - slot.frame->sampled <= kMaxRawAgeNs &&
         cr::camhook::raw10_color_compatible(slot.frame->color, color))
     {
-      constexpr int64_t kRefreshNs = 250'000'000LL;
-      if (!slot.pending && !slot.rendering && now - slot.requested >= kRefreshNs &&
+      // Start the next render sooner when this profile is inexpensive.
+      // Include scheduler delay in the estimate so a busy camera service
+      // automatically returns to the previous refresh interval.
+      const int64_t refresh_ns = std::clamp<int64_t>(
+          slot.frame->render_time * 3, 125'000'000LL, 250'000'000LL);
+      if (!slot.pending && !slot.rendering &&
+          now - std::max(slot.requested, slot.frame->sampled) >= refresh_ns &&
           (slot.frame->sequence != source.frame_seq || slot.frame->color != color))
       {
         if (!worker_.joinable())
@@ -1822,8 +1829,11 @@ static bool overwrite_raw10(ANWB* anb, const ANWBInfo& bi, int fence)
     return false;
   const unsigned written = ++g_raw10_written;
   if (written <= 5 || written % 60 == 0)
-    LOGI("camera raw10: replaced %u buffers (%dx%d stride=%d)",
-         written, width, height, bi.stride);
+    LOGI("camera raw10: replaced %u buffers (%dx%d stride=%d cache_age=%lldms sequence_lag=%llu)",
+         written, width, height, bi.stride,
+         static_cast<long long>((monotonic_ns() - cache->sampled) / 1'000'000),
+         static_cast<unsigned long long>(source.frame_seq >= cache->sequence ?
+                                         source.frame_seq - cache->sequence : 0));
   return true;
 }
 

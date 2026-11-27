@@ -450,10 +450,12 @@ public:
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(dec, 0);
     while (in_idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER)
     {
-      // Releasing decoded output can free input capacity asynchronously.
-      // Give the codec short waits instead of discarding the rest of a GOP
-      // just because the first dequeue found it temporarily occupied.
-      drain();
+      // Releasing one decoded output can unlock an input slot. Recheck
+      // immediately, including when the copy consumed the wait budget.
+      drain(1);
+      in_idx = AMediaCodec_dequeueInputBuffer(dec, 0);
+      if (in_idx != AMEDIACODEC_INFO_TRY_AGAIN_LATER)
+        break;
       const auto remaining = std::chrono::duration_cast<Microseconds>(
           input_deadline - Clock::now());
       if (remaining <= Microseconds::zero())
@@ -504,11 +506,11 @@ public:
 
   // Drain decoder output without queueing new input. Useful for callers
   // that want to flush after a burst.
-  void drain()
+  void drain(size_t buffer_budget = SIZE_MAX)
   {
     if (!dec)
       return;
-    for (;;)
+    while (buffer_budget != 0)
     {
       AMediaCodecBufferInfo info;
       ssize_t out_idx = AMediaCodec_dequeueOutputBuffer(dec, &info, 0);
@@ -625,6 +627,7 @@ public:
         }
       }
       AMediaCodec_releaseOutputBuffer(dec, (size_t) out_idx, false);
+      --buffer_budget;
     }
   }
 

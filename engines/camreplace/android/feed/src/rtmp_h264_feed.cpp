@@ -788,14 +788,14 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
           }
           if (!annexb.empty())
           {
-            if (!pipe.push(annexb.data(), annexb.size(), pts_us))
+            const bool accepted = pipe.push(annexb.data(), annexb.size(), pts_us);
+            // The decoder can still have output from earlier accepted AUs
+            // if this one missed its input deadline.
+            decoder_idle_until = cr::feed::DeadlineSocket::Clock::now() + kDecoderIdleWindow;
+            if (!accepted)
               seen_video_keyframe = false;
-            else
-            {
-              decoder_idle_until = cr::feed::DeadlineSocket::Clock::now() + kDecoderIdleWindow;
-              if (is_key)
-                seen_video_keyframe = true;
-            }
+            else if (is_key)
+              seen_video_keyframe = true;
           }
         }
         break;
