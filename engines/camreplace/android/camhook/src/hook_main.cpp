@@ -1190,6 +1190,7 @@ struct CaptureColor
   int64_t timestamp = 0;
   std::optional<cr::camhook::Raw10Color> logical;
   std::array<std::optional<cr::camhook::Raw10Color>, 2> rear;
+  std::optional<cr::camhook::Raw10Color> wide_sensor;
 };
 static std::mutex g_capture_colors_mutex;
 static std::array<CaptureColor, 64> g_capture_colors;
@@ -1206,6 +1207,25 @@ static thread_local const void* g_return_camera_stream = nullptr;
 
 static cr::camhook::Raw10StreamCalibration g_stream_colors;
 static std::atomic<unsigned> g_raw10_reused_color{0};
+static std::atomic<unsigned> g_raw10_wide_sensor_color{0};
+
+static std::optional<cr::camhook::Raw10Color> read_wide_sensor_color(const void* metadata)
+{
+  constexpr uint32_t kNeutralColorPoint = 0x000e0012;
+  CameraMetadataEntry entry{};
+  if (!metadata || g_find_camera_metadata(metadata, kNeutralColorPoint, &entry) != 0 ||
+      entry.type != 5 || entry.count != 3 || !entry.data)
+    return {};
+  const auto* points = static_cast<const MetadataRational*>(entry.data);
+  std::array<float, 3> neutral{};
+  for (size_t index = 0; index < neutral.size(); ++index)
+  {
+    if (points[index].denominator <= 0)
+      return {};
+    neutral[index] = static_cast<float>(points[index].numerator) / points[index].denominator;
+  }
+  return cr::camhook::pixel5_wide_raw_color(neutral);
+}
 
 static std::optional<cr::camhook::Raw10Color> capture_color(const void* metadata)
 {
@@ -1261,21 +1281,29 @@ static void observe_capture_settings(const CameraCaptureResult& result, bool pho
   };
   const bool have_ratio = read_value(kZoomRatio, 2, 1, &ratio, sizeof(ratio));
   const bool have_crop = read_value(kCropRegion, 1, 4, crop.data(), sizeof(crop));
-  if (have_crop)
+  if (have_crop || photo)
     read_value(kFocalLength, 2, 1, &focal, sizeof(focal));
 
   if (photo)
+  {
     color.logical = capture_color(result.metadata);
+    if (std::abs(focal - 4.38f) < .025f)
+      color.wide_sensor = read_wide_sensor_color(result.metadata);
+  }
   if (photo && result.physical_count <= 4 && result.physical_ids && result.physical_metadata)
     for (size_t index = 0; index < result.physical_count; ++index)
     {
       const char* id = result.physical_ids[index];
       if (id && strcmp(id, "2") == 0)
+      {
         color.rear[0] = capture_color(result.physical_metadata[index]);
+        if (auto wide = read_wide_sensor_color(result.physical_metadata[index]))
+          color.wide_sensor = wide;
+      }
       else if (id && strcmp(id, "3") == 0)
         color.rear[1] = capture_color(result.physical_metadata[index]);
     }
-  const bool have_color = color.logical || color.rear[0] || color.rear[1];
+  const bool have_color = color.logical || color.rear[0] || color.rear[1] || color.wide_sensor;
   if (!have_ratio && !have_crop && !have_color)
     return;
   std::lock_guard lock(g_capture_colors_mutex);
@@ -1361,7 +1389,8 @@ static std::optional<cr::camhook::Raw10Color> camera_color_for_buffer(size_t pro
     if (color.timestamp <= 0)
       continue;
     const int64_t distance = std::abs(color.timestamp - g_return_sensor_timestamp);
-    const bool calibrated = (profile < color.rear.size() && color.rear[profile]) ||
+    const bool calibrated = (profile == 0 && color.wide_sensor) ||
+                             (profile < color.rear.size() && color.rear[profile]) ||
                              color.logical.has_value();
     if (calibrated && distance < nearest)
     {
@@ -1371,8 +1400,15 @@ static std::optional<cr::camhook::Raw10Color> camera_color_for_buffer(size_t pro
   }
   if (best)
   {
-    const auto value = profile < best->rear.size() && best->rear[profile] ?
-                         best->rear[profile] : best->logical;
+    auto value = profile < best->rear.size() && best->rear[profile] ?
+                     best->rear[profile] : best->logical;
+    if (profile == 0 && best->wide_sensor)
+    {
+      value = best->wide_sensor;
+      const auto used = ++g_raw10_wide_sensor_color;
+      if (used == 1 || used % 120 == 0)
+        LOGI("camera RAW10: used wide sensor neutral point (total=%u)", used);
+    }
     g_stream_colors.remember(g_return_camera_stream, profile, best->timestamp, *value);
     return value;
   }

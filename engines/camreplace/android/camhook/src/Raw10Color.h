@@ -40,6 +40,46 @@ inline bool raw10_color_compatible(const Raw10Color& rendered, const Raw10Color&
          within_budget(rendered.odd, requested.odd);
 }
 
+// Pixel 5 rear wide's reviewed DNG forward matrices are identical at both
+// reference illuminants. Invert that sensor-to-XYZ(D50) transform against
+// the sRGB primaries, and normalize rows to the DNG neutral white.
+inline std::optional<Raw10Color> pixel5_wide_raw_color(const std::array<float, 3>& neutral)
+{
+  for (float coordinate : neutral)
+    if (!std::isfinite(coordinate) || coordinate < .125f || coordinate > 2.f)
+      return {};
+
+  constexpr std::array<float, 9> reference_from_srgb{{
+      .982715f, .008293f, .008992f,
+      .008448f, .997393f, -.005841f,
+      -.003258f, .005237f, .998021f}};
+  // Residual Pixel 5 rear-wide HDR+ response, fitted in linear sRGB using
+  // neutral and warm color patches and blended 75% towards its inverse.
+  // The nonnegative rows keep saturated input colors in the valid domain.
+  constexpr std::array<float, 9> hdr_input_compensation{{
+      .83404f, .05076f, .17796f,
+      .08416f, .89352f, .03616f,
+      .08180f, .05572f, .78589f}};
+  Raw10Color result;
+  for (size_t row = 0; row < neutral.size(); ++row)
+  {
+    const float sensor_neutral = neutral[row] / neutral[1];
+    if (sensor_neutral < .125f || sensor_neutral > 2.f)
+      return {};
+    for (size_t col = 0; col < 3; ++col)
+    {
+      const size_t index = row * 3 + col;
+      const float coefficient = reference_from_srgb[row * 3] * hdr_input_compensation[col] +
+                                reference_from_srgb[row * 3 + 1] * hdr_input_compensation[3 + col] +
+                                reference_from_srgb[row * 3 + 2] * hdr_input_compensation[6 + col];
+      result.even[index] =
+          std::lround(coefficient * sensor_neutral * Raw10Color::scale);
+    }
+  }
+  result.odd = result.even;
+  return result;
+}
+
 class Raw10StreamCalibration
 {
 public:

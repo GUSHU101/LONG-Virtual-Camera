@@ -82,6 +82,16 @@ int main()
   nearby.even = calibrated.even;
   ++nearby.odd[6];
   assert(!cr::camhook::raw10_color_compatible(calibrated, nearby));
+  const auto wide_sensor = cr::camhook::pixel5_wide_raw_color({.5f, 1.f, .75f});
+  assert(wide_sensor && wide_sensor->even == wide_sensor->odd);
+  const auto row_sum = [](const cr::camhook::Raw10Color::Matrix& matrix, size_t row) {
+    return matrix[3 * row] + matrix[3 * row + 1] + matrix[3 * row + 2];
+  };
+  assert(std::abs(row_sum(wide_sensor->even, 0) - 2174) < 6);
+  assert(std::abs(row_sum(wide_sensor->even, 1) - 4155) < 6);
+  assert(std::abs(row_sum(wide_sensor->even, 2) - 2837) < 6);
+  assert(!cr::camhook::pixel5_wide_raw_color({1.f, 0.f, .5f}));
+  assert(!cr::camhook::pixel5_wide_raw_color({2.f, .2f, .5f}));
   const std::array<float, 9> singular{};
   assert(!cr::camhook::invert_sensor_color(singular, {1.f, 1.f, 1.f, 1.f}, calibrated));
   assert(!cr::camhook::invert_sensor_color(identity, {0.f, 1.f, 1.f, 1.f}, calibrated));
