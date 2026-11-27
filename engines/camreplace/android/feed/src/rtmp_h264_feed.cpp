@@ -362,6 +362,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   int stream_fps_hint = 30;
   bool pipe_started = false;
   int pipe_w = 0, pipe_h = 0;
+  cr_feed::SdrColorAspects stream_color, pipe_color;
   bool seen_video_keyframe = false;
   uint64_t waiting_for_keyframe = 0;
   cr_feed::H264DecodePipe pipe;
@@ -392,18 +393,19 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
     if (!cr_feed::fit_source_geometry(stream_w, stream_h, fitted_width,
                                       fitted_height))
       return false;
-    if (pipe_started && pipe_w == stream_w && pipe_h == stream_h)
+    if (pipe_started && pipe_w == stream_w && pipe_h == stream_h && pipe_color == stream_color)
       return true;
     if (pipe_started)
     {
-      LOGI(OBF("rtmp: stream geometry changed %dx%d -> %dx%d; restarting decoder").c_str(),
-           pipe_w, pipe_h, stream_w, stream_h);
+      LOGI("rtmp: stream shape/color changed %dx%d/%d/%d -> %dx%d/%d/%d; restarting decoder",
+           pipe_w, pipe_h, pipe_color.standard, pipe_color.range,
+           stream_w, stream_h, stream_color.standard, stream_color.range);
       pipe.stop();
       decoder_idle_until = {};
       pipe_started = false;
       seen_video_keyframe = false;
     }
-    if (!pipe.start(stream_w, stream_h))
+    if (!pipe.start(stream_w, stream_h, stream_color))
     {
       LOGE(OBF("rtmp: H264DecodePipe.start(%dx%d) failed").c_str(), stream_w, stream_h);
       return false;
@@ -413,6 +415,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
     pipe_started = true;
     pipe_w = stream_w;
     pipe_h = stream_h;
+    pipe_color = stream_color;
     return true;
   };
 
@@ -749,9 +752,10 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
           // ReCam's SPS-derived geometry removes the fragile dependency on
           // onMetaData ordering. SPS is authoritative when it is parseable;
           // metadata remains a compatibility fallback for unusual profiles.
-          geometry_from_sps = config.width != 0 && config.height != 0;
-          stream_w = geometry_from_sps ? static_cast<int>(config.width) : metadata_w;
-          stream_h = geometry_from_sps ? static_cast<int>(config.height) : metadata_h;
+          geometry_from_sps = static_cast<bool>(config.sps.dimensions);
+          stream_w = geometry_from_sps ? static_cast<int>(config.sps.dimensions.width) : metadata_w;
+          stream_h = geometry_from_sps ? static_cast<int>(config.sps.dimensions.height) : metadata_h;
+          stream_color = cr_feed::SdrColorAspects::from_h264_vui(config.sps);
           if (stream_w > 0 && stream_h > 0)
             try_start_pipe();
         }

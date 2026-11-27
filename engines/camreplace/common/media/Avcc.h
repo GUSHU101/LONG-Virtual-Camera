@@ -255,8 +255,7 @@ inline H264Dimensions parse_h264_sps_dimensions(
 struct AvcDecoderConfig
 {
   std::uint8_t nalu_length_size = 0;
-  std::uint32_t width = 0;
-  std::uint32_t height = 0;
+  H264SpsInfo sps;
   std::vector<std::uint8_t> parameter_sets_annexb;
 };
 
@@ -298,16 +297,8 @@ inline bool parse_avc_decoder_config(std::span<const std::uint8_t> data,
       cursor += 2;
       if (size == 0 || cursor > data.size() || size > data.size() - cursor)
         return false;
-      if (sps && parsed.width == 0)
-      {
-        const H264Dimensions dimensions =
-            parse_h264_sps_dimensions(data.subspan(cursor, size));
-        if (dimensions)
-        {
-          parsed.width = dimensions.width;
-          parsed.height = dimensions.height;
-        }
-      }
+      if (sps && !parsed.sps.dimensions)
+        parsed.sps = parse_h264_sps(data.subspan(cursor, size));
       if (!append_annexb_nalu(data.subspan(cursor, size), parsed.parameter_sets_annexb))
         return false;
       cursor += size;

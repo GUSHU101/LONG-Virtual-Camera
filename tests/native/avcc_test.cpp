@@ -38,6 +38,17 @@ int main()
   assert(truncated_vui.dimensions.width == 1280);
   assert(!truncated_vui.full_range.has_value() && truncated_vui.matrix_coefficients == 2);
 
+  auto tagged_avcc = config(3);
+  tagged_avcc[7] = static_cast<uint8_t>(bt709_full_sps.size());
+  tagged_avcc.erase(tagged_avcc.begin() + 8, tagged_avcc.begin() + 11);
+  tagged_avcc.insert(tagged_avcc.begin() + 8, bt709_full_sps.begin(), bt709_full_sps.end());
+  AvcDecoderConfig tagged_config;
+  assert(cr::media::parse_avc_decoder_config(tagged_avcc, tagged_config));
+  assert(tagged_config.sps.dimensions.width == 1280 &&
+         tagged_config.sps.dimensions.height == 720);
+  assert(tagged_config.sps.full_range == true &&
+         tagged_config.sps.matrix_coefficients == 1);
+
   for (const std::uint8_t minus_one : {std::uint8_t{0}, std::uint8_t{1}, std::uint8_t{3}})
   {
     AvcDecoderConfig parsed{};

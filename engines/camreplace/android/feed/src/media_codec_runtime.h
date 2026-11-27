@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "../include/cr_feed.h"
+#include "media/Avcc.h"
 #include "util/Obf.h"
 
 namespace cr_feed
@@ -17,6 +18,32 @@ struct SdrColorAspects
 {
   int32_t standard = 0;
   int32_t range = 0;
+
+  bool operator==(const SdrColorAspects&) const = default;
+
+  bool known_standard() const { return standard == 1 || standard == 2 || standard == 4; }
+  bool known_range() const { return range == 1 || range == 2; }
+
+  static SdrColorAspects from_h264_vui(const cr::media::H264SpsInfo& sps)
+  {
+    SdrColorAspects coded;
+    switch (sps.matrix_coefficients)
+    {
+      case 1: coded.standard = 1; break; // BT.709
+      case 5: coded.standard = 2; break; // BT.601 PAL
+      case 6: coded.standard = 4; break; // BT.601 NTSC
+    }
+    if (sps.full_range)
+      coded.range = *sps.full_range ? 1 : 2;
+    return coded;
+  }
+
+  SdrColorAspects with_fallback(const SdrColorAspects& fallback) const
+  {
+    return {
+        !known_standard() && fallback.known_standard() ? fallback.standard : standard,
+        !known_range() && fallback.known_range() ? fallback.range : range};
+  }
 
   void update(AMediaFormat* format)
   {

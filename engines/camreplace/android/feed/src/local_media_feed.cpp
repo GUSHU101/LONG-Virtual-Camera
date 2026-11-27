@@ -143,7 +143,7 @@ cr_feed::SdrColorAspects read_track_color(AMediaFormat* track, const char* mime)
 {
   cr_feed::SdrColorAspects color;
   color.update(track);
-  if (strcmp(mime, "video/avc") != 0 || (color.standard != 0 && color.range != 0))
+  if (strcmp(mime, "video/avc") != 0 || (color.known_standard() && color.known_range()))
     return color;
 
   void* bytes = nullptr;
@@ -161,18 +161,7 @@ cr_feed::SdrColorAspects read_track_color(AMediaFormat* track, const char* mime)
       sps = sps.subspan(4);
   }
   const auto info = cr::media::parse_h264_sps(sps);
-  if (color.standard == 0)
-  {
-    switch (info.matrix_coefficients)
-    {
-    case 1: color.standard = 1; break; // BT.709
-    case 5: color.standard = 2; break; // BT.601 PAL / BT.470 BG
-    case 6: color.standard = 4; break; // BT.601 NTSC / SMPTE 170M
-    }
-  }
-  if (color.range == 0 && info.full_range.has_value())
-    color.range = *info.full_range ? 1 : 2;
-  return color;
+  return color.with_fallback(cr_feed::SdrColorAspects::from_h264_vui(info));
 }
 
 class FileVideoDecoder
@@ -444,10 +433,7 @@ private:
     // source metadata over vendor defaults for that YUV output.
     cr_feed::SdrColorAspects output_color;
     output_color.update(format);
-    if (track_color_.standard != 0)
-      output_color.standard = track_color_.standard;
-    if (track_color_.range != 0)
-      output_color.range = track_color_.range;
+    output_color = track_color_.with_fallback(output_color);
     output_color_flags_ = output_color.flags(false);
     __android_log_print(valid ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, TAG,
         OBF("local video output: color=0x%x stride=%d slice=%d crop=%d,%d-%d,%d valid=%d color_flags=%u").c_str(),

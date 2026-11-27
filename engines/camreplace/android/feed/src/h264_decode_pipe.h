@@ -332,12 +332,13 @@ public:
   H264DecodePipe(const H264DecodePipe&) = delete;
   H264DecodePipe& operator=(const H264DecodePipe&) = delete;
 
-  bool start(int ww, int hh)
+  bool start(int ww, int hh, SdrColorAspects source_color = {})
   {
     (void) ensure_media_codec_binder_pool();
     w = ww;
     h = hh;
-    color_flags = SdrColorAspects{}.flags(w >= 1280 || h >= 720);
+    coded_color = source_color;
+    color_flags = coded_color.flags(w >= 1280 || h >= 720);
     if (!fit_source_geometry(w, h, output_w, output_h))
     {
       CR_FEED_LOGE(OBF("h264 pipe: rejected source geometry %dx%d").c_str(),
@@ -524,10 +525,10 @@ public:
         uv_stride = y_stride;
         SdrColorAspects color;
         color.update(of);
-        // Some codecs omit color-standard on untagged SDR H.264.
-        color_flags = color.flags(w >= 1280 || h >= 720);
-        CR_FEED_LOGI("h264 color standard=%d range=%d shared_flags=%u",
-                     color.standard, color.range, color_flags);
+        // An unknown vendor standard is not evidence for BT.601.
+        color_flags = color.with_fallback(coded_color).flags(w >= 1280 || h >= 720);
+        CR_FEED_LOGI("h264 color standard=%d range=%d coded_standard=%d coded_range=%d shared_flags=%u",
+                     color.standard, color.range, coded_color.standard, coded_color.range, color_flags);
         CR_FEED_LOGI(OBF("h264 out fmt: color=0x%x stride=%d slice=%d").c_str(), color_format, y_stride, slice_height);
         AMediaFormat_delete(of);
         continue;
@@ -673,6 +674,7 @@ private:
   uint64_t input_deadline_misses = 0;
   uint64_t slot_busy_count = 0;
   uint64_t published_count = 0;
+  SdrColorAspects coded_color;
   uint32_t color_flags = 0;
   uint64_t output_layout_warns = 0;
 };
