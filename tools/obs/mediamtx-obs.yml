@@ -1,0 +1,31 @@
+# Managed by longvc-mediamtx.lua. The relay only forwards the encoded stream.
+logLevel: error
+api: false
+metrics: false
+pprof: false
+playback: false
+rtsp: false
+rtmp: true
+rtmpAddress: 127.0.0.1:1935
+rtmpEncryption: "no"
+hls: false
+webrtc: false
+srt: false
+moq: false
+authMethod: internal
+authInternalUsers:
+  - user: any
+    ips: [127.0.0.1]
+    permissions:
+      - action: publish
+        path: longvc
+  - user: any
+    ips: [127.0.0.1]
+    permissions:
+      - action: read
+        path: longvc
+paths:
+  all_others:
+    source: publisher
+    overridePublisher: false
+    record: false

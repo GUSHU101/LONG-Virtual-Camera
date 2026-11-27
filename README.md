@@ -14,11 +14,13 @@ LONG Virtual Camera 是面向自有或明确授权测试设备的 Android ARM64 
 
 ## OBS 与画面分辨率
 
-1. 在电脑运行 [MediaMTX](https://mediamtx.org/docs/kickoff/install)，保留 RTMP 默认端口 1935。
-2. 在同一台电脑的 OBS 打开「设置 → 直播」，选择「自定义」，服务器填 `rtmp://127.0.0.1:1935/longvc`，推流码留空。视频编码选 H.264，然后开始推流。 [OBS 推流示例](https://mediamtx.org/docs/publish/obs-studio)
-3. 手机与电脑在同一局域网时，在 APK 的「电脑 OBS 拉流」填写 `rtmp://<电脑局域网 IP>:1935/longvc`。保存后打开「全局摄像头」或「照片输出替换」。使用 USB 时，在电脑执行 `adb reverse tcp:1935 tcp:1935`，手机地址填 `rtmp://127.0.0.1:1935/longvc`。
+Windows x64 的 OBS 可用 Lua 脚本自动管理本机 MediaMTX。解压官方 MediaMTX 后，在 OBS「工具 → 脚本」加载 `longvc-mediamtx.lua`，选择已有的 `mediamtx.exe`，再点「启动 / 应用并重启中继」。脚本和 `mediamtx-obs.yml` 放在同一目录。脚本配置随 OBS 场景集合保存。 [配置与排查](tools/obs/README.md) · [MediaMTX 下载](https://mediamtx.org/docs/kickoff/install)
 
-电脑与手机通过局域网连接时，需要让手机能访问电脑上的 TCP 1935。明文 RTMP 适用于可信网络。启用 MediaMTX 读取认证时，可在手机地址中加 `?user=用户名&pass=密码`，面板状态隐藏查询参数。需要 OBS 音频时，选中 OBS AAC 并打开虚拟麦克风。 [读取认证配置](https://mediamtx.org/docs/features/authentication)
+1. 在 OBS「设置 → 直播」选择「自定义」，服务器填 `rtmp://127.0.0.1:1935/longvc`，推流码留空。视频使用 H.264，然后开始推流。 [OBS 推流示例](https://mediamtx.org/docs/publish/obs-studio)
+2. 用 USB 时，在电脑执行 `adb reverse tcp:1935 tcp:1935`。用局域网时，在脚本填手机的 IPv4 并应用，中继会允许该地址拉流。
+3. 在 APK 的「电脑 OBS 拉流」填 `rtmp://127.0.0.1:1935/longvc`（USB）或 `rtmp://<电脑局域网 IP>:1935/longvc`（局域网）。保存后开启相机或照片替换。需要 OBS 音频时，选中 OBS AAC 并打开虚拟麦克风。
+
+也可连接自行管理的 MediaMTX。若该中继启用了读取认证，手机地址可加 `?user=用户名&pass=密码`。RTMP 为明文，适用于可信网络。 [MediaMTX 读取认证](https://mediamtx.org/docs/features/authentication)
 
 低延迟可先用 H.264、30 fps 和 1 秒关键帧间隔。连接稳定时，可用 720p 约 8 Mbps 或 1080p 约 14 Mbps 的 CBR 测试清晰度。OBS 的「视频」中将输出分辨率设为目标尺寸，并检查源素材是否有足够的原始分辨率。使用 x264 时可选 `zerolatency`。使用 NVENC 时可选低延迟调优、关闭 Look-ahead 并设 B 帧为 0。网络持续丢帧时，先降到 720p 并检查 Wi-Fi 或切换 USB。 [OBS 丢帧排查](https://obsproject.com/kb/stream-connection-troubleshooting) [H.264 码率参考](https://support.google.com/youtube/answer/2853702)
 
