@@ -17,6 +17,15 @@ int main()
   assert(cr::camhook::nv21_to_bggr10(neutral, 4, 2, raw, 4, 2));
   assert((raw == std::array<uint8_t, 10>{16, 16, 255, 255, 0xf0,
                                         16, 16, 255, 255, 0xf0}));
+  std::array<uint8_t, 40> upscaled_raw{};
+  assert(cr::camhook::nv21_to_bggr10(neutral, 4, 2, upscaled_raw, 8, 4));
+  for (size_t row = 0; row < 4; ++row)
+  {
+    for (size_t byte = 0; byte < 4; ++byte)
+      assert(upscaled_raw[row * 10 + byte] == 16 &&
+             upscaled_raw[row * 10 + 5 + byte] == 255);
+    assert(upscaled_raw[row * 10 + 4] == 0 && upscaled_raw[row * 10 + 9] == 0xff);
+  }
 
   auto red = neutral;
   red.fill(81);
@@ -64,4 +73,8 @@ int main()
   assert(!history.recall(&wide, 0, observed - 1));
   assert(!history.recall(&wide, 1, observed));
   assert(!history.recall(&other, 0, observed));
+  history.remember(&other, 0, observed, calibrated);
+  history.forget(&wide);
+  assert(!history.recall(&wide, 0, observed + 1));
+  assert(history.recall(&other, 0, observed + 1) == calibrated);
 }

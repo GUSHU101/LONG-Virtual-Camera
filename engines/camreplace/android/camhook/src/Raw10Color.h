@@ -23,6 +23,13 @@ struct Raw10Color
 class Raw10StreamCalibration
 {
 public:
+  void forget(const void* stream)
+  {
+    for (auto& entry : entries_)
+      if (entry.stream == stream)
+        entry = {};
+  }
+
   void remember(const void* stream, size_t profile, int64_t timestamp, const Raw10Color& color)
   {
     if (!stream || timestamp <= 0)

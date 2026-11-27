@@ -57,7 +57,9 @@ inline bool nv21_to_bggr10(std::span<const uint8_t> nv21, int sw, int sh,
   const auto yuv = cr_yuv_coefficients_for(bt709, full_range);
   const auto sample = [&](int y, int u, int v, const Raw10Color::Matrix& matrix, int row) {
     const int scaled_y = yuv.y_scale * (y - yuv.y_offset);
-    const auto decode = [&](int chroma) { return linear[std::clamp((scaled_y + chroma + 128) >> 8, 0, 255)]; };
+    const auto decode = [&](int offset) {
+      return linear[std::clamp((scaled_y + offset + 128) >> 8, 0, 255)];
+    };
     const auto* coefficients = matrix.data() + 3 * row;
     const int sensor = coefficients[0] * decode(yuv.red_v * v) +
                        coefficients[1] * decode(-yuv.green_u * u - yuv.green_v * v) +
@@ -79,18 +81,47 @@ inline bool nv21_to_bggr10(std::span<const uint8_t> nv21, int sw, int sh,
     const uint8_t* top = nv21.data() + static_cast<size_t>(sy) * sw;
     const uint8_t* bottom = top + sw;
     const uint8_t* vu = nv21.data() + luma + static_cast<size_t>(sy / 2) * sw;
+    if (dw * 2 < crop.width * 3)
+    {
+      // There are few or no repeated columns in this geometry.
+      for (int group = 0; group < dw / 4; ++group)
+      {
+        const int left = columns[group * 2], right = columns[group * 2 + 1];
+        const int u0 = vu[left + 1] - 128, v0 = vu[left] - 128;
+        const int u1 = vu[right + 1] - 128, v1 = vu[right] - 128;
+        pack_raw10(even + group * 5,
+                   sample(top[left], u0, v0, color.even, 2), sample(top[left + 1], u0, v0, color.even, 1),
+                   sample(top[right], u1, v1, color.even, 2), sample(top[right + 1], u1, v1, color.even, 1));
+        pack_raw10(odd + group * 5,
+                   sample(bottom[left], u0, v0, color.odd, 1), sample(bottom[left + 1], u0, v0, color.odd, 0),
+                   sample(bottom[right], u1, v1, color.odd, 1), sample(bottom[right + 1], u1, v1, color.odd, 0));
+      }
+      continue;
+    }
+
+    // A substantial upscale repeats source 2x2 blocks across adjacent
+    // Bayer cells. Keep both calibrated green values in the cached cell.
+    int previous_column = -1;
+    std::array<unsigned, 4> previous_cell{};
+    const auto cell = [&](int column) {
+      if (column != previous_column)
+      {
+        const int v = vu[column] - 128, u = vu[column + 1] - 128;
+        previous_cell = {
+            sample(top[column], u, v, color.even, 2),
+            sample(top[column + 1], u, v, color.even, 1),
+            sample(bottom[column], u, v, color.odd, 1),
+            sample(bottom[column + 1], u, v, color.odd, 0)};
+        previous_column = column;
+      }
+      return previous_cell;
+    };
     for (int group = 0; group < dw / 4; ++group)
     {
-      const int left = columns[group * 2];
-      const int right = columns[group * 2 + 1];
-      const int u0 = vu[left + 1] - 128, v0 = vu[left] - 128;
-      const int u1 = vu[right + 1] - 128, v1 = vu[right] - 128;
-      pack_raw10(even + group * 5,
-                 sample(top[left], u0, v0, color.even, 2), sample(top[left + 1], u0, v0, color.even, 1),
-                 sample(top[right], u1, v1, color.even, 2), sample(top[right + 1], u1, v1, color.even, 1));
-      pack_raw10(odd + group * 5,
-                 sample(bottom[left], u0, v0, color.odd, 1), sample(bottom[left + 1], u0, v0, color.odd, 0),
-                 sample(bottom[right], u1, v1, color.odd, 1), sample(bottom[right + 1], u1, v1, color.odd, 0));
+      const auto left = cell(columns[group * 2]);
+      const auto right = cell(columns[group * 2 + 1]);
+      pack_raw10(even + group * 5, left[0], left[1], right[0], right[1]);
+      pack_raw10(odd + group * 5, left[2], left[3], right[2], right[3]);
     }
   }
   return true;

@@ -1183,10 +1183,14 @@ static FindCameraMetadata g_find_camera_metadata = nullptr;
 using ProcessCameraResult = void (*)(void*, const CameraCaptureResult*);
 using ReturnCameraBuffer = int32_t (*)(void*, const void*, int64_t, int64_t, bool, int32_t,
                                        const std::vector<size_t>&, void*);
+using DisconnectCameraStream = int32_t (*)(void*);
 static void* g_orig_camera_result = nullptr;
 static void* g_orig_camera_return = nullptr;
+static void* g_orig_camera_disconnect = nullptr;
 static void* g_camera_result_hook = nullptr;
 static void* g_camera_return_hook = nullptr;
+static void* g_camera_disconnect_hook = nullptr;
+static int32_t proxy_camera_disconnect(void* stream);
 
 struct CaptureColor
 {
@@ -1330,6 +1334,11 @@ static std::optional<cr::camhook::Raw10Color> camera_color_for_buffer(size_t pro
 
 static void remove_camera_color_hooks()
 {
+  if (g_camera_disconnect_hook)
+  {
+    shadowhook_unhook(g_camera_disconnect_hook);
+    g_camera_disconnect_hook = nullptr;
+  }
   if (g_camera_return_hook)
   {
     shadowhook_unhook(g_camera_return_hook);
@@ -1361,7 +1370,14 @@ static bool install_camera_color_hooks()
   if (g_camera_result_hook && g_camera_return_hook &&
       __atomic_load_n(&g_orig_camera_result, __ATOMIC_ACQUIRE) &&
       __atomic_load_n(&g_orig_camera_return, __ATOMIC_ACQUIRE))
-    return true;
+  {
+    g_camera_disconnect_hook = shadowhook_hook_sym_name("libcameraservice.so",
+        "_ZN7android7camera319Camera3OutputStream16disconnectLockedEv",
+        reinterpret_cast<void*>(proxy_camera_disconnect), &g_orig_camera_disconnect);
+    if (g_camera_disconnect_hook &&
+        __atomic_load_n(&g_orig_camera_disconnect, __ATOMIC_ACQUIRE))
+      return true;
+  }
   remove_camera_color_hooks();
   return false;
 }
@@ -1421,16 +1437,32 @@ public:
     slots_ = {};
   }
 
+  bool forget(const void* stream)
+  {
+    if (!stream)
+      return false;
+    bool removed = false;
+    std::lock_guard lock(mutex_);
+    for (auto& slot : slots_)
+      if (slot.stream == stream)
+      {
+        slot = {};
+        removed = true;
+      }
+    return removed;
+  }
+
   std::shared_ptr<const Raw10Frame> get(size_t profile, PinnedSlot& source,
-                                        const cr::camhook::Raw10Color& color)
+                                        const cr::camhook::Raw10Color& color,
+                                        const void* stream)
   {
     std::unique_lock lock(mutex_);
-    if (!enabled_)
+    if (!enabled_ || !stream)
       return {};
     auto& slot = slots_[profile];
     const auto now = monotonic_ns();
     constexpr int64_t kMaxRawAgeNs = 750'000'000LL;
-    if (slot.frame && slot.frame->generation == source.generation &&
+    if (slot.stream == stream && slot.frame && slot.frame->generation == source.generation &&
         now - slot.frame->prepared <= kMaxRawAgeNs)
     {
       constexpr int64_t kRefreshNs = 250'000'000LL;
@@ -1451,17 +1483,20 @@ public:
     // Night Sight can stop delivering RAW for several seconds and then
     // immediately submit a burst. The first buffer may be used in the saved
     // shot. Prepare that frame now when no valid cache entry is available.
+    slot = {};
+    slot.stream = stream;
+    const uint64_t revision = ++revision_;
+    slot.revision = revision;
     slot.generation = source.generation;
     slot.sequence = source.frame_seq;
     slot.color = color;
     slot.requested = now;
-    slot.pending = false;
     lock.unlock();
     std::vector<uint8_t> input;
     auto frame = render_raw10(profile, source, color, input);
     if (frame)
     {
-      publish(profile, frame);
+      publish(profile, revision, frame);
       const auto miss = ++cold_preparations_;
       if (miss <= 8 || miss % 60 == 0)
         LOGI("camera RAW10: prepared first buffer after pause (profile=%zu, %lld ms, total=%u)",
@@ -1471,11 +1506,12 @@ public:
   }
 
 private:
-  void publish(size_t profile, const std::shared_ptr<Raw10Frame>& frame)
+  void publish(size_t profile, uint64_t revision,
+               const std::shared_ptr<Raw10Frame>& frame)
   {
     std::lock_guard lock(mutex_);
     auto& slot = slots_[profile];
-    if (enabled_ && slot.generation == frame->generation &&
+    if (enabled_ && slot.revision == revision && slot.generation == frame->generation &&
         (!slot.frame || slot.frame->generation != frame->generation ||
          slot.frame->sequence <= frame->sequence))
       slot.frame = frame;
@@ -1484,6 +1520,8 @@ private:
   struct Slot
   {
     std::shared_ptr<const Raw10Frame> frame;
+    const void* stream = nullptr;
+    uint64_t revision = 0;
     uint32_t generation = 0;
     uint64_t sequence = 0;
     int64_t requested = 0;
@@ -1497,6 +1535,7 @@ private:
     for (;;)
     {
       size_t profile;
+      uint64_t revision;
       uint32_t generation;
       cr::camhook::Raw10Color color;
       {
@@ -1511,6 +1550,7 @@ private:
         while (!slots_[profile].pending)
           profile = (profile + 1) % slots_.size();
         slots_[profile].pending = false;
+        revision = slots_[profile].revision;
         generation = slots_[profile].generation;
         color = slots_[profile].color;
         next_ = (profile + 1) % slots_.size();
@@ -1524,7 +1564,7 @@ private:
                 CR_CHANNEL_STATE_READY)
           continue;
         if (auto result = render_raw10(profile, source, color, input))
-          publish(profile, result);
+          publish(profile, revision, result);
       }
       catch (const std::exception&)
       {
@@ -1538,11 +1578,31 @@ private:
   std::array<Slot, kPixel5RawLayouts.size()> slots_{};
   std::thread worker_;
   std::atomic<unsigned> cold_preparations_{0};
+  uint64_t revision_ = 0;
   size_t next_ = 0;
   bool enabled_ = false;
 };
 
 static Raw10Cache g_raw10_cache;
+
+static int32_t proxy_camera_disconnect(void* stream)
+{
+  const auto original = reinterpret_cast<DisconnectCameraStream>(
+      __atomic_load_n(&g_orig_camera_disconnect, __ATOMIC_ACQUIRE));
+  if (!original)
+    return -ENOSYS;
+  const auto status = original(stream);
+  if (status == 0)
+  {
+    {
+      std::lock_guard lock(g_capture_colors_mutex);
+      g_stream_colors.forget(stream);
+    }
+    if (g_raw10_cache.forget(stream))
+      LOGI("camera RAW10: released disconnected stream cache");
+  }
+  return status;
+}
 
 static bool pixel5_stock_android14()
 {
@@ -1598,7 +1658,7 @@ static bool overwrite_raw10(ANWB* anb, const ANWBInfo& bi, int fence)
            profile, static_cast<long long>(g_return_sensor_timestamp), skipped);
     return false;
   }
-  const auto cache = g_raw10_cache.get(profile, source, *color);
+  const auto cache = g_raw10_cache.get(profile, source, *color, g_return_camera_stream);
   source.release_read();
   if (!cache)
     return false;
