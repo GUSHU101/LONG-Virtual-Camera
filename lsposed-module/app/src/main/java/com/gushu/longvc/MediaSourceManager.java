@@ -90,7 +90,7 @@ final class MediaSourceManager {
         return url;
     }
 
-    private static boolean validObsUrl(String url) {
+    static boolean validObsUrl(String url) {
         if (url.length() > 512 || !url.matches("[!-~]+")) return false;
         try {
             java.net.URI uri = java.net.URI.create(url);

@@ -5,7 +5,7 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.text.method.ScrollingMovementMethod;
+import android.text.format.DateFormat;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CompoundButton;
@@ -15,6 +15,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.Collections;
+import java.util.Date;
 import java.util.Locale;
 
 import io.github.libxposed.service.XposedService;
@@ -26,14 +27,24 @@ public final class MainActivity extends Activity
     private static final int PICK_IMAGE = 1002;
     private static final int PICK_AUDIO = 1003;
     private static final String PICKER_OPEN = "document_picker_open";
+    private static final String OBS_AUDIO_DRAFT = "obs_audio_draft";
 
     private RootController rootController;
+    private DashboardView dashboard;
     private XposedService xposedService;
     private TextView frameworkStatus;
     private TextView rootStatus;
     private TextView sourceStatus;
     private TextView obsConfiguration;
-    private TextView operationLog;
+    private TextView obsAddressGuidance;
+    private TextView overviewState;
+    private TextView overviewSource;
+    private TextView cameraStatus;
+    private TextView photoStatus;
+    private TextView micStatus;
+    private TextView runtimeDetails;
+    private TextView statusUpdated;
+    private Button overviewAction;
     private Switch cameraSwitch;
     private Switch photoSwitch;
     private Switch micSwitch;
@@ -52,6 +63,7 @@ public final class MainActivity extends Activity
     private boolean busy;
     private boolean emergencyBusy;
     private boolean documentPickerOpen;
+    private boolean obsAudioEdited;
     private boolean canRequestSystemScope;
     private boolean destroyed;
     private long operationGeneration;
@@ -63,14 +75,22 @@ public final class MainActivity extends Activity
         documentPickerOpen = savedInstanceState != null
                 && savedInstanceState.getBoolean(PICKER_OPEN);
         setContentView(R.layout.activity_main);
+        dashboard = new DashboardView(this, savedInstanceState);
         rootController = new RootController(this);
 
         frameworkStatus = findViewById(R.id.framework_status);
         rootStatus = findViewById(R.id.root_status);
         sourceStatus = findViewById(R.id.source_status);
         obsConfiguration = findViewById(R.id.obs_configuration);
-        operationLog = findViewById(R.id.operation_log);
-        operationLog.setMovementMethod(new ScrollingMovementMethod());
+        obsAddressGuidance = findViewById(R.id.obs_address_guidance);
+        overviewState = findViewById(R.id.overview_state);
+        overviewSource = findViewById(R.id.overview_source);
+        overviewAction = findViewById(R.id.overview_action);
+        cameraStatus = findViewById(R.id.camera_status);
+        photoStatus = findViewById(R.id.photo_status);
+        micStatus = findViewById(R.id.mic_status);
+        runtimeDetails = findViewById(R.id.runtime_details);
+        statusUpdated = findViewById(R.id.status_updated);
         cameraSwitch = findViewById(R.id.camera_switch);
         photoSwitch = findViewById(R.id.photo_switch);
         micSwitch = findViewById(R.id.mic_switch);
@@ -79,6 +99,10 @@ public final class MainActivity extends Activity
             obsUrlInput.setImportantForContentCapture(View.IMPORTANT_FOR_CONTENT_CAPTURE_NO);
         }
         obsAudioSwitch = findViewById(R.id.obs_audio_switch);
+        if (savedInstanceState != null && savedInstanceState.containsKey(OBS_AUDIO_DRAFT)) {
+            obsAudioEdited = true;
+            obsAudioSwitch.setChecked(savedInstanceState.getBoolean(OBS_AUDIO_DRAFT));
+        }
         rootButton = findViewById(R.id.root_button);
         installButton = findViewById(R.id.install_button);
         stopButton = findViewById(R.id.stop_button);
@@ -109,6 +133,9 @@ public final class MainActivity extends Activity
             if (!rendering) runToggle(button, checked,
                     RootController.Action.ARM_MIC, RootController.Action.DISARM_MIC);
         });
+        obsAudioSwitch.setOnCheckedChangeListener((button, checked) -> {
+            if (!rendering) obsAudioEdited = true;
+        });
 
         rootButton.setOnClickListener(view -> runOperation("正在请求 root…",
                 rootController::requestRootAndReadStatus));
@@ -117,21 +144,32 @@ public final class MainActivity extends Activity
         stopButton.setOnClickListener(view -> runEmergencyStop());
         refreshButton.setOnClickListener(view -> {
             renderFramework();
-            runOperation("正在读取运行状态…", rootController::requestRootAndReadStatus);
+            runOperation(getString(R.string.runtime_read_pending), rootController::requestRootAndReadStatus);
         });
         scopeButton.setOnClickListener(view -> requestSystemScope());
         selectVideoButton.setOnClickListener(view -> selectDocument("video/*", PICK_VIDEO));
         selectImageButton.setOnClickListener(view -> selectDocument("image/*", PICK_IMAGE));
         selectAudioButton.setOnClickListener(view -> selectDocument("audio/*", PICK_AUDIO));
         configureObsButton.setOnClickListener(view -> {
-            String url = obsUrlInput.getText().toString();
+            String url = obsUrlInput.getText().toString().trim();
+            boolean missingSavedUrl = lastState != null && lastState.controllerVerified
+                    && !lastState.obsConfigured;
+            if (url.isEmpty() ? missingSavedUrl : !MediaSourceManager.validObsUrl(url)) {
+                obsUrlInput.setError(getString(R.string.obs_address_invalid));
+                obsUrlInput.requestFocus();
+                return;
+            }
+            obsUrlInput.setError(null);
             boolean useObsAudio = obsAudioSwitch.isChecked();
             runOperation("正在保存电脑拉流地址…",
                     () -> rootController.configureObs(url, useObsAudio),
-                    () -> obsUrlInput.getText().clear());
+                    () -> {
+                        obsAudioEdited = false;
+                        obsUrlInput.getText().clear();
+                    });
         });
 
-        renderControls();
+        renderState(null);
     }
 
     @Override
@@ -150,6 +188,8 @@ public final class MainActivity extends Activity
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         outState.putBoolean(PICKER_OPEN, documentPickerOpen);
+        if (obsAudioEdited) outState.putBoolean(OBS_AUDIO_DRAFT, obsAudioSwitch.isChecked());
+        dashboard.save(outState);
         super.onSaveInstanceState(outState);
     }
 
@@ -176,7 +216,8 @@ public final class MainActivity extends Activity
             startActivityForResult(intent, requestCode);
         } catch (android.content.ActivityNotFoundException error) {
             documentPickerOpen = false;
-            operationLog.setText(getString(R.string.operation_failed, safeMessage(error)));
+            showNotice(DashboardView.Notice.ERROR, R.string.operation_attention,
+                    getString(R.string.operation_failed, safeMessage(error)));
         }
     }
 
@@ -211,7 +252,10 @@ public final class MainActivity extends Activity
 
     private void runToggle(CompoundButton button, boolean checked,
                            RootController.Action on, RootController.Action off) {
-        button.setEnabled(false);
+        // Reflect the last observed device state until the operation completes.
+        rendering = true;
+        button.setChecked(!checked);
+        rendering = false;
         RootController.Action action = checked ? on : off;
         runOperation((checked ? "正在启用 " : "正在停用 ") + label(action) + "…",
                 () -> rootController.run(action));
@@ -235,23 +279,21 @@ public final class MainActivity extends Activity
                     if (generation != operationGeneration) return;
                     busy = false;
                     onSuccess.run();
-                    RuntimeState display = state;
-                    lastState = display;
-                    renderState(display);
-                    operationLog.setText(buildSummary(display));
+                    publishState(state);
+                    dashboard.notice(DashboardView.Notice.NONE, "", "");
                 });
             } catch (Exception error) {
                 showOperationFailure(generation, false, error);
             }
         });
         if (!accepted) {
-            operationLog.setText(R.string.root_operation_in_progress);
+            showNotice(DashboardView.Notice.INFO, R.string.root_operation_in_progress, "");
             renderState(lastState);
             return;
         }
         operationGeneration = generation;
         busy = true;
-        operationLog.setText(pending);
+        dashboard.notice(DashboardView.Notice.BUSY, pending, "");
         renderControls();
     }
 
@@ -264,24 +306,22 @@ public final class MainActivity extends Activity
                 runOnUiThreadIfAlive(() -> {
                     if (generation != operationGeneration) return;
                     emergencyBusy = false;
-                    RuntimeState display = state;
-                    lastState = display;
-                    renderState(display);
-                    operationLog.setText(getString(R.string.recovery_verified,
-                            buildSummary(display)));
+                    publishState(state);
+                    showNotice(DashboardView.Notice.INFO, R.string.operation_restored,
+                            getString(R.string.recovery_verified));
                 });
             } catch (Exception error) {
                 showOperationFailure(generation, true, error);
             }
         });
         if (!accepted) {
-            operationLog.setText(R.string.recovery_in_progress);
+            showNotice(DashboardView.Notice.INFO, R.string.recovery_in_progress, "");
             return;
         }
         operationGeneration = generation;
         busy = false;
         emergencyBusy = true;
-        operationLog.setText(R.string.recovery_in_progress);
+        showNotice(DashboardView.Notice.BUSY, R.string.recovery_in_progress, "");
         renderControls();
     }
 
@@ -305,13 +345,19 @@ public final class MainActivity extends Activity
             if (generation != operationGeneration) return;
             busy = false;
             emergencyBusy = false;
-            lastState = current;
-            renderState(lastState);
+            publishState(current);
+            if (current == null) {
+                statusUpdated.setText(R.string.runtime_read_failed);
+                rootStatus.setText(R.string.root_unconfirmed);
+            }
+            String message = safeMessage(error);
             String status = current == null
-                    ? getString(R.string.runtime_state_unknown, readError)
-                    : buildSummary(lastState);
-            operationLog.setText(getString(recovery ? R.string.recovery_unverified
-                    : R.string.operation_failed_with_status, safeMessage(error), status));
+                    ? getString(R.string.runtime_state_unknown, readError.equals(message) ? "" : readError)
+                    : "";
+            String details = getString(recovery ? R.string.recovery_unverified
+                    : R.string.operation_failed, message);
+            showNotice(DashboardView.Notice.ERROR, R.string.operation_attention,
+                    status.isEmpty() ? details : details + "\n\n" + status);
         });
     }
 
@@ -330,23 +376,46 @@ public final class MainActivity extends Activity
                     @Override
                     public void onScopeRequestApproved(java.util.List<String> approved) {
                         runOnUiThreadIfAlive(() -> {
-                            operationLog.setText(approved.contains("system")
-                                    ? getString(R.string.scope_approved, getPackageName())
-                                    : getString(R.string.scope_failed, approved));
+                            if (approved.contains("system")) {
+                                dashboard.notice(DashboardView.Notice.INFO,
+                                        getString(R.string.scope_approved_short),
+                                        getString(R.string.scope_approved, getPackageName()));
+                            } else {
+                                showScopeFailure(approved.toString());
+                            }
                             renderFramework();
                         });
                     }
 
                     @Override
                     public void onScopeRequestFailed(String message) {
-                        runOnUiThreadIfAlive(() -> operationLog.setText(
-                                getString(R.string.scope_failed, message)));
+                        runOnUiThreadIfAlive(() -> showScopeFailure(message));
                     }
                 });
         } catch (RuntimeException error) {
-            operationLog.setText(getString(R.string.scope_failed, safeMessage(error)));
+            showScopeFailure(safeMessage(error));
             renderFramework();
         }
+    }
+
+    private void showScopeFailure(String message) {
+        showNotice(DashboardView.Notice.ERROR, R.string.operation_attention,
+                getString(R.string.scope_failed, RootShell.redactDiagnostic(message)));
+    }
+
+    private void showNotice(DashboardView.Notice notice, int message, CharSequence details) {
+        dashboard.notice(notice, getString(message), details);
+    }
+
+    private void publishState(RuntimeState state) {
+        lastState = state;
+        if (state == null) {
+            statusUpdated.setText(R.string.status_not_read);
+        } else {
+            statusUpdated.setText(getString(R.string.status_updated,
+                    DateFormat.getTimeFormat(this).format(new Date())));
+        }
+        renderState(state);
     }
 
     private void renderState(RuntimeState state) {
@@ -368,6 +437,9 @@ public final class MainActivity extends Activity
             rootStatus.setText(status);
         }
         renderSource(state);
+        renderOverview(state);
+        if (state == null) runtimeDetails.setText(R.string.overview_unknown);
+        else runtimeDetails.setText(buildSummary(state));
         rendering = false;
         renderControls();
     }
@@ -399,29 +471,71 @@ public final class MainActivity extends Activity
     }
 
     private void renderSource(RuntimeState state) {
+        obsAddressGuidance.setText(state != null && state.obsConfigured
+                ? R.string.obs_url_saved_hint : R.string.obs_url_hint);
         if (state == null || !state.root) {
-            sourceStatus.setText(R.string.source_not_configured);
-            obsConfiguration.setText(R.string.obs_not_configured);
+            sourceStatus.setText(state == null ? R.string.overview_unknown : R.string.source_needs_root);
+            obsConfiguration.setText(R.string.obs_status_unknown);
             return;
         }
         if (!state.controllerVerified) {
             sourceStatus.setText(R.string.source_controller_mismatch);
-            obsConfiguration.setText(R.string.obs_not_configured);
+            obsConfiguration.setText(R.string.obs_status_unknown);
             return;
         }
-        String visual = state.visualUsesObs()
-                ? state.videoChannelReady ? "电脑 OBS（已收到视频）" : "电脑 OBS"
-                : !state.visualSourceReady ? "本地（未选择）"
-                : "image".equals(state.visualKind) ? "本地图片" : "本地视频";
         String audio = state.audioUsesObs()
                 ? !state.micEnabled ? "OBS AAC（虚拟麦克风关闭）"
                     : state.audioChannelReady ? "OBS AAC（已收到音频）" : "OBS AAC（等待音频）"
                 : state.audioSourceReady ? "本地音频" : "手机原生麦克风（替换关闭）";
-        sourceStatus.setText(getString(R.string.source_independent_status, visual, audio));
-        obsUrlInput.setHint(state.obsConfigured ? R.string.obs_url_saved_hint : R.string.obs_url_hint);
-        obsAudioSwitch.setChecked(state.audioUsesObs());
+        sourceStatus.setText(getString(R.string.source_independent_status, visualSourceLabel(state), audio));
+        if (!obsAudioEdited) obsAudioSwitch.setChecked(state.audioUsesObs());
         obsConfiguration.setText(state.obsConfigured
                 ? formatObsConfiguration(state) : getString(R.string.obs_not_configured));
+    }
+
+    private void renderOverview(RuntimeState state) {
+        boolean verified = state != null && state.root && state.controllerVerified;
+        int heading = R.string.overview_unknown;
+        if (state != null && !state.root) heading = R.string.overview_root_required;
+        else if (state != null && !verified) heading = R.string.overview_verify_payload;
+        else if (verified) {
+            if (RootController.isCameraStartPaused()) heading = R.string.overview_paused;
+            else if (!state.visualSourceReady) heading = R.string.overview_select_source;
+            else if (!state.cameraEnabled && !state.photoEnabled) heading = R.string.overview_standby;
+            else if (!state.cameraHookReady) heading = R.string.overview_waiting_hook;
+            else if (!state.videoFeederReady || !state.videoChannelReady) heading = R.string.overview_waiting_frames;
+            else heading = R.string.overview_ready;
+        }
+        overviewState.setText(heading);
+        boolean awaitingOutput = heading == R.string.overview_waiting_hook
+                || heading == R.string.overview_waiting_frames;
+        boolean needsDiagnostics = !verified || heading == R.string.overview_paused || awaitingOutput;
+        int statusColor = heading == R.string.overview_ready ? R.color.hero_ready
+                : needsDiagnostics && state != null ? R.color.hero_attention : R.color.hero_ink;
+        overviewState.setTextColor(getColor(statusColor));
+        overviewSource.setVisibility(verified ? View.VISIBLE : View.GONE);
+        cameraStatus.setVisibility(verified ? View.VISIBLE : View.GONE);
+        photoStatus.setVisibility(verified ? View.VISIBLE : View.GONE);
+        if (verified) {
+            overviewSource.setText(getString(R.string.overview_source, visualSourceLabel(state)));
+            cameraStatus.setText(state.cameraEnabled ? cameraState(state, true) : "使用手机相机");
+            photoStatus.setText(state.photoEnabled ? photoState(state) : "使用手机相机");
+            micStatus.setText(microphoneState(state));
+        } else {
+            micStatus.setText(R.string.microphone_replace_hint);
+        }
+        overviewAction.setText(needsDiagnostics ? R.string.view_diagnostics
+                : state.visualSourceReady ? R.string.change_source : R.string.open_source_settings);
+        overviewAction.setOnClickListener(view -> {
+            if (needsDiagnostics) dashboard.openDiagnostics();
+            else dashboard.show(DashboardView.Page.SOURCES);
+        });
+    }
+
+    private static String visualSourceLabel(RuntimeState state) {
+        if (state.visualUsesObs()) return "电脑 OBS";
+        if (!state.visualSourceReady) return "尚未选择";
+        return "image".equals(state.visualKind) ? "本地图片" : "本地视频";
     }
 
     private void renderFramework() {
@@ -575,7 +689,7 @@ public final class MainActivity extends Activity
                 ? "等待启动电脑拉流，输出静音" : "等待本地音频解码器，输出静音";
         if (!state.audioChannelReady) return state.audioUsesObs()
                 ? "等待 OBS AAC 音频帧，输出静音" : "等待本地 PCM，输出静音";
-        return "READY";
+        return "已收到音频";
     }
 
     private String formatObsConfiguration(RuntimeState state) {
