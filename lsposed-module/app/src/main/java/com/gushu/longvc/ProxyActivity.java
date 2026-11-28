@@ -1,5 +1,8 @@
 package com.gushu.longvc;
 
+import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+import static android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
@@ -56,24 +59,32 @@ public final class ProxyActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         controller = new RootProxyController(this);
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
         ScrollView page = new ScrollView(this);
+        layout.addView(page, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
         fields = new LinearLayout(this);
         fields.setOrientation(LinearLayout.VERTICAL);
         int inset = dp(16);
         fields.setPadding(inset, inset, inset, inset);
         page.addView(fields);
-        setContentView(page);
+        LinearLayout actions = new LinearLayout(this);
+        actions.setPadding(inset, dp(4), inset, dp(4));
+        actions.setBackgroundColor(getColor(R.color.surface_card));
+        layout.addView(actions);
+        setContentView(layout);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             getWindow().setDecorFitsSystemWindows(false);
-            page.setOnApplyWindowInsetsListener((view, insets) -> {
+            layout.setOnApplyWindowInsetsListener((view, insets) -> {
                 Insets visible = insets.getInsets(WindowInsets.Type.systemBars()
                         | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
-                page.setPadding(visible.left, visible.top, visible.right, visible.bottom);
+                view.setPadding(visible.left, visible.top, visible.right, visible.bottom);
+                actions.setVisibility(insets.isVisible(WindowInsets.Type.ime()) ? View.GONE : View.VISIBLE);
                 return WindowInsets.CONSUMED;
             });
-            page.requestApplyInsets();
+            layout.requestApplyInsets();
         }
-        button(R.string.proxy_back, this::finish);
+        fields.addView(button(R.string.proxy_back, this::finish));
         TextView heading = label(R.string.proxy_title);
         heading.setTextAppearance(R.style.PageTitle);
         label(R.string.proxy_intro);
@@ -115,8 +126,12 @@ public final class ProxyActivity extends Activity {
         result.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         test = button(R.string.proxy_test, this::test);
         start = button(R.string.proxy_start, this::confirmStart);
+        fields.addView(test);
+        fields.addView(start);
         refresh = button(R.string.refresh, () -> run(controller::status));
         stop = button(R.string.proxy_stop, () -> run(controller::stop));
+        actions.addView(refresh, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
+        actions.addView(stop, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 2));
         run(controller::status);
     }
 
@@ -243,7 +258,6 @@ public final class ProxyActivity extends Activity {
         view.setAllCaps(false);
         view.setMinHeight(dp(48));
         view.setOnClickListener(v -> onClick.run());
-        fields.addView(view);
         return view;
     }
 
