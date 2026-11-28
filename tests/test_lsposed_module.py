@@ -189,8 +189,10 @@ class LsposedModuleContractTests(unittest.TestCase):
         )
         self.assertIn("static final ExecutorService ROOT_OPERATIONS", application)
         self.assertIn("newSingleThreadExecutor", application)
-        self.assertIn("LongVcApplication.executeRootOperation", activity)
-        self.assertIn("runOnUiThreadIfAlive", activity)
+        self.assertIn("operations.attach(operationListener)", activity)
+        self.assertIn("operations.detach(operationListener)", activity)
+        self.assertIn("studioOperations()", application)
+        self.assertIn("operations.claimCompletion(snapshot)", activity)
 
     def test_product_has_only_android_entry_points(self) -> None:
         for path in ("desktop/main.py", "long_virtual_camera.py", "build.bat",
@@ -243,6 +245,7 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertIn("obsAudioSwitch.isChecked()", activity)
         self.assertIn('useObsAudio ? "obs" : "local"', sources)
         self.assertIn("obsSettingsMatch(url, obsAudio)", controller)
+        self.assertIn("if (mediaSources.obsAudioSettingsMatch(url)) return status();", controller)
         self.assertIn('new SourceConfig(visualMode, visualKind, visualPath, "obs", audioPath, url)', sources)
         self.assertNotIn("obs_token", sources)
         self.assertNotIn("state.obsAddress", activity)
@@ -268,7 +271,7 @@ class LsposedModuleContractTests(unittest.TestCase):
         activity = (MODULE / "java/com/gushu/longvc/MainActivity.java").read_text(
             encoding="utf-8"
         )
-        self.assertIn("if (!documentPickerOpen && !busy && !emergencyBusy)", activity)
+        self.assertIn("if (!documentPickerOpen && !busy && !emergencyBusy && !hasUnseenOperation)", activity)
         self.assertLess(activity.index("documentPickerOpen = true;"),
                         activity.index("startActivityForResult(intent, requestCode)"))
         self.assertIn("outState.putBoolean(PICKER_OPEN, documentPickerOpen)", activity)

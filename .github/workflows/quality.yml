@@ -38,7 +38,7 @@ jobs:
           set -euo pipefail
           src=lsposed-module/app/src/main/java/com/gushu/longvc
           out=$(mktemp -d)
-          javac -d "$out" "$src/RootOperations.java" "$src/RuntimeState.java" \
+          javac -d "$out" "$src/RootOperations.java" "$src/StudioOperations.java" "$src/RuntimeState.java" \
             "$src/RootShell.java" tests/jvm/RootLifecycleTest.java
           java -cp "$out" com.gushu.longvc.RootLifecycleTest
       - name: Shared-memory and media geometry tests

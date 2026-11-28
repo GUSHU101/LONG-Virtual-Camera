@@ -20,14 +20,18 @@ final class RootOperations {
     }
 
     synchronized boolean submit(Runnable action) {
+        return submit(action, () -> {});
+    }
+
+    synchronized boolean submit(Runnable action, Runnable finished) {
         if (ordinary != null || recovering) return false;
         Task task = new Task();
         ordinary = task;
-        ordinaryExecutor.execute(() -> executeOrdinary(task, action));
+        ordinaryExecutor.execute(() -> executeOrdinary(task, action, finished));
         return true;
     }
 
-    private void executeOrdinary(Task task, Runnable action) {
+    private void executeOrdinary(Task task, Runnable action, Runnable finished) {
         synchronized (this) {
             if (task.cancelled) {
                 ordinary = null;
@@ -42,10 +46,15 @@ final class RootOperations {
                 task.runner = null;
                 ordinary = null;
             }
+            finished.run();
         }
     }
 
     synchronized boolean recover(Runnable action) {
+        return recover(action, () -> {});
+    }
+
+    synchronized boolean recover(Runnable action, Runnable finished) {
         if (recovering) return false;
         recovering = true;
         if (ordinary != null) {
@@ -59,6 +68,7 @@ final class RootOperations {
                 synchronized (this) {
                     recovering = false;
                 }
+                finished.run();
             }
         });
         return true;

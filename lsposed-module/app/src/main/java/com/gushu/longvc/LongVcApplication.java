@@ -1,6 +1,8 @@
 package com.gushu.longvc;
 
 import android.app.Application;
+import android.os.Handler;
+import android.os.Looper;
 
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -34,8 +36,9 @@ public final class LongVcApplication extends Application
                 thread.setDaemon(true);
                 return thread;
             });
-    private static final RootOperations OPERATIONS =
-            new RootOperations(ROOT_OPERATIONS, EMERGENCY_OPERATIONS);
+    private final StudioOperations studioOperations = new StudioOperations(
+            new RootOperations(ROOT_OPERATIONS, EMERGENCY_OPERATIONS),
+            new Handler(Looper.getMainLooper())::post);
     private static volatile XposedService service;
 
     static void addServiceStateListener(ServiceStateListener listener, boolean notifyImmediately) {
@@ -47,12 +50,8 @@ public final class LongVcApplication extends Application
         LISTENERS.remove(listener);
     }
 
-    static boolean executeRootOperation(Runnable operation) {
-        return OPERATIONS.submit(operation);
-    }
-
-    static boolean executeEmergencyOperation(Runnable operation) {
-        return OPERATIONS.recover(operation);
+    StudioOperations studioOperations() {
+        return studioOperations;
     }
 
     @Override

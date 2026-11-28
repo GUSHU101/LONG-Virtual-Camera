@@ -91,6 +91,12 @@ final class MediaSourceManager {
                 && url.equals(config.obsUrl);
     }
 
+    boolean obsAudioSettingsMatch(String requestedUrl) throws IOException, InterruptedException {
+        SourceConfig config = readConfig().config;
+        String url = resolveObsUrl(requestedUrl, config);
+        return "obs".equals(config.audioMode) && url.equals(config.obsUrl);
+    }
+
     private static String resolveObsUrl(String requested, SourceConfig config) throws IOException {
         String url = requested.trim();
         if (url.isEmpty()) url = config.obsUrl;

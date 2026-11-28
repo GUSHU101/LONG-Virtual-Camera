@@ -1,6 +1,7 @@
 package com.gushu.longvc;
 
 import android.app.Activity;
+import android.os.Bundle;
 import android.text.format.DateFormat;
 import android.view.View;
 import android.widget.LinearLayout;
@@ -12,6 +13,7 @@ import java.util.Deque;
 
 final class StudioEvents {
     private static final int CAPACITY = 30;
+    private static final String FILTER = "studio_event_filter";
     private static final Deque<Entry> entries = new ArrayDeque<>();
 
     enum Level {
@@ -36,7 +38,7 @@ final class StudioEvents {
     private final LinearLayout rows;
     private Level filter;
 
-    StudioEvents(Activity activity) {
+    StudioEvents(Activity activity, Bundle state) {
         this.activity = activity;
         rows = activity.findViewById(R.id.event_rows);
         activity.findViewById(R.id.events_all).setOnClickListener(view -> filter(null));
@@ -47,7 +49,13 @@ final class StudioEvents {
             entries.clear();
             render();
         });
-        filter(null);
+        int selection = state == null ? -1 : state.getInt(FILTER, -1);
+        Level[] levels = Level.values();
+        filter(selection >= 0 && selection < levels.length ? levels[selection] : null);
+    }
+
+    void save(Bundle state) {
+        state.putInt(FILTER, filter == null ? -1 : filter.ordinal());
     }
 
     void add(Level level, CharSequence message) {

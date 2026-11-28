@@ -133,6 +133,7 @@ final class RootController {
     }
 
     RuntimeState configureObsAudio(String url) throws IOException, InterruptedException {
+        if (mediaSources.obsAudioSettingsMatch(url)) return status();
         return replaceSource(() -> mediaSources.configureObsAudio(url));
     }
 

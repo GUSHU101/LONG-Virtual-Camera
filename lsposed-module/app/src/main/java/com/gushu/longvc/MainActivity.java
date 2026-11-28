@@ -24,6 +24,7 @@ import android.widget.Toast;
 import java.util.Collections;
 import java.util.Date;
 import java.util.Locale;
+import java.util.function.Consumer;
 
 import io.github.libxposed.service.XposedService;
 import io.github.libxposed.service.HookedTarget;
@@ -48,6 +49,8 @@ public final class MainActivity extends Activity
     }
 
     private RootController rootController;
+    private StudioOperations operations;
+    private final Consumer<StudioOperations.Snapshot> operationListener = this::renderOperation;
     private DashboardView dashboard;
     private StudioPreview studioPreview;
     private StudioEvents studioEvents;
@@ -98,7 +101,7 @@ public final class MainActivity extends Activity
     private boolean obsAudioOnly;
     private boolean canRequestSystemScope;
     private boolean destroyed;
-    private long operationGeneration;
+    private long lastCompletionShown;
     private RuntimeState lastState;
 
     @Override
@@ -116,10 +119,11 @@ public final class MainActivity extends Activity
         documentPickerOpen = savedInstanceState != null
                 && savedInstanceState.getBoolean(PICKER_OPEN);
         setContentView(R.layout.activity_main);
-        studioEvents = new StudioEvents(this);
+        studioEvents = new StudioEvents(this, savedInstanceState);
         studioPreview = new StudioPreview(this, this::refreshOnEntry);
         dashboard = new DashboardView(this, savedInstanceState, studioPreview::stop);
-        rootController = new RootController(this);
+        rootController = new RootController(getApplicationContext());
+        operations = ((LongVcApplication) getApplication()).studioOperations();
 
         frameworkStatus = findViewById(R.id.framework_status);
         rootStatus = findViewById(R.id.root_status);
@@ -212,13 +216,13 @@ public final class MainActivity extends Activity
         });
 
         rootButton.setOnClickListener(view -> runOperation("正在请求 root…",
-                rootController::requestRootAndReadStatus));
+                RootController::requestRootAndReadStatus));
         installButton.setOnClickListener(view -> runOperation("正在校验并安装 ARM64 载荷…",
-                rootController::installAndReadStatus));
+                RootController::installAndReadStatus));
         for (View button : recoveryButtons) button.setOnClickListener(view -> confirmStop());
         refreshButton.setOnClickListener(view -> {
             renderFramework();
-            runOperation(getString(R.string.runtime_read_pending), rootController::requestRootAndReadStatus);
+            runOperation(getString(R.string.runtime_read_pending), RootController::requestRootAndReadStatus);
         });
         scopeButton.setOnClickListener(view -> requestSystemScope());
         selectVideoButton.setOnClickListener(view -> selectDocument("video/*", PICK_VIDEO));
@@ -234,8 +238,9 @@ public final class MainActivity extends Activity
                 scrollToObsSettings();
                 return;
             }
-            runOperation(getString(R.string.select_obs_audio_pending), () -> rootController.configureObsAudio(""),
-                    () -> obsAudioEdited = false);
+            runOperation(new StudioOperations.Request(getString(R.string.select_obs_audio_pending),
+                    StudioOperations.Effect.OBS_AUDIO_SELECTED, null),
+                    controller -> controller.configureObsAudio(""));
         });
         configureObsButton.setOnClickListener(view -> {
             String url = obsUrlInput.getText().toString().trim();
@@ -249,13 +254,10 @@ public final class MainActivity extends Activity
             obsUrlInput.setError(null);
             boolean useObsAudio = obsAudioSwitch.isChecked();
             boolean audioOnly = obsAudioOnly;
-            runOperation(getString(R.string.save_obs_pending),
-                    () -> audioOnly ? rootController.configureObsAudio(url)
-                            : rootController.configureObs(url, useObsAudio),
-                    () -> {
-                        obsAudioEdited = false;
-                        obsUrlInput.getText().clear();
-                    });
+            runOperation(new StudioOperations.Request(getString(R.string.save_obs_pending),
+                    StudioOperations.Effect.OBS_SAVED, null),
+                    controller -> audioOnly ? controller.configureObsAudio(url)
+                            : controller.configureObs(url, useObsAudio));
         });
         overviewAction.setOnClickListener(view -> dashboard.show(DashboardView.Page.SOURCES));
         findViewById(R.id.device_details).setOnClickListener(view -> dashboard.openDiagnostics());
@@ -268,13 +270,16 @@ public final class MainActivity extends Activity
     protected void onStart() {
         super.onStart();
         LongVcApplication.addServiceStateListener(this, true);
+        StudioOperations.Snapshot latest = operations.latest();
+        boolean hasUnseenOperation = latest != null && latest.id() != lastCompletionShown;
+        operations.attach(operationListener);
         // The picker result may arrive after onStart. A background refresh
         // cannot take the operation slot from the pending user import.
-        if (!documentPickerOpen && !busy && !emergencyBusy) refreshOnEntry();
+        if (!documentPickerOpen && !busy && !emergencyBusy && !hasUnseenOperation) refreshOnEntry();
     }
 
     private void refreshOnEntry() {
-        runOperation("正在检查 LSPosed 与 root 状态…", rootController::requestRootAndReadStatus);
+        runOperation("正在检查 LSPosed 与 root 状态…", RootController::requestRootAndReadStatus);
     }
 
     @Override
@@ -286,6 +291,7 @@ public final class MainActivity extends Activity
             outState.putBoolean(OBS_AUDIO_ONLY, obsAudioOnly);
         }
         dashboard.save(outState);
+        studioEvents.save(outState);
         super.onSaveInstanceState(outState);
     }
 
@@ -299,6 +305,7 @@ public final class MainActivity extends Activity
     @Override
     protected void onStop() {
         LongVcApplication.removeServiceStateListener(this);
+        operations.detach(operationListener);
         studioPreview.stop();
         super.onStop();
     }
@@ -348,18 +355,15 @@ public final class MainActivity extends Activity
         }
         Uri uri = data.getData();
         switch (requestCode) {
-            case PICK_VIDEO -> runOperation("正在校验并导入本地视频…",
-                    () -> rootController.stageVideo(uri), () -> {
-                        studioPreview.remember(uri, "video");
-                        announceMediaSaved();
-                    });
-            case PICK_IMAGE -> runOperation("正在解码并导入本地图片…",
-                    () -> rootController.stageImage(uri), () -> {
-                        studioPreview.remember(uri, "image");
-                        announceMediaSaved();
-                    });
-            case PICK_AUDIO -> runOperation("正在校验并导入本地音频…",
-                    () -> rootController.stageAudio(uri), this::announceMediaSaved);
+            case PICK_VIDEO -> runOperation(new StudioOperations.Request("正在校验并导入本地视频…",
+                            StudioOperations.Effect.VIDEO_IMPORTED, uri.toString()),
+                    controller -> controller.stageVideo(uri));
+            case PICK_IMAGE -> runOperation(new StudioOperations.Request("正在解码并导入本地图片…",
+                            StudioOperations.Effect.IMAGE_IMPORTED, uri.toString()),
+                    controller -> controller.stageImage(uri));
+            case PICK_AUDIO -> runOperation(new StudioOperations.Request("正在校验并导入本地音频…",
+                            StudioOperations.Effect.AUDIO_IMPORTED, null),
+                    controller -> controller.stageAudio(uri));
             default -> { }
         }
     }
@@ -382,7 +386,7 @@ public final class MainActivity extends Activity
         rendering = false;
         RootController.Action action = checked ? on : off;
         runOperation((checked ? "正在启用 " : "正在停用 ") + label(action) + "…",
-                () -> rootController.run(action));
+                controller -> controller.run(action));
     }
 
     private void confirmStop() {
@@ -445,105 +449,90 @@ public final class MainActivity extends Activity
         page.post(() -> page.smoothScrollTo(0, target.getTop()));
     }
 
-    private void runOperation(String pending, StateOperation operation) {
-        runOperation(pending, operation, () -> {});
+    private void runOperation(String pending, ControllerOperation operation) {
+        runOperation(new StudioOperations.Request(pending), operation);
     }
 
-    private void runOperation(String pending, StateOperation operation, Runnable onSuccess) {
+    private void runOperation(StudioOperations.Request request, ControllerOperation operation) {
         if (busy || emergencyBusy) {
             Toast.makeText(this, "已有操作正在执行", Toast.LENGTH_SHORT).show();
             renderState(lastState);
             return;
         }
-        final long generation = operationGeneration + 1;
-        boolean accepted = LongVcApplication.executeRootOperation(() -> {
-            try {
-                RuntimeState state = operation.run();
-                runOnUiThreadIfAlive(() -> {
-                    if (generation != operationGeneration) return;
-                    busy = false;
-                    onSuccess.run();
-                    publishState(state);
-                    dashboard.notice(DashboardView.Notice.NONE, "", "");
-                    recordOperation(state, pending);
-                });
-            } catch (Exception error) {
-                showOperationFailure(generation, false, error);
-            }
-        });
+        RootController controller = rootController;
+        boolean accepted = operations.start(request, false, () -> operation.run(controller),
+                controller::requestRootAndReadStatus);
         if (!accepted) {
             showNotice(DashboardView.Notice.INFO, R.string.root_operation_in_progress, "");
             renderState(lastState);
-            return;
         }
-        operationGeneration = generation;
-        busy = true;
-        dashboard.notice(DashboardView.Notice.BUSY, pending, "");
-        renderControls();
     }
 
     private void runEmergencyStop() {
         if (emergencyBusy) return;
-        final long generation = operationGeneration + 1;
-        boolean accepted = LongVcApplication.executeEmergencyOperation(() -> {
-            try {
-                RuntimeState state = rootController.run(RootController.Action.STOP_ALL);
-                runOnUiThreadIfAlive(() -> {
-                    if (generation != operationGeneration) return;
-                    emergencyBusy = false;
-                    publishState(state);
-                    showNotice(DashboardView.Notice.INFO, R.string.operation_restored,
-                            getString(R.string.recovery_verified));
-                });
-            } catch (Exception error) {
-                showOperationFailure(generation, true, error);
-            }
-        });
+        RootController controller = rootController;
+        boolean accepted = operations.start(
+                new StudioOperations.Request(getString(R.string.recovery_in_progress)), true,
+                () -> controller.run(RootController.Action.STOP_ALL), controller::requestRootAndReadStatus);
         if (!accepted) {
             showNotice(DashboardView.Notice.INFO, R.string.recovery_in_progress, "");
-            return;
         }
-        operationGeneration = generation;
-        busy = false;
-        emergencyBusy = true;
-        showNotice(DashboardView.Notice.BUSY, R.string.recovery_in_progress, "");
-        renderControls();
     }
 
-    private void showOperationFailure(long generation, boolean recovery, Exception error) {
-        RuntimeState observed = null;
-        String statusError = "";
-        if (error instanceof InterruptedException) {
-            Thread.currentThread().interrupt();
-        } else if (!Thread.currentThread().isInterrupted()) {
-            try {
-                observed = rootController.requestRootAndReadStatus();
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            } catch (Exception readFailure) {
-                statusError = safeMessage(readFailure);
-            }
+    private void renderOperation(StudioOperations.Snapshot snapshot) {
+        busy = snapshot.pending() && !snapshot.recovery();
+        emergencyBusy = snapshot.pending() && snapshot.recovery();
+        if (snapshot.pending()) {
+            dashboard.notice(DashboardView.Notice.BUSY, snapshot.request().label(), "");
+            renderControls();
+            return;
         }
-        final RuntimeState current = observed;
-        final String readError = statusError;
-        runOnUiThreadIfAlive(() -> {
-            if (generation != operationGeneration) return;
-            busy = false;
-            emergencyBusy = false;
-            publishState(current);
-            if (current == null) {
-                statusUpdated.setText(R.string.runtime_read_failed);
-                rootStatus.setText(R.string.root_unconfirmed);
+
+        lastCompletionShown = snapshot.id();
+        StudioOperations.Outcome outcome = snapshot.outcome();
+        boolean once = operations.claimCompletion(snapshot);
+        if (outcome.failure() == null && once) applyOperationSuccess(snapshot.request());
+        publishState(outcome.state(), outcome.readAt());
+        if (outcome.failure() != null) {
+            renderOperationFailure(snapshot.recovery(), outcome, once);
+        } else if (snapshot.recovery()) {
+            String details = getString(R.string.recovery_verified);
+            dashboard.notice(DashboardView.Notice.INFO, getString(R.string.operation_restored), details);
+            if (once) studioEvents.add(StudioEvents.Level.INFO, details);
+        } else {
+            dashboard.notice(DashboardView.Notice.NONE, "", "");
+            if (once) recordOperation(outcome.state(), snapshot.request().label());
+        }
+    }
+
+    private void applyOperationSuccess(StudioOperations.Request request) {
+        switch (request.effect()) {
+            case VIDEO_IMPORTED, IMAGE_IMPORTED -> {
+                studioPreview.remember(Uri.parse(request.document()),
+                        request.effect() == StudioOperations.Effect.VIDEO_IMPORTED ? "video" : "image");
+                announceMediaSaved();
             }
-            String message = safeMessage(error);
-            String status = current == null
-                    ? getString(R.string.runtime_state_unknown, readError.equals(message) ? "" : readError)
-                    : "";
-            String details = getString(recovery ? R.string.recovery_unverified
-                    : R.string.operation_failed, message);
-            showNotice(DashboardView.Notice.ERROR, R.string.operation_attention,
-                    status.isEmpty() ? details : details + "\n\n" + status);
-        });
+            case AUDIO_IMPORTED -> announceMediaSaved();
+            case OBS_SAVED -> {
+                obsAudioEdited = false;
+                obsUrlInput.getText().clear();
+            }
+            case OBS_AUDIO_SELECTED -> obsAudioEdited = false;
+            case NONE -> { }
+        }
+    }
+
+    private void renderOperationFailure(boolean recovery, StudioOperations.Outcome outcome, boolean once) {
+        String message = safeMessage(outcome.failure());
+        String details = getString(recovery ? R.string.recovery_unverified : R.string.operation_failed, message);
+        if (outcome.state() == null) {
+            statusUpdated.setText(R.string.runtime_read_failed);
+            rootStatus.setText(R.string.root_unconfirmed);
+            String readError = outcome.statusFailure() == null ? "" : safeMessage(outcome.statusFailure());
+            details += "\n\n" + getString(R.string.runtime_state_unknown, readError.equals(message) ? "" : readError);
+        }
+        dashboard.notice(DashboardView.Notice.ERROR, getString(R.string.operation_attention), details);
+        if (once) studioEvents.add(StudioEvents.Level.ERROR, details);
     }
 
     private void runOnUiThreadIfAlive(Runnable action) {
@@ -608,13 +597,13 @@ public final class MainActivity extends Activity
         }
     }
 
-    private void publishState(RuntimeState state) {
+    private void publishState(RuntimeState state, long readAt) {
         lastState = state;
         if (state == null) {
             statusUpdated.setText(R.string.status_not_read);
         } else {
             statusUpdated.setText(getString(R.string.status_updated,
-                    DateFormat.getTimeFormat(this).format(new Date())));
+                    DateFormat.getTimeFormat(this).format(new Date(readAt))));
         }
         renderState(state);
     }
@@ -995,7 +984,7 @@ public final class MainActivity extends Activity
     }
 
     @FunctionalInterface
-    private interface StateOperation {
-        RuntimeState run() throws Exception;
+    private interface ControllerOperation {
+        RuntimeState run(RootController controller) throws Exception;
     }
 }

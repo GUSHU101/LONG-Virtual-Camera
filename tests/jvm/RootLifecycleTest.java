@@ -2,11 +2,13 @@ package com.gushu.longvc;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 public final class RootLifecycleTest {
     private static void check(boolean condition, String message) {
@@ -73,6 +75,66 @@ public final class RootLifecycleTest {
                 + "audio_runtime=stock\nfeeder_runtime=idle\nmode_markers=clear\n"
                 + "audio_feeder_ready=0\nvideo_channel_ready=0\naudio_channel_ready=0\n"
                 + "visual_source_ready=1\naudio_source_ready=0\nobs_pull_running=0\n";
+    }
+
+    private static void replaysImportAcrossActivities() throws Exception {
+        ArrayDeque<Runnable> workers = new ArrayDeque<>();
+        ArrayDeque<Runnable> ui = new ArrayDeque<>();
+        StudioOperations operations = new StudioOperations(
+                new RootOperations(workers::add, workers::add), ui::add);
+        ArrayList<StudioOperations.Snapshot> original = new ArrayList<>();
+        Consumer<StudioOperations.Snapshot> oldScreen = original::add;
+        operations.attach(oldScreen);
+        RuntimeState imported = RuntimeState.parseController(snapshot("ok"), true, true);
+        StudioOperations.Request request = new StudioOperations.Request("Import image",
+                StudioOperations.Effect.IMAGE_IMPORTED, "content://fixture/new-image");
+        check(operations.start(request, false, () -> imported, () -> null), "import accepted");
+        check(original.size() == 1 && original.get(0).pending(), "old screen sees progress");
+        operations.detach(oldScreen);
+
+        ArrayList<StudioOperations.Snapshot> recreated = new ArrayList<>();
+        Consumer<StudioOperations.Snapshot> newScreen = recreated::add;
+        operations.attach(newScreen);
+        check(recreated.size() == 1 && recreated.get(0).pending(), "new screen sees in-flight import");
+        operations.detach(newScreen);
+        workers.remove().run();
+        ui.remove().run();
+        operations.attach(newScreen);
+        StudioOperations.Snapshot completion = recreated.get(recreated.size() - 1);
+        check(!completion.pending() && completion.outcome().state() == imported,
+                "new screen sees completed import without a new command");
+        check(completion.request().document().equals(request.document()), "preview can remember the imported document");
+        check(operations.claimCompletion(completion), "first screen can apply the completed import");
+        check(!operations.claimCompletion(completion), "replay cannot repeat the toast or URI changes");
+        check(original.size() == 1, "destroyed screen was detached");
+    }
+
+    private static void recoveryRejectsObsoleteCompletion() throws Exception {
+        ArrayDeque<Runnable> ordinary = new ArrayDeque<>();
+        ArrayDeque<Runnable> recovery = new ArrayDeque<>();
+        ArrayDeque<Runnable> ui = new ArrayDeque<>();
+        StudioOperations operations = new StudioOperations(
+                new RootOperations(ordinary::add, recovery::add), ui::add);
+        RuntimeState stopped = RuntimeState.parseController(snapshot("ok"), true, true);
+        check(operations.start(new StudioOperations.Request("Refresh"), false, () -> stopped, () -> null),
+                "normal operation accepted");
+        ordinary.remove().run();
+        check(operations.start(new StudioOperations.Request("Recover"), true, () -> stopped, () -> null),
+                "recovery accepted before queued GUI callback");
+        ui.remove().run();
+        check(operations.latest().pending() && operations.latest().recovery(),
+                "old GUI callback cannot replace recovery progress");
+        recovery.remove().run();
+        ui.remove().run();
+        check(operations.latest().outcome().state().isStopped(), "recovery outcome takes precedence");
+
+        IOException failed = new IOException("save failed");
+        check(operations.start(new StudioOperations.Request("Save"), false, () -> { throw failed; },
+                () -> stopped), "new operation accepted after recovery");
+        ordinary.remove().run();
+        ui.remove().run();
+        check(operations.latest().outcome().failure() == failed
+                && operations.latest().outcome().state() == stopped, "failed operation retains observed status");
     }
 
     private static void verifiesRecoveryResult() throws Exception {
@@ -166,6 +228,8 @@ public final class RootLifecycleTest {
     public static void main(String[] args) throws Exception {
         cancelsQueuedWork();
         interruptsRunningWork();
+        replaysImportAcrossActivities();
+        recoveryRejectsObsoleteCompletion();
         verifiesRecoveryResult();
         checksCameraOutputStats();
         System.out.println("Root lifecycle checks passed");
