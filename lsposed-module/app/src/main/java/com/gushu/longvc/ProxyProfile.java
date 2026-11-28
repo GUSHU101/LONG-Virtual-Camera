@@ -103,6 +103,10 @@ final class ProxyProfile {
             config.put("inbounds", new JSONArray().put(new JSONObject().put("type", "tun")
                     .put("interface_name", "lvcproxy0")
                     .put("address", new JSONArray().put("172.30.93.1/30").put("fd00:3976:1::1/126"))
+                    .put("route_exclude_address", new JSONArray()
+                            .put("10.0.0.0/8").put("172.16.0.0/12").put("192.168.0.0/16")
+                            .put("169.254.0.0/16").put("224.0.0.0/4").put("255.255.255.255/32")
+                            .put("fc00::/7").put("fe80::/10").put("ff00::/8"))
                     .put("mtu", 1400).put("auto_route", true).put("strict_route", true)
                     .put("iproute2_table_index", 39761).put("iproute2_rule_index", 8850)));
         }

@@ -120,7 +120,7 @@
     <string name="event_operation_completed">已完成 · %1$s</string>
     <string name="settings_title">系统设置</string>
     <string name="proxy_title">Root 透明代理</string>
-    <string name="proxy_intro">sing-box · Root TUN。局域网流量直连，代理流量的 DNS 使用经代理的 1.1.1.1 HTTPS 解析。</string>
+    <string name="proxy_intro">sing-box · Root TUN。局域网地址绕行，进入 TUN 的 53 端口 DNS 请求使用经代理的 HTTPS 解析。</string>
     <string name="proxy_protocol">协议</string>
     <string-array name="proxy_protocols">
         <item>SOCKS5</item>
