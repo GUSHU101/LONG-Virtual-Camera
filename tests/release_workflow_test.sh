@@ -19,10 +19,17 @@ for channel in development production; do
   grep -Fxq "commit=$commit" "$temp/metadata"
   : > "$temp/metadata"
 done
+expect_invalid_metadata() {
+  if GITHUB_OUTPUT="$temp/metadata" bash "$metadata" "$1" "$2" > "$temp/metadata-error" 2>&1; then
+    printf 'Unexpectedly accepted version %q in channel %q\n' "$1" "$2" >&2
+    exit 1
+  fi
+  grep -Fq '::error::' "$temp/metadata-error"
+}
 for invalid in '' v2.01.4 v0.0.0 v2100.0.1 'v2.0.1 bad'; do
-  ! GITHUB_OUTPUT="$temp/metadata" bash "$metadata" "$invalid" development
+  expect_invalid_metadata "$invalid" development
 done
-! GITHUB_OUTPUT="$temp/metadata" bash "$metadata" v2.0.1 quality
+expect_invalid_metadata v2.0.1 quality
 [[ ! -s "$temp/metadata" ]]
 
 cd "$temp"
