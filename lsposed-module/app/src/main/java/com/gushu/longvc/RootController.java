@@ -24,9 +24,12 @@ final class RootController {
         }
     }
 
-    static final class CameraInitializationException extends IOException {
-        CameraInitializationException() {
-            super("Camera module initialization failed (rc=17)");
+    static final class CameraActionException extends IOException {
+        final int messageResource;
+
+        CameraActionException(String message, int messageResource) {
+            super(message);
+            this.messageResource = messageResource;
         }
     }
 
@@ -69,8 +72,15 @@ final class RootController {
                 case ARM_PHOTO -> "photo_arm_failed";
                 default -> null;
             };
-            if (cameraError != null && result.reportsFailure(cameraError, "cr_injector: FAIL rc=17")) {
-                throw new CameraInitializationException();
+            if (cameraError != null) {
+                if (result.reportsFailure(cameraError, "camera_recovery=unverified")) {
+                    throw new CameraActionException("Camera recovery could not be verified",
+                            R.string.camera_recovery_failed);
+                }
+                if (result.reportsFailure(cameraError, "cr_injector: FAIL rc=17")) {
+                    throw new CameraActionException("Camera module initialization failed (rc=17)",
+                            R.string.camera_initialization_failed);
+                }
             }
             throw new IOException(action.command + " failed: " + result.describe());
         }

@@ -22,6 +22,7 @@ final class RuntimeState {
     final boolean videoFeederReady;
     final boolean audioFeederReady;
     final boolean cameraHookReady;
+    final boolean cameraRuntimeStock;
     final boolean audioHookReady;
     final boolean videoChannelReady;
     final boolean audioChannelReady;
@@ -61,6 +62,7 @@ final class RuntimeState {
         this.videoFeederReady = flag(values, "video_feeder_ready");
         this.audioFeederReady = flag(values, "audio_feeder_ready");
         this.cameraHookReady = flag(values, "camera_hook_ready");
+        this.cameraRuntimeStock = "stock".equals(values.get("camera_runtime"));
         this.audioHookReady = flag(values, "audio_hook_ready");
         this.videoChannelReady = flag(values, "video_channel_ready");
         this.audioChannelReady = flag(values, "audio_channel_ready");
@@ -149,7 +151,7 @@ final class RuntimeState {
 
     boolean isStopped() {
         return root && controllerVerified && !cameraEnabled && !photoEnabled
-                && !micEnabled && !cameraHookReady && !audioHookReady
+                && !micEnabled && cameraRuntimeStock && !cameraHookReady && !audioHookReady
                 && !videoFeederReady && !audioFeederReady && !obsPullRunning
                 && !videoChannelReady && !audioChannelReady;
     }

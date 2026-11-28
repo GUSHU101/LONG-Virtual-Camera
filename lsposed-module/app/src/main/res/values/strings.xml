@@ -55,6 +55,7 @@
     <string name="operation_failed">操作失败：%1$s</string>
     <string name="operation_failed_with_status">操作失败：%1$s\n\n%2$s</string>
     <string name="camera_initialization_failed">相机模块初始化失败（错误码 17），本次未能启用请求的输出。</string>
+    <string name="camera_recovery_failed">相机启动失败，回滚未通过验证。可点击「停止全部并恢复系统服务」重试清理。</string>
     <string name="root_operation_in_progress">另一项 Root 操作仍在执行。结束后可刷新状态。</string>
     <string name="recovery_in_progress">正在中断普通任务并验证系统服务恢复…</string>
     <string name="recovery_unverified">恢复未通过验证：%1$s\n\n%2$s</string>

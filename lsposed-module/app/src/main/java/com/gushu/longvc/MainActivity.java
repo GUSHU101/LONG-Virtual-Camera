@@ -492,6 +492,8 @@ public final class MainActivity extends Activity
                 + "\n照片替换：" + photoState(state)
                 + "\n虚拟麦克风：" + microphoneState(state)
                 + (state.micEnabled ? "" : "（手机原生麦克风）")
+                + (!state.cameraEnabled && !state.photoEnabled && !state.cameraRuntimeStock
+                    ? "\n原生相机服务恢复尚未确认。" : "")
                 + cameraOutputSummary(state);
     }
 
@@ -601,8 +603,8 @@ public final class MainActivity extends Activity
     }
 
     private String safeMessage(Throwable error) {
-        if (error instanceof RootController.CameraInitializationException) {
-            return getString(R.string.camera_initialization_failed);
+        if (error instanceof RootController.CameraActionException cameraError) {
+            return getString(cameraError.messageResource);
         }
         String message = error.getMessage();
         if (message == null || message.isBlank()) message = error.getClass().getSimpleName();

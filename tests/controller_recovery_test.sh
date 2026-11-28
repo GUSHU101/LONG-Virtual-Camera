@@ -9,6 +9,40 @@ DATA=$fixture
 CONTROL=$fixture
 MIC_MODE=$fixture/mic_mode
 
+(
+  CAM_READY=$fixture/camhook.ready
+  reported_pid=42 map_result=1 service_result=0
+  pidof() {
+    [[ $1 == cameraserver && -n "$reported_pid" ]] || return 1
+    printf '%s\n' "$reported_pid"
+  }
+  grep() {
+    case "${3:-}" in /proc/*/maps) return "$map_result" ;; esac
+    command grep "$@"
+  }
+  service() {
+    [[ $1 == check && $2 == media.camera && $service_result == 0 ]] || return 1
+    printf '%s\n' 'Service media.camera: found'
+  }
+  [[ $(camera_runtime_state) == stock ]]
+  map_result=0
+  [[ $(camera_runtime_state) == hook_mapped ]]
+  map_result=2
+  [[ $(camera_runtime_state) == unknown ]]
+  map_result=1 service_result=1
+  [[ $(camera_runtime_state) == unknown ]]
+  service_result=0 reported_pid=
+  [[ $(camera_runtime_state) == unknown ]]
+
+  reported_pid=42 map_result=2
+  wait_service() { return 0; }
+  touch "$CAM_READY"
+  if unload_camera_hook; then exit 1; fi
+  [[ ! -e "$CAM_READY" ]]
+  map_result=1
+  unload_camera_hook
+)
+
 verify_steps() {
   local fail_step=$1 expected_rc=$2 rc=0
   steps=""
@@ -113,11 +147,19 @@ camera_dump=$'Active Camera Clients:\n[\n(Camera ID: 0, Client Package Name: com
 (
   ensure_video() { steps+=" video"; }
   install_camera_flag() { steps+=" flag"; return 1; }
-  stop_video_passthrough() { steps+=" feeder"; }
-  unload_camera_hook() { steps+=" hook"; }
-  steps=""
-  if arm_photo; then exit 1; fi
-  [[ $steps == ' video flag feeder hook' && ! -e "$CONTROL/photo.lease" ]]
+  stop_video_passthrough() { steps+=" feeder"; [[ $fail_step != feeder ]]; }
+  unload_camera_hook() { steps+=" hook"; [[ $fail_step != hook ]]; }
+  for fail_step in none feeder hook; do
+    steps=""
+    if arm_photo > "$fixture/arm_failure"; then exit 1; fi
+    [[ $steps == ' video flag feeder hook' && ! -e "$CONTROL/photo.lease" ]]
+    if [[ $fail_step == none ]]; then
+      [[ ! -s "$fixture/arm_failure" ]]
+    else
+      [[ $(cat "$fixture/arm_failure") == camera_recovery=unverified ]]
+    fi
+  done
+  rm -f "$fixture/arm_failure"
 )
 
 (

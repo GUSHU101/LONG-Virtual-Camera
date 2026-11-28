@@ -318,6 +318,30 @@ mapped_hook_pid() {
   return 1
 }
 
+camera_runtime_state() {
+  local pids camera_pid scan_rc state
+  pids=$(pidof cameraserver 2>/dev/null) || pids=
+  state=stock
+  if [ -z "$pids" ]; then
+    say unknown
+    return
+  fi
+  for camera_pid in $pids; do
+    if grep -q '/libcr_hooks\.so' "/proc/$camera_pid/maps" 2>/dev/null; then
+      say hook_mapped
+      return
+    else
+      scan_rc=$?
+      [ "$scan_rc" -eq 1 ] || state=unknown
+    fi
+  done
+  if ! service check media.camera 2>/dev/null | grep -q ': found$' ||
+     [ "$(pidof cameraserver 2>/dev/null)" != "$pids" ]; then
+    state=unknown
+  fi
+  say "$state"
+}
+
 wait_service() {
   wait_proc=$1
   wait_old_pid=${2:-}
@@ -708,24 +732,26 @@ reconcile_stale_leases() {
 }
 
 unload_camera_hook() {
+  local marker_rc=0
   if ! old_camera_pid=$(mapped_hook_pid cameraserver); then
-    rm -f "$CAM_READY" && wait_service cameraserver
+    rm -f "$CAM_READY" && wait_service cameraserver &&
+      [ "$(camera_runtime_state)" = stock ]
     return $?
   fi
   remember_and_close_camera
-  rm -f "$CAM_READY"
+  rm -f "$CAM_READY" || marker_rc=1
   if ! killall -q cameraserver >/dev/null 2>&1 &&
      ! killall cameraserver >/dev/null 2>&1; then
     restore_camera
     return 1
   fi
   if ! wait_service cameraserver "$old_camera_pid" ||
-     mapped_hook_pid cameraserver >/dev/null 2>&1; then
+     [ "$(camera_runtime_state)" != stock ]; then
     restore_camera
     return 1
   fi
   restore_camera
-  return 0
+  return "$marker_rc"
 }
 
 unload_audio_hook() {
@@ -757,6 +783,7 @@ install_camera_flag() {
 }
 
 arm_visual() {
+  local cleanup_rc=0
   visual_lease="$CONTROL/$1.lease"
   visual_flag="$DATA/$2"
   visual_already_active=0
@@ -766,13 +793,14 @@ arm_visual() {
     return 0
   fi
   [ "$visual_already_active" = 0 ] || return 1
-  rm -f "$visual_lease" "$visual_flag"
+  rm -f "$visual_lease" "$visual_flag" || cleanup_rc=1
   # Both visual modes use the same writer. An unsuccessful second arm must
   # leave the surviving mode's writer and shared buffer intact.
   if ! visual_requested; then
-    stop_video_passthrough
-    unload_camera_hook
+    stop_video_passthrough || cleanup_rc=1
+    unload_camera_hook || cleanup_rc=1
   fi
+  [ "$cleanup_rc" -eq 0 ] || say "camera_recovery=unverified"
   return 1
 }
 
@@ -964,6 +992,7 @@ print_status() {
   say "video_channel_ready=$video_channel"
   say "audio_channel_ready=$audio_channel"
   say "camera_hook_ready=$camera_hook_ready"
+  say "camera_runtime=$(camera_runtime_state)"
   say "audio_hook_ready=$audio_hook_ready"
   say "camera_hook_pid=$camera_hook"
   say "audio_hook_pid=$audio_hook"
