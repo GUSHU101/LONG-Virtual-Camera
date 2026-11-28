@@ -290,14 +290,15 @@ local function environment(spec)
     return block
 end
 
--- If owner is nil, detect any IPv4 listener on this port. Otherwise verify
--- that MediaMTX, rather than a pre-existing listener, opened the port.
-local function listening(port, owner, address)
+-- An owner and address verify readiness. During replacement, exclude only
+-- the process that OBS is about to stop when checking for port conflicts.
+local function listening(port, owner, address, ignored_owner)
     local port_be = (port % 256) * 256 + math.floor(port / 256)
     return table_contains(function(buffer, size)
         return tcp.GetExtendedTcpTable(buffer, size, 0, 2, 3, 0)
     end, "LongVcTcpRow", function(row)
         return row.state == 2 and bit.band(row.localPort, 0xffff) == port_be
+            and row.pid ~= ignored_owner
             and (not owner or (row.pid == owner and row.localAddress == address))
     end)
 end
@@ -379,6 +380,11 @@ local function matches_endpoint(relay, endpoint)
         and relay.publisher_ip == endpoint.host
 end
 
+local function replacement_port_available(port)
+    local current_owner = child and child.job and child.pid
+    return listening(port, nil, nil, current_owner) == false
+end
+
 local function report_follow_warning(message)
     if follow_warning ~= message then
         follow_warning = message
@@ -399,8 +405,8 @@ local function sync_endpoint(now)
         follow_warning = nil
         return
     end
-    if endpoint.port ~= desired.port and listening(endpoint.port) ~= false then
-        report_follow_warning("OBS 的新推流端口不可用，当前中继继续运行。")
+    if not replacement_port_available(endpoint.port) then
+        report_follow_warning("OBS 推流端口暂不可用，当前中继继续运行。")
         return
     end
     -- Follow the OBS service independently of unapplied executable or LAN
@@ -486,7 +492,7 @@ local function apply_settings()
             warn("OBS 正在推流。请在停止推流后应用中继设置。")
             return false
         end
-        if next_relay.port ~= active.port and listening(next_relay.port) ~= false then
+        if not replacement_port_available(next_relay.port) then
             warn("新端口不可用，当前中继继续运行。")
             return false
         end
