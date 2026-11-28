@@ -74,6 +74,14 @@ final class MediaSourceManager {
         commitConfig(current, current.config.withObs(url, obsAudio));
     }
 
+    void configureObsAudio(String requestedUrl) throws IOException, InterruptedException {
+        ensureStorage();
+        SourceSnapshot current = readConfig();
+        String url = resolveObsUrl(requestedUrl, current.config);
+        if ("obs".equals(current.config.audioMode) && url.equals(current.config.obsUrl)) return;
+        commitConfig(current, current.config.withObsAudio(url));
+    }
+
     boolean obsSettingsMatch(String requestedUrl, boolean obsAudio)
             throws IOException, InterruptedException {
         SourceConfig config = readConfig().config;
@@ -552,6 +560,10 @@ final class MediaSourceManager {
         SourceConfig withObs(String url, boolean useObsAudio) {
             return new SourceConfig("obs", visualKind, visualPath, useObsAudio ? "obs" : "local",
                     audioPath, url);
+        }
+
+        SourceConfig withObsAudio(String url) {
+            return new SourceConfig(visualMode, visualKind, visualPath, "obs", audioPath, url);
         }
 
         String serialize() {

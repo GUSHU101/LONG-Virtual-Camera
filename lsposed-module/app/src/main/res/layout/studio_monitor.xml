@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/diagnostics_page"
+    style="@style/Page"
+    tools:targetApi="28"
+    android:accessibilityPaneTitle="@string/nav_diagnostics"
+    android:visibility="gone">
+    <LinearLayout
+        style="@style/PageContent">
+        <TextView
+            style="@style/PageTitle"
+            android:text="@string/status_title"
+            tools:targetApi="28"
+            android:accessibilityHeading="true" />
+        <LinearLayout
+            style="@style/Card">
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical">
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:layout_weight="1">
+                    <TextView
+                        android:id="@+id/monitor_health"
+                        style="@style/SectionTitle"
+                        android:text="@string/overview_unknown" />
+                    <TextView
+                        android:id="@+id/status_updated"
+                        style="@style/CaptionText"
+                        android:text="@string/status_not_read" />
+                </LinearLayout>
+                <Button
+                    android:id="@+id/refresh_button"
+                    style="@style/SecondaryButton"
+                    android:text="@string/refresh"
+                    android:layout_width="wrap_content" />
+            </LinearLayout>
+        </LinearLayout>
+        <LinearLayout
+            android:id="@+id/operation_card"
+            style="@style/Card"
+            android:visibility="gone">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/operation_details_title"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <TextView
+                android:id="@+id/operation_log"
+                style="@style/BodyText"
+                android:layout_marginTop="@dimen/space_small"
+                android:textIsSelectable="true" />
+        </LinearLayout>
+        <TextView
+            style="@style/SectionTitle"
+            android:text="@string/studio_health"
+            tools:targetApi="28"
+            android:accessibilityHeading="true"
+            android:layout_marginTop="@dimen/space_medium" />
+        <LinearLayout
+            android:id="@+id/authorization_card"
+            style="@style/Card">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/scope_title"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <TextView
+                android:id="@+id/framework_status"
+                style="@style/BodyText"
+                android:text="@string/framework_checking"
+                android:layout_marginTop="4dp"
+                android:textIsSelectable="true" />
+            <Button
+                android:id="@+id/scope_button"
+                style="@style/SecondaryButton"
+                android:text="@string/scope_button"
+                android:layout_marginTop="@dimen/space_small" />
+            <View
+                style="@style/Separator"
+                android:layout_marginTop="@dimen/space_small"
+                android:layout_marginBottom="@dimen/space_small" />
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/root_title"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <TextView
+                android:id="@+id/root_status"
+                style="@style/BodyText"
+                android:text="@string/root_not_checked"
+                android:layout_marginTop="4dp" />
+            <Button
+                android:id="@+id/root_button"
+                style="@style/SecondaryButton"
+                android:text="@string/root_button"
+                android:layout_marginTop="@dimen/space_small" />
+            <Button
+                android:id="@+id/install_button"
+                style="@style/ActionButton"
+                android:text="@string/install_button" />
+        </LinearLayout>
+        <LinearLayout
+            android:id="@+id/runtime_card"
+            style="@style/Card">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/runtime_heading"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <TextView
+                android:id="@+id/runtime_details"
+                style="@style/BodyText"
+                android:text="@string/overview_unknown"
+                android:layout_marginTop="@dimen/space_small"
+                android:textIsSelectable="true" />
+        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:baselineAligned="false"
+            android:gravity="center_vertical"
+            android:layout_marginTop="@dimen/space_small">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/event_log"
+                tools:targetApi="28"
+                android:accessibilityHeading="true"
+                android:layout_width="0dp"
+                android:layout_weight="1" />
+            <Button
+                android:id="@+id/clear_events"
+                style="@style/ActionButton"
+                android:text="@string/clear_log"
+                android:layout_width="wrap_content"
+                android:textColor="@color/accent_ink" />
+        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:baselineAligned="false"
+            android:gravity="center_vertical"
+            android:background="@drawable/status_background">
+            <Button
+                android:id="@+id/events_all"
+                style="@style/FilterButton"
+                android:text="@string/filter_all"
+                android:layout_width="0dp"
+                android:layout_weight="1" />
+            <Button
+                android:id="@+id/events_info"
+                style="@style/FilterButton"
+                android:text="@string/filter_info"
+                android:layout_width="0dp"
+                android:layout_weight="1" />
+            <Button
+                android:id="@+id/events_warn"
+                style="@style/FilterButton"
+                android:text="@string/filter_warn"
+                android:layout_width="0dp"
+                android:layout_weight="1" />
+            <Button
+                android:id="@+id/events_error"
+                style="@style/FilterButton"
+                android:text="@string/filter_error"
+                android:layout_width="0dp"
+                android:layout_weight="1" />
+        </LinearLayout>
+        <LinearLayout
+            android:id="@+id/events_card"
+            style="@style/Card">
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:id="@+id/event_rows" />
+        </LinearLayout>
+        <Button
+            android:id="@+id/monitor_stop_button"
+            style="@style/DangerButton"
+            android:text="@string/stop_all"
+            android:layout_marginTop="@dimen/card_gap" />
+    </LinearLayout>
+</ScrollView>

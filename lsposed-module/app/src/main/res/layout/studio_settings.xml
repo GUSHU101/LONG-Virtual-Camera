@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/settings_page"
+    style="@style/Page"
+    tools:targetApi="28"
+    android:accessibilityPaneTitle="@string/nav_settings"
+    android:visibility="gone">
+    <LinearLayout
+        style="@style/PageContent">
+        <TextView
+            style="@style/PageTitle"
+            android:text="@string/settings_title"
+            tools:targetApi="28"
+            android:accessibilityHeading="true" />
+        <LinearLayout
+            style="@style/Card">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/appearance_title"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical"
+                android:layout_marginTop="@dimen/space_small">
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:layout_weight="1">
+                    <TextView
+                        style="@style/StatusField"
+                        android:text="@string/theme_setting" />
+                    <TextView
+                        android:id="@+id/theme_value"
+                        style="@style/CaptionText"
+                        android:text="@string/theme_dark" />
+                </LinearLayout>
+                <Button
+                    android:id="@+id/change_theme"
+                    style="@style/SecondaryButton"
+                    android:text="@string/theme_action"
+                    android:layout_width="wrap_content" />
+            </LinearLayout>
+            <View
+                style="@style/Separator" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical"
+                android:minHeight="@dimen/touch_target">
+                <TextView
+                    style="@style/StatusField"
+                    android:text="@string/display_language"
+                    android:layout_width="0dp"
+                    android:layout_weight="1" />
+                <TextView
+                    style="@style/CaptionText"
+                    android:text="@string/language_zh"
+                    android:layout_width="wrap_content" />
+            </LinearLayout>
+        </LinearLayout>
+        <LinearLayout
+            style="@style/Card">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/device_and_safety"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <Button
+                android:id="@+id/settings_authorization"
+                style="@style/SettingsLink"
+                android:text="@string/device_authorization" />
+            <View
+                style="@style/Separator" />
+            <Button
+                android:id="@+id/settings_components"
+                style="@style/SettingsLink"
+                android:text="@string/studio_services" />
+            <View
+                style="@style/Separator" />
+            <Button
+                android:id="@+id/settings_events"
+                style="@style/SettingsLink"
+                android:text="@string/event_log" />
+        </LinearLayout>
+        <LinearLayout
+            style="@style/Card">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/about_app"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical"
+                android:layout_marginTop="@dimen/space_small">
+                <ImageView
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:src="@drawable/studio_mark"
+                    android:importantForAccessibility="no" />
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:layout_weight="1"
+                    android:layout_marginStart="@dimen/space_small">
+                    <TextView
+                        style="@style/SectionTitle"
+                        android:text="@string/studio_brand" />
+                    <TextView
+                        android:id="@+id/studio_version"
+                        style="@style/BodyText" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+        <LinearLayout
+            style="@style/Card">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/safe_recovery"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <TextView
+                style="@style/BodyText"
+                android:text="@string/stop_confirmation_message"
+                android:layout_marginTop="@dimen/space_small" />
+            <Button
+                android:id="@+id/settings_stop_button"
+                style="@style/DangerButton"
+                android:text="@string/stop_all"
+                android:layout_marginTop="@dimen/card_gap" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

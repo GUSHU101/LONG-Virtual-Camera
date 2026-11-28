@@ -132,6 +132,10 @@ final class RootController {
         return replaceSource(() -> mediaSources.configureObs(url, obsAudio));
     }
 
+    RuntimeState configureObsAudio(String url) throws IOException, InterruptedException {
+        return replaceSource(() -> mediaSources.configureObsAudio(url));
+    }
+
     RuntimeState status() throws IOException, InterruptedException {
         // Never execute an unknown/corrupt file as root merely to read status.
         // A degraded but rooted fallback keeps repair and emergency-stop UI

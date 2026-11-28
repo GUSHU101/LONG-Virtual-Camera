@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/control_page"
+    style="@style/Page"
+    tools:targetApi="28"
+    android:accessibilityPaneTitle="@string/nav_control">
+    <LinearLayout
+        style="@style/PageContent">
+        <TextView
+            style="@style/PageTitle"
+            android:text="@string/control_heading"
+            tools:targetApi="28"
+            android:accessibilityHeading="true" />
+        <LinearLayout
+            style="@style/Card"
+            android:background="@drawable/studio_session">
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical">
+                <TextView
+                    style="@style/CaptionText"
+                    android:text="@string/studio_current_session"
+                    android:layout_width="0dp"
+                    android:layout_weight="1" />
+                <TextView
+                    android:id="@+id/overview_badge"
+                    style="@style/StatusChip"
+                    android:text="@string/studio_status_unknown" />
+            </LinearLayout>
+            <TextView
+                android:id="@+id/overview_state"
+                style="@style/DisplayStatus"
+                android:text="@string/overview_unknown"
+                android:layout_marginTop="@dimen/space_small" />
+            <TextView
+                android:id="@+id/overview_description"
+                style="@style/BodyText"
+                android:text="@string/studio_state_description" />
+            <View
+                style="@style/Separator"
+                android:layout_marginTop="@dimen/space_small"
+                android:layout_marginBottom="@dimen/space_small" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical">
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:layout_weight="1">
+                    <TextView
+                        style="@style/CaptionText"
+                        android:text="@string/visual_input" />
+                    <TextView
+                        android:id="@+id/overview_source"
+                        style="@style/StatusField"
+                        android:text="@string/studio_waiting_source" />
+                </LinearLayout>
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:layout_weight="1">
+                    <TextView
+                        style="@style/CaptionText"
+                        android:text="@string/audio_input" />
+                    <TextView
+                        android:id="@+id/overview_audio"
+                        style="@style/StatusField"
+                        android:text="@string/studio_native_mic" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:baselineAligned="false"
+            android:gravity="center_vertical"
+            android:layout_marginTop="@dimen/space_small">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/media_monitor"
+                tools:targetApi="28"
+                android:accessibilityHeading="true"
+                android:layout_width="0dp"
+                android:layout_weight="1" />
+            <Button
+                android:id="@+id/overview_action"
+                style="@style/ActionButton"
+                android:text="@string/change_source"
+                android:layout_width="wrap_content"
+                android:textColor="@color/accent_ink" />
+        </LinearLayout>
+        <include
+            android:id="@+id/workbench_preview"
+            layout="@layout/studio_preview" />
+        <LinearLayout
+            style="@style/Card">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/outputs_heading"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <Switch
+                android:id="@+id/camera_switch"
+                style="@style/ControlSwitch"
+                android:text="@string/global_camera" />
+            <TextView
+                android:id="@+id/camera_status"
+                style="@style/BodyText"
+                android:text="@string/overview_unknown"
+                android:paddingBottom="@dimen/space_small" />
+            <View
+                style="@style/Separator" />
+            <Switch
+                android:id="@+id/photo_switch"
+                style="@style/ControlSwitch"
+                android:text="@string/photo_replace" />
+            <TextView
+                android:id="@+id/photo_status"
+                style="@style/BodyText"
+                android:text="@string/overview_unknown"
+                android:paddingBottom="@dimen/space_small" />
+            <View
+                style="@style/Separator" />
+            <Switch
+                android:id="@+id/mic_switch"
+                style="@style/ControlSwitch"
+                android:text="@string/microphone_replace" />
+            <TextView
+                android:id="@+id/mic_status"
+                style="@style/BodyText"
+                android:text="@string/microphone_replace_hint" />
+        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:baselineAligned="false"
+            android:gravity="center_vertical"
+            android:layout_marginTop="@dimen/space_small">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/device_overview"
+                tools:targetApi="28"
+                android:accessibilityHeading="true"
+                android:layout_width="0dp"
+                android:layout_weight="1" />
+            <Button
+                android:id="@+id/device_details"
+                style="@style/ActionButton"
+                android:text="@string/view_diagnostics"
+                android:layout_width="wrap_content"
+                android:textColor="@color/accent_ink" />
+        </LinearLayout>
+        <LinearLayout
+            style="@style/Card"
+            android:layout_marginTop="0dp">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/device_authorization" />
+            <TextView
+                android:id="@+id/workbench_device"
+                style="@style/BodyText"
+                android:text="@string/overview_unknown" />
+            <View
+                style="@style/Separator"
+                android:layout_marginTop="@dimen/space_small"
+                android:layout_marginBottom="@dimen/space_small" />
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/studio_services" />
+            <TextView
+                android:id="@+id/workbench_services"
+                style="@style/BodyText"
+                android:text="@string/overview_unknown" />
+        </LinearLayout>
+        <Button
+            android:id="@+id/stop_button"
+            style="@style/DangerButton"
+            android:text="@string/stop_all"
+            android:layout_marginTop="@dimen/card_gap" />
+    </LinearLayout>
+</ScrollView>

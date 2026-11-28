@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    style="@style/Card"
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_marginTop="0dp"
+    android:padding="@dimen/space_small">
+    <com.gushu.longvc.StudioPreviewFrame
+        android:id="@+id/preview_canvas"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@drawable/preview_grid">
+        <TextView
+            style="@style/PreviewCaption"
+            android:text="@string/preview_badge"
+            android:layout_gravity="top|start"
+            android:layout_margin="@dimen/space_small" />
+        <TextView
+            android:id="@+id/preview_state"
+            style="@style/PreviewCaption"
+            android:text="@string/preview_empty"
+            android:layout_gravity="center"
+            android:maxWidth="250dp"
+            android:gravity="center" />
+    </com.gushu.longvc.StudioPreviewFrame>
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:baselineAligned="false"
+        android:gravity="center_vertical"
+        android:layout_marginTop="@dimen/space_small">
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_weight="1">
+            <TextView
+                android:id="@+id/preview_title"
+                style="@style/StatusField"
+                android:text="@string/preview_empty" />
+            <TextView
+                android:id="@+id/preview_note"
+                style="@style/CaptionText"
+                android:text="@string/preview_source_only" />
+        </LinearLayout>
+        <Button
+            android:id="@+id/play_preview"
+            style="@style/SecondaryButton"
+            android:text="@string/preview_play"
+            android:layout_width="wrap_content"
+            android:layout_marginStart="@dimen/space_small" />
+    </LinearLayout>
+</LinearLayout>

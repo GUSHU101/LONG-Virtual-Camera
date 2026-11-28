@@ -1,19 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="surface">#101C1A</color>
-    <color name="surface_card">#192824</color>
-    <color name="surface_subtle">#21352F</color>
-    <color name="ink">#EFF9F5</color>
-    <color name="ink_muted">#B3C8BF</color>
-    <color name="accent">#98EACD</color>
-    <color name="on_accent">#11372C</color>
-    <color name="accent_tonal">#244B40</color>
-    <color name="accent_ink">#C4F9E5</color>
-    <color name="divider">#364A43</color>
-    <color name="disabled_fill">#293834</color>
-    <color name="disabled_ink">#9AA9A3</color>
-    <color name="ripple">#33A9F6DA</color>
-    <color name="warning">#FFBF9F</color>
-    <color name="warning_fill">#40281F</color>
+    <color name="surface">#0D1117</color>
+    <color name="surface_card">#151B24</color>
+    <color name="surface_subtle">#1C2531</color>
+    <color name="divider">#293442</color>
+    <color name="ink">#EAF0F7</color>
+    <color name="ink_muted">#8D9BAE</color>
+    <color name="accent">#73DFC4</color>
+    <color name="on_accent">#092820</color>
+    <color name="warning">#E7BD7A</color>
+    <color name="error">#FF929E</color>
+    <color name="warning_fill">#321F28</color>
+    <color name="accent_tonal">#1C3735</color>
+    <color name="accent_ink">#73DFC4</color>
+    <color name="disabled_fill">#1C2531</color>
+    <color name="disabled_ink">#8D9BAE</color>
+    <color name="ripple">#3373DFC4</color>
+    <color name="preview_surface">#080D15</color>
+    <color name="preview_ink">#BDCAD8</color>
+    <color name="preview_grid">#304157</color>
     <bool name="light_system_bars">false</bool>
 </resources>

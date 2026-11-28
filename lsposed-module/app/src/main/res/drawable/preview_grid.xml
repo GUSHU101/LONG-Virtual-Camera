@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="160dp" android:height="90dp"
+    android:viewportWidth="320" android:viewportHeight="180">
+    <path android:fillColor="@color/preview_surface" android:pathData="M0,0H320V180H0Z" />
+    <path android:strokeColor="@color/preview_grid" android:strokeWidth="1"
+        android:pathData="M106,0V180 M213,0V180 M0,60H320 M0,120H320 M122,90a38,38 0,1 0,76,0a38,38 0,1 0,-76,0 M150,90H170 M160,80V100" />
+</vector>

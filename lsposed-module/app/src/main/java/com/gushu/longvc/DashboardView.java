@@ -9,6 +9,8 @@ import android.view.WindowInsets;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
 
 final class DashboardView {
     private static final String SELECTED_PAGE = "dashboard_page";
@@ -16,7 +18,8 @@ final class DashboardView {
     enum Page {
         CONTROL(R.id.control_page, R.id.nav_control),
         SOURCES(R.id.source_page, R.id.nav_sources),
-        DIAGNOSTICS(R.id.diagnostics_page, R.id.nav_diagnostics);
+        DIAGNOSTICS(R.id.diagnostics_page, R.id.nav_diagnostics),
+        SETTINGS(R.id.settings_page, R.id.nav_settings);
 
         final int contentId;
         final int tabId;
@@ -36,11 +39,16 @@ final class DashboardView {
     private final View detailsButton;
     private final View operationCard;
     private final TextView operationLog;
+    private final Runnable onPageLeaving;
+    private final OnBackInvokedCallback backToControl;
     private Page current;
     private Notice notice = Notice.NONE;
 
-    DashboardView(Activity activity, Bundle savedState) {
+    DashboardView(Activity activity, Bundle savedState, Runnable onPageLeaving) {
         this.activity = activity;
+        this.onPageLeaving = onPageLeaving;
+        backToControl = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                ? () -> show(Page.CONTROL) : null;
         banner = activity.findViewById(R.id.feedback_banner);
         feedback = activity.findViewById(R.id.feedback_text);
         progress = activity.findViewById(R.id.feedback_progress);
@@ -63,6 +71,15 @@ final class DashboardView {
 
     void show(Page next) {
         if (current == next) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            OnBackInvokedDispatcher back = activity.getOnBackInvokedDispatcher();
+            if ((current == null || current == Page.CONTROL) && next != Page.CONTROL) {
+                back.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, backToControl);
+            } else if (current != null && next == Page.CONTROL) {
+                back.unregisterOnBackInvokedCallback(backToControl);
+            }
+        }
+        if (current != null) onPageLeaving.run();
         if (current == Page.SOURCES) {
             View focused = activity.getCurrentFocus();
             if (focused != null) {
@@ -80,10 +97,29 @@ final class DashboardView {
         updateDetailsButton();
     }
 
+    boolean returnToControl() {
+        if (current == Page.CONTROL) return false;
+        show(Page.CONTROL);
+        return true;
+    }
+
+    void close() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && current != Page.CONTROL) {
+            activity.getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(backToControl);
+        }
+    }
+
     void openDiagnostics() {
+        openDiagnosticsAt(0);
+    }
+
+    void openDiagnosticsAt(int anchor) {
         show(Page.DIAGNOSTICS);
         ScrollView page = activity.findViewById(R.id.diagnostics_page);
-        page.post(() -> page.scrollTo(0, 0));
+        page.post(() -> {
+            View target = anchor == 0 ? null : page.findViewById(anchor);
+            page.scrollTo(0, target == null ? 0 : target.getTop());
+        });
     }
 
     void notice(Notice next, CharSequence message, CharSequence details) {
@@ -92,7 +128,7 @@ final class DashboardView {
         banner.setBackgroundColor(activity.getColor(
                 next == Notice.ERROR ? R.color.warning_fill : R.color.surface_subtle));
         feedback.setTextColor(activity.getColor(
-                next == Notice.ERROR ? R.color.warning : R.color.ink));
+                next == Notice.ERROR ? R.color.error : R.color.ink));
         feedback.setText(message);
         progress.setVisibility(next == Notice.BUSY ? View.VISIBLE : View.GONE);
         operationLog.setText(details);
@@ -112,6 +148,8 @@ final class DashboardView {
                 Insets visible = insets.getInsets(WindowInsets.Type.systemBars()
                         | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
                 view.setPadding(visible.left, visible.top, visible.right, visible.bottom);
+                View navigation = view.findViewById(R.id.studio_navigation);
+                navigation.setVisibility(insets.isVisible(WindowInsets.Type.ime()) ? View.GONE : View.VISIBLE);
                 return WindowInsets.CONSUMED;
             });
             root.requestApplyInsets();

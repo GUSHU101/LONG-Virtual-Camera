@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/source_page"
+    style="@style/Page"
+    tools:targetApi="28"
+    android:accessibilityPaneTitle="@string/nav_sources"
+    android:visibility="gone">
+    <LinearLayout
+        style="@style/PageContent">
+        <TextView
+            style="@style/PageTitle"
+            android:text="@string/source_title"
+            tools:targetApi="28"
+            android:accessibilityHeading="true" />
+        <TextView
+            style="@style/SectionTitle"
+            android:text="@string/visual_input"
+            tools:targetApi="28"
+            android:accessibilityHeading="true"
+            android:layout_marginTop="@dimen/space_medium"
+            android:layout_marginBottom="@dimen/space_small" />
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:baselineAligned="false"
+            android:gravity="center_vertical">
+            <Button
+                android:id="@+id/choose_video"
+                style="@style/MediaChoice"
+                android:text="@string/local_video"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:drawableTop="@drawable/ic_studio_media" />
+            <Button
+                android:id="@+id/choose_image"
+                style="@style/MediaChoice"
+                android:text="@string/local_image"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_marginStart="@dimen/space_small"
+                android:drawableTop="@drawable/ic_studio_picture" />
+            <Button
+                android:id="@+id/choose_obs"
+                style="@style/MediaChoice"
+                android:text="@string/obs_title"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_marginStart="@dimen/space_small"
+                android:drawableTop="@drawable/ic_studio_stream" />
+        </LinearLayout>
+        <LinearLayout
+            android:id="@+id/local_source_panel"
+            style="@style/Card">
+            <TextView
+                android:id="@+id/visual_configuration"
+                style="@style/SectionTitle"
+                android:text="@string/studio_waiting_source" />
+            <Button
+                android:id="@+id/select_video_button"
+                style="@style/PrimaryButton"
+                android:text="@string/select_video"
+                android:layout_marginTop="@dimen/space_small" />
+            <Button
+                android:id="@+id/select_image_button"
+                style="@style/PrimaryButton"
+                android:text="@string/select_image"
+                android:layout_marginTop="@dimen/space_small"
+                android:visibility="gone" />
+        </LinearLayout>
+        <LinearLayout
+            android:id="@+id/obs_source_panel"
+            style="@style/Card"
+            android:visibility="gone">
+            <TextView
+                android:id="@+id/obs_configuration"
+                style="@style/BodyText"
+                android:text="@string/obs_status_unknown" />
+            <TextView
+                style="@style/BodyText"
+                android:text="@string/obs_url_label"
+                android:layout_marginTop="@dimen/space_small"
+                android:labelFor="@+id/obs_connection_input" />
+            <EditText
+                android:id="@id/obs_connection_input"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="@dimen/touch_target"
+                android:layout_marginTop="4dp"
+                android:background="@drawable/status_background"
+                android:paddingStart="@dimen/space_small"
+                android:paddingEnd="@dimen/space_small"
+                android:importantForAutofill="no"
+                android:imeOptions="actionDone|flagNoExtractUi|flagNoPersonalizedLearning"
+                android:inputType="textPassword"
+                android:saveEnabled="false"
+                android:singleLine="true"
+                android:textSize="14sp" />
+            <TextView
+                android:id="@+id/obs_address_guidance"
+                style="@style/CaptionText"
+                android:text="@string/obs_url_hint"
+                android:layout_marginTop="@dimen/space_small" />
+            <TextView
+                style="@style/BodyText"
+                android:text="@string/obs_hint" />
+            <Switch
+                android:id="@+id/obs_audio_switch"
+                style="@style/ControlSwitch"
+                android:text="@string/obs_audio_opt_in" />
+            <Button
+                android:id="@+id/configure_obs_button"
+                style="@style/PrimaryButton"
+                android:text="@string/configure_obs"
+                android:layout_marginTop="@dimen/space_small" />
+        </LinearLayout>
+        <LinearLayout
+            style="@style/Card">
+            <TextView
+                style="@style/SectionTitle"
+                android:text="@string/audio_input"
+                tools:targetApi="28"
+                android:accessibilityHeading="true" />
+            <TextView
+                android:id="@+id/media_audio_config"
+                style="@style/BodyText"
+                android:text="@string/overview_unknown"
+                android:layout_marginTop="@dimen/space_small" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical">
+                <TextView
+                    style="@style/StatusField"
+                    android:text="@string/studio_native_mic"
+                    android:layout_width="0dp"
+                    android:layout_weight="1" />
+                <Button
+                    android:id="@+id/phone_mic_button"
+                    style="@style/ActionButton"
+                    android:text="@string/studio_use_native"
+                    android:layout_width="wrap_content"
+                    android:textColor="@color/accent_ink" />
+            </LinearLayout>
+            <View
+                style="@style/Separator" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical">
+                <TextView
+                    style="@style/StatusField"
+                    android:text="@string/local_audio"
+                    android:layout_width="0dp"
+                    android:layout_weight="1" />
+                <Button
+                    android:id="@+id/select_audio_button"
+                    style="@style/ActionButton"
+                    android:text="@string/select_file"
+                    android:layout_width="wrap_content"
+                    android:textColor="@color/accent_ink" />
+            </LinearLayout>
+            <View
+                style="@style/Separator" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:baselineAligned="false"
+                android:gravity="center_vertical">
+                <TextView
+                    style="@style/StatusField"
+                    android:text="@string/obs_audio"
+                    android:layout_width="0dp"
+                    android:layout_weight="1" />
+                <Button
+                    android:id="@+id/select_obs_audio"
+                    style="@style/ActionButton"
+                    android:text="@string/studio_select"
+                    android:layout_width="wrap_content"
+                    android:textColor="@color/accent_ink" />
+            </LinearLayout>
+        </LinearLayout>
+        <TextView
+            style="@style/SectionTitle"
+            android:text="@string/preview_label"
+            tools:targetApi="28"
+            android:accessibilityHeading="true"
+            android:layout_marginTop="@dimen/space_medium"
+            android:layout_marginBottom="@dimen/space_small" />
+        <include
+            android:id="@+id/source_preview"
+            layout="@layout/studio_preview" />
+    </LinearLayout>
+</ScrollView>

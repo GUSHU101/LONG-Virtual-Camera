@@ -33,7 +33,7 @@
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:orientation">vertical</item>
-        <item name="android:layout_marginTop">@dimen/space_medium</item>
+        <item name="android:layout_marginTop">@dimen/card_gap</item>
         <item name="android:background">@drawable/card_background</item>
         <item name="android:padding">@dimen/panel_padding</item>
     </style>
@@ -42,7 +42,7 @@
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:textColor">@color/ink</item>
-        <item name="android:textSize">28sp</item>
+        <item name="android:textSize">24sp</item>
         <item name="android:textStyle">bold</item>
     </style>
 
@@ -50,7 +50,7 @@
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:textColor">@color/ink</item>
-        <item name="android:textSize">18sp</item>
+        <item name="android:textSize">16sp</item>
         <item name="android:textStyle">bold</item>
     </style>
 
@@ -103,6 +103,70 @@
         <item name="android:layout_weight">1</item>
         <item name="android:background">@drawable/button_tab</item>
         <item name="android:textColor">@color/tab_label</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:minHeight">64dp</item>
+        <item name="android:paddingTop">8dp</item>
+        <item name="android:paddingBottom">8dp</item>
+        <item name="android:gravity">center</item>
+    </style>
+
+    <style name="CaptionText" parent="BodyText">
+        <item name="android:textSize">12sp</item>
+    </style>
+
+    <style name="DisplayStatus" parent="PageTitle">
+        <item name="android:textSize">28sp</item>
+    </style>
+
+    <style name="StatusField" parent="BodyText">
+        <item name="android:textColor">@color/ink</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="StatusChip" parent="CaptionText">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:background">@drawable/status_background</item>
+        <item name="android:paddingStart">8dp</item>
+        <item name="android:paddingEnd">8dp</item>
+        <item name="android:paddingTop">4dp</item>
+        <item name="android:paddingBottom">4dp</item>
+    </style>
+
+    <style name="StudioIconButton" parent="android:style/Widget.Material.ImageButton">
+        <item name="android:layout_width">@dimen/touch_target</item>
+        <item name="android:layout_height">@dimen/touch_target</item>
+        <item name="android:background">@drawable/button_tonal</item>
+        <item name="android:scaleType">center</item>
+    </style>
+
+    <style name="MediaChoice" parent="NavButton">
+        <item name="android:minHeight">72dp</item>
+        <item name="android:background">@drawable/media_choice</item>
+        <item name="android:drawablePadding">4dp</item>
+        <item name="android:drawableTint">@color/tab_label</item>
+    </style>
+
+    <style name="FilterButton" parent="NavButton">
+        <item name="android:minHeight">@dimen/touch_target</item>
+    </style>
+
+    <style name="SettingsLink" parent="ActionButton">
+        <item name="android:gravity">start|center_vertical</item>
+        <item name="android:textColor">@color/accent_ink</item>
+        <item name="android:paddingStart">0dp</item>
+    </style>
+
+    <style name="DangerButton" parent="ActionButton">
+        <item name="android:textColor">@color/error</item>
+        <item name="android:background">@drawable/studio_danger_button</item>
+    </style>
+
+    <style name="PreviewCaption" parent="CaptionText">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:textColor">@color/preview_ink</item>
+        <item name="android:background">@color/preview_surface</item>
+        <item name="android:padding">4dp</item>
+        <item name="android:importantForAccessibility">no</item>
     </style>
 
     <style name="Separator">
