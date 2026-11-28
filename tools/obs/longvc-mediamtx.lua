@@ -575,10 +575,13 @@ local function report_status()
     return false
 end
 
+local function show_manual_endpoint(props, manual)
+    obs.obs_property_set_visible(obs.obs_properties_get(props, "port"), manual)
+    obs.obs_property_set_visible(obs.obs_properties_get(props, "stream_path"), manual)
+end
+
 local function update_endpoint_fields(props, _, data)
-    local manual = not obs.obs_data_get_bool(data, "follow_obs")
-    obs.obs_property_set_enabled(obs.obs_properties_get(props, "port"), manual)
-    obs.obs_property_set_enabled(obs.obs_properties_get(props, "stream_path"), manual)
+    show_manual_endpoint(props, not obs.obs_data_get_bool(data, "follow_obs"))
     return true
 end
 
@@ -594,6 +597,7 @@ function script_description()
     return "LONG Virtual Camera · MediaMTX 中继<br>"
         .. "使用「沿用 OBS 本机推流地址」可以读取 OBS 的端口和流路径。<br>"
         .. "OBS 使用自定义 RTMP，推流码留空，编码选 H.264。<br>"
+        .. "点击「检查中继和推流状态」，在脚本日志中查看实际推流地址。<br>"
         .. "使用 Wi-Fi 时开启「允许局域网拉流」。使用 USB 时请让 OBS 推流到 127.0.0.1。"
 end
 
@@ -605,6 +609,7 @@ function script_properties()
     local follow = obs.obs_properties_add_bool(props, "follow_obs", "沿用 OBS 本机推流地址")
     obs.obs_properties_add_int(props, "port", "RTMP 端口", 1024, 65535, 1)
     obs.obs_properties_add_text(props, "stream_path", "流路径", obs.OBS_TEXT_DEFAULT)
+    show_manual_endpoint(props, not (settings_now and settings_now.follow_obs))
     obs.obs_property_set_modified_callback(follow, update_endpoint_fields)
     local readers = obs.obs_properties_add_bool(props, "lan_readers", "允许局域网拉流（无需填写 IP）")
     obs.obs_property_set_long_description(readers, "可访问端口的私有 IPv4 设备可以读取当前画面。")
