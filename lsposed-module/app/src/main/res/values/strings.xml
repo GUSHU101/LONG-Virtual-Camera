@@ -119,6 +119,47 @@
     <string name="event_empty">当前筛选条件下没有日志</string>
     <string name="event_operation_completed">已完成 · %1$s</string>
     <string name="settings_title">系统设置</string>
+    <string name="proxy_title">Root 透明代理</string>
+    <string name="proxy_intro">sing-box · Root TUN。局域网流量直连，代理流量的 DNS 使用经代理的 1.1.1.1 HTTPS 解析。</string>
+    <string name="proxy_protocol">协议</string>
+    <string-array name="proxy_protocols">
+        <item>SOCKS5</item>
+        <item>HTTP CONNECT</item>
+        <item>HTTPS CONNECT</item>
+        <item>VLESS / TLS</item>
+        <item>VMess / TLS</item>
+        <item>Hysteria2</item>
+    </string-array>
+    <string name="proxy_host">上游主机</string>
+    <string name="proxy_port">端口</string>
+    <string name="proxy_username">用户名（可选）</string>
+    <string name="proxy_uuid">用户 UUID</string>
+    <string name="proxy_password">密码或令牌</string>
+    <string name="proxy_sni">TLS 证书名称（可选）</string>
+    <string name="proxy_url">测试链接（HTTP 或 HTTPS）</string>
+    <string name="proxy_start">接管系统流量</string>
+    <string name="proxy_stop">停止代理并验证恢复</string>
+    <string name="proxy_test">通过此上游测试链接</string>
+    <string name="proxy_back">返回设置</string>
+    <string name="proxy_confirmation">启用系统透明代理？</string>
+    <string name="proxy_confirmation_detail">启用后，手机的网络请求将按代理配置转发，局域网仍走直连。请确认上游可用。</string>
+    <string name="proxy_confirmation_test">先通过所选上游访问测试链接，收到响应后再启用系统透明代理。局域网仍走直连。</string>
+    <string name="proxy_idle">点击刷新检查是否正在运行。</string>
+    <string name="proxy_working">正在检查代理…</string>
+    <string name="proxy_active">已确认 Root TUN 和策略路由已接管。</string>
+    <string name="proxy_stopped">代理已停止，或尚未部署。</string>
+    <string name="proxy_unknown">状态未确认，请检查 Root 授权、核心完整性或设备权限。</string>
+    <string name="proxy_residue">仍检测到该代理配置使用的接口或路由，请检查系统配置后再启动。</string>
+    <string name="proxy_failed">未能建立 Root TUN 或确认系统已恢复。</string>
+    <string name="proxy_start_failed">核心未能建立可验证的 Root TUN 路由。</string>
+    <string name="proxy_device_unsupported">无法访问 TUN 或读取设备的 IPv4、IPv6 策略路由。</string>
+    <string name="proxy_busy">有另一项代理操作正在执行。</string>
+    <string name="proxy_already_running">代理已在运行。更换配置前请先停止。</string>
+    <string name="proxy_invalid">请检查协议、服务器、端口和认证信息。</string>
+    <string name="proxy_url_invalid">请输入不含用户名和密码的 HTTP 或 HTTPS 链接。</string>
+    <string name="proxy_response">经所选代理收到网站响应 · 测试总耗时 %1$d ms</string>
+    <string name="proxy_timeout">测试或 Root 操作超时。</string>
+    <string name="proxy_connection_failed">通过所选上游访问失败。请核对地址、认证或 TLS 证书。</string>
     <string name="appearance_title">外观与体验</string>
     <string name="theme_setting">主题模式</string>
     <string name="theme_action">切换主题</string>

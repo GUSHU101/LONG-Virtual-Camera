@@ -428,6 +428,8 @@ public final class MainActivity extends Activity
                 view -> dashboard.openDiagnosticsAt(R.id.runtime_card));
         findViewById(R.id.settings_events).setOnClickListener(
                 view -> dashboard.openDiagnosticsAt(R.id.events_card));
+        findViewById(R.id.settings_proxy).setOnClickListener(
+                view -> startActivity(new Intent(this, ProxyActivity.class)));
         TextView version = findViewById(R.id.studio_version);
         try {
             version.setText(getString(R.string.studio_version,

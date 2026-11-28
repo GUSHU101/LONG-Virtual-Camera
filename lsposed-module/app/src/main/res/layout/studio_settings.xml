@@ -90,6 +90,11 @@
                 android:id="@+id/settings_events"
                 style="@style/SettingsLink"
                 android:text="@string/event_log" />
+            <View style="@style/Separator" />
+            <Button
+                android:id="@+id/settings_proxy"
+                style="@style/SettingsLink"
+                android:text="@string/proxy_title" />
         </LinearLayout>
         <LinearLayout
             style="@style/Card">

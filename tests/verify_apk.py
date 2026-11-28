@@ -38,8 +38,25 @@ def verify(apk: Path) -> None:
             recorded.add(name)
         if recorded != expected:
             raise ValueError("The APK payload manifest is incomplete")
+        proxy = "assets/proxy/arm64-v8a/"
+        files = sorted(name.removeprefix(proxy) for name in archive.namelist()
+                       if name.startswith(proxy) and not name.endswith("/"))
+        if files != ["LICENSE", "SOURCE", "longvc-proxy.sh", "sing-box", "sing-box.sha256"]:
+            raise ValueError("APK proxy payload has missing, duplicate or unexpected files")
+        core = archive.read(proxy + "sing-box")
+        if core[:6] != b"\x7fELF\x02\x01" or core[18:20] != b"\xb7\x00":
+            raise ValueError("sing-box is not a little-endian ARM64 ELF binary")
+        if sha256(core).hexdigest() != archive.read(proxy + "sing-box.sha256").decode().strip():
+            raise ValueError("sing-box hash mismatch")
+        launcher = archive.read(proxy + "longvc-proxy.sh")
+        if not launcher.startswith(b"#!/system/bin/sh\n") or b"\r" in launcher:
+            raise ValueError("Proxy controller script must use LF line endings")
+        if b"GNU GENERAL PUBLIC LICENSE" not in archive.read(proxy + "LICENSE"):
+            raise ValueError("Missing sing-box license")
+        if b"https://github.com/SagerNet/sing-box/tree/" not in archive.read(proxy + "SOURCE"):
+            raise ValueError("Missing sing-box source information")
 
 
 if __name__ == "__main__":
     verify(Path(sys.argv[1]))
-    print("APK scope, ARM64 payloads and SHA-256 manifest verified")
+    print("APK scope, camera and proxy ARM64 payloads, and SHA-256 manifests verified")

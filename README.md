@@ -12,6 +12,21 @@ LONG Virtual Camera 是面向自有或明确授权测试设备的 Android ARM64 
 
 `system` 作用域用于激活模块。相机和音频替换由原生系统服务路径处理，覆盖范围取决于固件及实际使用的 CameraService、gralloc 和 Audio HAL 路径。
 
+## Root 透明代理
+
+在手机 App 的「设置 → Root 透明代理」填写上游地址、端口和认证信息。可填入 HTTP 或 HTTPS 测试链接，再点「通过此上游测试链接」。收到响应表示该请求已通过所选上游往返。测试可在系统代理关闭时运行。填有测试链接时，接管前先执行同一测试，成功后才修改路由。
+
+「接管系统流量」使用 Root 创建 `lvcproxy0` TUN 并安装 IPv4、IPv6 策略路由，无需 Android 的 VPN 授权。私有 IP 流量使用直连，保留局域网 OBS 拉流路径。识别到的常规 DNS 请求使用代理内的 HTTPS 解析。使用完毕后点「停止代理并验证恢复」。代理与相机、麦克风各有独立开关，设备重启后需手动启用代理。
+
+| 上游 | 支持范围 |
+| --- | --- |
+| SOCKS5 | 支持用户名和密码，UDP 取决于服务器是否支持 `UDP ASSOCIATE` |
+| HTTP / HTTPS | HTTP CONNECT，支持认证，公网业务使用 TCP |
+| Xray / V2Fly | 分别支持 VLESS / VMess 的标准 TCP + TLS 配置 |
+| Hysteria | 支持 Hysteria 2，使用 TLS 和密码认证 |
+
+所有上游由 sing-box 处理。Xray 专有传输和整份第三方核心配置文件尚无导入入口。TLS 连接校验证书，连接到 IP 时可填写证书对应的主机名。启用前应确认网络及 Root 环境能建立所需路由。 [sing-box 1.14.6](https://github.com/SagerNet/sing-box/releases/tag/v1.14.6) · [TUN 参数](https://sing-box.sagernet.org/configuration/inbound/tun/)
+
 ## OBS 与画面分辨率
 
 Windows x64 的 OBS 可用 Lua 脚本自动管理本机 MediaMTX。解压官方 MediaMTX 后，在 OBS「工具 → 脚本」加载 `longvc-mediamtx.lua`，选择 `mediamtx.exe`，再点「启动 / 应用中继设置」。勾选「沿用 OBS 本机推流地址」可从已有 OBS 设置读取端口与流路径。脚本配置随 OBS 场景集合保存。 [配置与排查](tools/obs/README.md) · [MediaMTX 下载](https://mediamtx.org/docs/kickoff/install)
@@ -39,7 +54,7 @@ cmake --build build/camreplace-android --parallel
 python tests/verify_apk.py lsposed-module/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Windows 开发机可用 `lsposed-module\gradlew.bat` 执行相同的 Gradle 任务。载荷清单会核验 APK 内的文件大小、SHA-256 与 ARM64 ELF 架构。
+Windows 开发机可用 `lsposed-module\gradlew.bat` 执行相同的 Gradle 任务。构建代理载荷需要 Python 3，首次构建下载固定版本的官方 sing-box ARM64 归档并核验 SHA-256，后续使用 `build/proxy-core` 的缓存。APK 检查会分别验证相机载荷和代理核心的 SHA-256 与 ARM64 ELF 架构。
 
 ## 从 GitHub 获取 APK
 

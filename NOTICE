@@ -21,3 +21,9 @@ resolution adaptation and MediaCodec file playback.
 Native-core third-party attributions are listed in
 engines/camreplace/THIRD_PARTY_NOTICES.txt and in license files stored beside
 the corresponding source trees.
+
+sing-box - https://github.com/SagerNet/sing-box/tree/v1.14.6
+  Unmodified standalone Android ARM64 executable from the v1.14.6 release.
+  Original license: GNU GPL v3.0 or later. License and source information
+  are included beside the executable in APK assets/proxy/arm64-v8a/.
+  Source archive: https://github.com/SagerNet/sing-box/archive/refs/tags/v1.14.6.tar.gz

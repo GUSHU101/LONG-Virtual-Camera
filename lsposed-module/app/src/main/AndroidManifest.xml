@@ -17,6 +17,10 @@
         android:theme="@style/Theme.LongVirtualCamera"
         android:usesCleartextTraffic="false">
         <activity
+            android:name=".ProxyActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+        <activity
             android:name=".MainActivity"
             tools:targetApi="33"
             android:enableOnBackInvokedCallback="true"

@@ -1,0 +1,9 @@
+<resources>
+    <item name="proxy_protocol_field" type="id" />
+    <item name="proxy_host_field" type="id" />
+    <item name="proxy_port_field" type="id" />
+    <item name="proxy_user_field" type="id" />
+    <item name="proxy_password_field" type="id" />
+    <item name="proxy_sni_field" type="id" />
+    <item name="proxy_url_field" type="id" />
+</resources>

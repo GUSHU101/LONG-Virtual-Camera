@@ -27,6 +27,23 @@ if ((developmentStorePath == null) != (developmentStorePassword == null)) {
 }
 def controlScript = layout.projectDirectory.file("src/main/payload/longvc-control.sh")
 def generatedAssetsDir = layout.buildDirectory.dir("generated/payloadAssets").get().asFile
+def generatedProxyAssetsDir = layout.buildDirectory.dir("generated/proxyAssets").get().asFile
+def proxyStageScript = rootProject.file("../.github/scripts/stage-proxy-core.py")
+def proxyLauncher = file("src/main/proxy/longvc-proxy.sh")
+def proxyCache = rootProject.file("../build/proxy-core")
+
+tasks.register("prepareProxyAssets") {
+    inputs.files(proxyStageScript, proxyLauncher, rootProject.file("../LICENSE"))
+    outputs.dir(generatedProxyAssetsDir)
+    doLast {
+        File output = new File(generatedProxyAssetsDir, "proxy/arm64-v8a")
+        def python = System.getProperty("os.name").startsWith("Windows") ? "python" : "python3"
+        providers.exec {
+            commandLine python, proxyStageScript, proxyCache, output
+        }.result.get().assertNormalExitValue()
+        new File(output, "longvc-proxy.sh").bytes = proxyLauncher.bytes
+    }
+}
 
 tasks.register("preparePayload") {
     inputs.files(payloadFiles.collect { new File(payloadDir, it) })
@@ -156,6 +173,7 @@ android {
     sourceSets {
         main {
             assets.srcDir(generatedAssetsDir)
+            assets.srcDir(generatedProxyAssetsDir)
         }
     }
 
@@ -183,7 +201,7 @@ android {
 }
 
 tasks.named("preBuild").configure {
-    dependsOn(tasks.named("preparePayload"))
+    dependsOn(tasks.named("preparePayload"), tasks.named("prepareProxyAssets"))
 }
 
 dependencies {
