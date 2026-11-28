@@ -67,36 +67,41 @@ static inline int clampi(int v, int lo, int hi)
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
+static inline void write_rgb_pixel(uint8_t* rgb, int luma, int red, int green, int blue)
+{
+  rgb[0] = (uint8_t) clampi((luma + red) >> 8, 0, 255);
+  rgb[1] = (uint8_t) clampi((luma + green) >> 8, 0, 255);
+  rgb[2] = (uint8_t) clampi((luma + blue) >> 8, 0, 255);
+}
+
 // NV21 → RGB888. NV21 is Y plane (sw*sh bytes) followed by interleaved
-// V,U pairs at half-resolution ((sw/2)*(sh/2) pairs * 2 bytes). The
-// chroma row index is y/2; the chroma byte pair starts at (x/2)*2.
+// V,U pairs at half-resolution. Each pair supplies a 2x2 block, so
+// reuse its chroma contribution for each of the four luma values.
 static void nv21_to_rgb24(const uint8_t* nv21, int sw, int sh, uint8_t* rgb,
                            int bt709, int full_range)
 {
   const uint8_t* y_plane = nv21;
   const uint8_t* vu_plane = nv21 + (size_t) sw * sh;
   const cr_yuv_coefficients yuv = cr_yuv_coefficients_for(bt709, full_range);
-  for (int y = 0; y < sh; ++y)
+  const size_t rgb_stride = (size_t) sw * 3;
+  for (int y = 0; y < sh; y += 2)
   {
-    const int sy_uv = y >> 1;
-    const uint8_t* yr = y_plane + (size_t) y * sw;
-    const uint8_t* vu = vu_plane + (size_t) sy_uv * sw;
-    uint8_t* drow = rgb + (size_t) y * sw * 3;
-    for (int x = 0; x < sw; ++x)
+    const uint8_t* top = y_plane + (size_t) y * sw;
+    const uint8_t* bottom = top + sw;
+    const uint8_t* vu = vu_plane + (size_t) (y / 2) * sw;
+    uint8_t* rgb_top = rgb + (size_t) y * rgb_stride;
+    uint8_t* rgb_bottom = rgb_top + rgb_stride;
+    for (int x = 0; x < sw; x += 2)
     {
-      const int sx_uv = (x >> 1) << 1;
-      const int Y = yr[x];
-      const int V = vu[sx_uv + 0];
-      const int U = vu[sx_uv + 1];
-      const int C = yuv.y_scale * (Y - yuv.y_offset);
-      const int D = U - 128;
-      const int E = V - 128;
-      int R = (C + yuv.red_v * E + 128) >> 8;
-      int G = (C - yuv.green_u * D - yuv.green_v * E + 128) >> 8;
-      int B = (C + yuv.blue_u * D + 128) >> 8;
-      drow[x * 3 + 0] = (uint8_t) clampi(R, 0, 255);
-      drow[x * 3 + 1] = (uint8_t) clampi(G, 0, 255);
-      drow[x * 3 + 2] = (uint8_t) clampi(B, 0, 255);
+      const int v = vu[x] - 128;
+      const int u = vu[x + 1] - 128;
+      const int red = yuv.red_v * v + 128;
+      const int green = 128 - yuv.green_u * u - yuv.green_v * v;
+      const int blue = yuv.blue_u * u + 128;
+      write_rgb_pixel(rgb_top + x * 3, yuv.y_scale * (top[x] - yuv.y_offset), red, green, blue);
+      write_rgb_pixel(rgb_top + x * 3 + 3, yuv.y_scale * (top[x + 1] - yuv.y_offset), red, green, blue);
+      write_rgb_pixel(rgb_bottom + x * 3, yuv.y_scale * (bottom[x] - yuv.y_offset), red, green, blue);
+      write_rgb_pixel(rgb_bottom + x * 3 + 3, yuv.y_scale * (bottom[x + 1] - yuv.y_offset), red, green, blue);
     }
   }
 }

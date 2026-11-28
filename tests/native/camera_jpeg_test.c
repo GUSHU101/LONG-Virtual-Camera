@@ -1,11 +1,80 @@
 #include "jpeg_encode.h"
 
+#define STBI_ONLY_JPEG
+#define STBI_NO_STDIO
+#define STB_IMAGE_IMPLEMENTATION
+#include "../../engines/camreplace/third_party/stb/stb_image.h"
+
 #include <assert.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
+static int reference_channel(double value)
+{
+  return (int) lround(fmin(255.0, fmax(0.0, value)));
+}
+
+static void verify_encoded_colors(int bt709, int full_range)
+{
+  enum { SWATCH = 16, COLUMNS = 4, WIDTH = SWATCH * COLUMNS, HEIGHT = SWATCH * 2 };
+  // Include a gray ramp and asymmetric chroma values to catch a U/V swap.
+  const uint8_t swatches[][3] = {
+      {full_range ? 0 : 16, 128, 128}, {64, 128, 128}, {170, 128, 128},
+      {full_range ? 255 : 235, 128, 128},
+      {110, 90, 190}, {125, 185, 84}, {147, 68, 102}, {114, 158, 171}};
+  uint8_t nv21[WIDTH * HEIGHT * 3 / 2];
+  for (int row = 0; row < HEIGHT; ++row)
+  {
+    for (int col = 0; col < WIDTH; ++col)
+    {
+      const uint8_t* swatch = swatches[(row / SWATCH) * COLUMNS + col / SWATCH];
+      nv21[row * WIDTH + col] = swatch[0];
+      if ((row % 2) == 0 && (col % 2) == 0)
+      {
+        size_t offset = WIDTH * HEIGHT + (row / 2) * WIDTH + col;
+        nv21[offset] = swatch[2];
+        nv21[offset + 1] = swatch[1];
+      }
+    }
+  }
+
+  uint8_t* jpeg = NULL;
+  size_t length = 0;
+  assert(cr_nv21_to_jpeg_color(nv21, sizeof(nv21), WIDTH, HEIGHT, 8192, 85,
+                               &jpeg, &length, bt709, full_range) == 0);
+  int width = 0, height = 0, components = 0;
+  uint8_t* rgb = stbi_load_from_memory(jpeg, (int) length, &width, &height, &components, 3);
+  assert(rgb && width == WIDTH && height == HEIGHT);
+  const double kr = bt709 ? 0.2126 : 0.299;
+  const double kb = bt709 ? 0.0722 : 0.114;
+  for (size_t i = 0; i < sizeof(swatches) / sizeof(swatches[0]); ++i)
+  {
+    const double y = (swatches[i][0] - (full_range ? 0 : 16)) * 255.0 / (full_range ? 255 : 219);
+    const double cb = (swatches[i][1] - 128) * 255.0 / (full_range ? 255 : 224);
+    const double cr = (swatches[i][2] - 128) * 255.0 / (full_range ? 255 : 224);
+    const double r = y + 2.0 * (1.0 - kr) * cr;
+    const double b = y + 2.0 * (1.0 - kb) * cb;
+    const double g = (y - kr * r - kb * b) / (1.0 - kr - kb);
+    const size_t row = i / COLUMNS * SWATCH + SWATCH / 2;
+    const size_t col = i % COLUMNS * SWATCH + SWATCH / 2;
+    const uint8_t* pixel = rgb + (row * WIDTH + col) * 3;
+    // JPEG quantization and integer rounding account for a few code values.
+    assert(abs(pixel[0] - reference_channel(r)) <= 4);
+    assert(abs(pixel[1] - reference_channel(g)) <= 4);
+    assert(abs(pixel[2] - reference_channel(b)) <= 4);
+  }
+  stbi_image_free(rgb);
+  free(jpeg);
+}
+
 int main(void)
 {
+  verify_encoded_colors(0, 0);
+  verify_encoded_colors(0, 1);
+  verify_encoded_colors(1, 0);
+  verify_encoded_colors(1, 1);
+
   enum { WIDTH = 64, HEIGHT = 64, BLOB_BYTES = 8192 };
   uint8_t nv21[WIDTH * HEIGHT * 3 / 2];
   uint32_t random = 123;
