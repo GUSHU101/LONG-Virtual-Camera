@@ -17,6 +17,7 @@ final class RuntimeState {
     final boolean obsConfigured;
     final boolean obsPullRunning;
     final boolean feedersIdle;
+    final boolean modeMarkersClear;
     final boolean cameraEnabled;
     final boolean photoEnabled;
     final boolean micEnabled;
@@ -59,6 +60,7 @@ final class RuntimeState {
         this.obsConfigured = flag(values, "obs_configured");
         this.obsPullRunning = flag(values, "obs_pull_running");
         this.feedersIdle = "idle".equals(values.get("feeder_runtime"));
+        this.modeMarkersClear = "clear".equals(values.get("mode_markers"));
         this.cameraEnabled = flag(values, "camera_enabled");
         this.photoEnabled = flag(values, "photo_enabled");
         this.micEnabled = flag(values, "mic_enabled");
@@ -155,7 +157,7 @@ final class RuntimeState {
 
     boolean isStopped() {
         return root && controllerVerified && !cameraEnabled && !photoEnabled
-                && !micEnabled && cameraRuntimeStock && audioRuntimeStock && feedersIdle
+                && !micEnabled && cameraRuntimeStock && audioRuntimeStock && feedersIdle && modeMarkersClear
                 && !cameraHookReady && !audioHookReady
                 && !videoFeederReady && !audioFeederReady && !obsPullRunning
                 && !videoChannelReady && !audioChannelReady;

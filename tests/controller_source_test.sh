@@ -5,10 +5,14 @@ source <(sed '/^require_root$/,$d' lsposed-module/app/src/main/payload/longvc-co
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 CONTROL=$fixture/control
+DATA=$fixture
 MEDIA=$fixture/media
+MIC_MODE=$DATA/mic_mode
 SOURCE_CONFIG=$CONTROL/source.conf
 mkdir -p "$CONTROL" "$MEDIA"
 chown() { :; } # CI has no root. The real function still checks chmod and rename.
+feeder=idle
+feeder_runtime_state() { printf '%s\n' "$feeder"; }
 
 old_file=$MEDIA/visual-$(printf '%064d' 1).media
 next_file=$MEDIA/visual-$(printf '%064d' 2).media
@@ -33,6 +37,14 @@ touch "$CONTROL/camera.lease"
 [[ $(commit "$revision" || true) == *source_runtime_active* ]]
 rm "$CONTROL/camera.lease"
 [[ $(config_value visual_path) == "$old_file" ]]
+touch "$DATA/video_mode"
+[[ $(commit "$revision" || true) == *source_runtime_active* ]]
+rm "$DATA/video_mode"
+for feeder in active unknown; do
+  [[ $(commit "$revision" || true) == *source_runtime_active* ]]
+  [[ $(config_value visual_path) == "$old_file" && -f "$old_file" && -f "$stage" ]]
+done
+feeder=idle
 
 prepare "$missing_file"
 [[ $(commit "$revision" || true) == *source_media_missing* ]]

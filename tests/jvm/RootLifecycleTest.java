@@ -70,7 +70,7 @@ public final class RootLifecycleTest {
         return "schema=1\nroot=1\nresult=" + result + "\n"
                 + "camera_enabled=0\nphoto_enabled=0\nmic_enabled=0\n"
                 + "camera_hook_ready=0\ncamera_runtime=stock\naudio_hook_ready=0\nvideo_feeder_ready=0\n"
-                + "audio_runtime=stock\nfeeder_runtime=idle\n"
+                + "audio_runtime=stock\nfeeder_runtime=idle\nmode_markers=clear\n"
                 + "audio_feeder_ready=0\nvideo_channel_ready=0\naudio_channel_ready=0\n"
                 + "visual_source_ready=1\naudio_source_ready=0\nobs_pull_running=0\n";
     }
@@ -89,7 +89,9 @@ public final class RootLifecycleTest {
                 stopped.replace("audio_runtime=stock\n", ""),
                 stopped.replace("feeder_runtime=idle", "feeder_runtime=active"),
                 stopped.replace("feeder_runtime=idle", "feeder_runtime=unknown"),
-                stopped.replace("feeder_runtime=idle\n", "")}) {
+                stopped.replace("feeder_runtime=idle\n", ""),
+                stopped.replace("mode_markers=clear", "mode_markers=present"),
+                stopped.replace("mode_markers=clear\n", "")}) {
             check(!RuntimeState.parseController(ambiguous, true, true).isStopped(),
                     "missing or ambiguous runtime state must prevent recovery confirmation");
         }

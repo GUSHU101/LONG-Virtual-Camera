@@ -564,9 +564,9 @@ commit_source() (
   valid_sha256 "$2" && valid_sha256 "$3" || fail "invalid_source_commit"
   source_stage=$CONTROL/$source_name
 
-  for lease in camera photo mic; do
-    [ ! -e "$CONTROL/$lease.lease" ] || fail "source_runtime_active"
-  done
+  if has_mode_markers || [ "$(feeder_runtime_state)" != idle ]; then
+    fail "source_runtime_active"
+  fi
   [ -f "$source_stage" ] && [ ! -L "$source_stage" ] ||
     fail "source_stage_missing"
   [ "$(file_sha256 "$source_stage")" = "$3" ] || fail "source_stage_checksum"
@@ -752,30 +752,25 @@ reconcile_mode_pair() {
   fi
 }
 
+has_mode_markers() {
+  local marker
+  for marker in "$CONTROL/camera.lease" "$CONTROL/photo.lease" "$CONTROL/mic.lease" \
+    "$DATA/video_mode" "$DATA/photo_mode" "$MIC_MODE"; do
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 reconcile_stale_leases() {
-  # /data survives a reboot while injected mappings and feeder processes do
-  # not. Never interpret a stale marker as an instruction to auto-enable,
-  # especially for the opt-in microphone path.
-  video_live=0
-  if find_feed_pid "--role video" >/dev/null 2>&1 ||
-     find_feed_pid "--role obs-video" >/dev/null 2>&1 ||
-     find_feed_pid "--role obs-av" >/dev/null 2>&1 ||
-     mapped_hook_pid cameraserver >/dev/null 2>&1; then
-    video_live=1
-  fi
-  if [ "$video_live" = "0" ]; then
+  # A saved marker is stale when the system service is verified to be stock.
+  # An unreadable process map is not evidence that a service has recovered.
+  if [ "$(camera_runtime_state)" = stock ]; then
     rm -f "$CONTROL/camera.lease" "$CONTROL/photo.lease" \
       "$DATA/photo_mode" "$DATA/video_mode"
   fi
-
-  audio_live=0
-  if find_feed_pid "--role audio" >/dev/null 2>&1 ||
-     find_feed_pid "--role obs-audio" >/dev/null 2>&1 ||
-     find_feed_pid "--role obs-av" >/dev/null 2>&1 ||
-     mapped_hook_pid audioserver >/dev/null 2>&1; then
-    audio_live=1
-  fi
-  if [ "$audio_live" = "0" ]; then
+  if [ "$(audio_runtime_state)" = stock ]; then
     rm -f "$CONTROL/mic.lease" "$MIC_MODE"
   fi
   reconcile_mode_pair "$CONTROL/camera.lease" "$DATA/video_mode"
@@ -980,7 +975,6 @@ camera_output_stats() {
 }
 
 print_status() {
-  reconcile_stale_leases
   [ -x "$INJECTOR" ] && [ -x "$FEEDER" ] && [ -r "$HOOK" ] && installed=1 || installed=0
   visual_mode=$(current_visual_mode)
   audio_mode=$(current_audio_mode)
@@ -1021,11 +1015,17 @@ print_status() {
   [ "$audio_feed" = "1" ] && channel_has_header "$DATA/audio" 55415243 36 && audio_channel=1 || audio_channel=0
   camera_hook=$(hook_pid cameraserver "$CAM_READY" 2>/dev/null || true)
   audio_hook=$(hook_pid audioserver "$AUD_READY" 2>/dev/null || true)
+  camera_runtime=$(camera_runtime_state)
+  audio_runtime=$(audio_runtime_state)
   [ -n "$camera_hook" ] && camera_hook_ready=1 || camera_hook_ready=0
   [ -n "$audio_hook" ] && audio_hook_ready=1 || audio_hook_ready=0
-  [ -e "$CONTROL/camera.lease" ] && [ -f "$DATA/video_mode" ] && camera_enabled=1 || camera_enabled=0
-  [ -e "$CONTROL/photo.lease" ] && [ -e "$DATA/photo_mode" ] && photo_enabled=1 || photo_enabled=0
-  [ -e "$CONTROL/mic.lease" ] && [ -f "$MIC_MODE" ] && audio_enabled=1 || audio_enabled=0
+  [ "$camera_runtime" != stock ] && [ -e "$CONTROL/camera.lease" ] &&
+    [ -f "$DATA/video_mode" ] && camera_enabled=1 || camera_enabled=0
+  [ "$camera_runtime" != stock ] && [ -e "$CONTROL/photo.lease" ] &&
+    [ -f "$DATA/photo_mode" ] && photo_enabled=1 || photo_enabled=0
+  [ "$audio_runtime" != stock ] && [ -e "$CONTROL/mic.lease" ] &&
+    [ -f "$MIC_MODE" ] && audio_enabled=1 || audio_enabled=0
+  has_mode_markers && mode_markers=present || mode_markers=clear
 
   say "schema=1"
   say "root=1"
@@ -1040,6 +1040,7 @@ print_status() {
   say "obs_configured=$obs_configured"
   say "obs_pull_running=$obs_pull"
   say "feeder_runtime=$(feeder_runtime_state)"
+  say "mode_markers=$mode_markers"
   say "camera_enabled=$camera_enabled"
   say "photo_enabled=$photo_enabled"
   say "mic_enabled=$audio_enabled"
@@ -1048,9 +1049,9 @@ print_status() {
   say "video_channel_ready=$video_channel"
   say "audio_channel_ready=$audio_channel"
   say "camera_hook_ready=$camera_hook_ready"
-  say "camera_runtime=$(camera_runtime_state)"
+  say "camera_runtime=$camera_runtime"
   say "audio_hook_ready=$audio_hook_ready"
-  say "audio_runtime=$(audio_runtime_state)"
+  say "audio_runtime=$audio_runtime"
   say "camera_hook_pid=$camera_hook"
   say "audio_hook_pid=$audio_hook"
   camera_output_stats "$camera_hook"

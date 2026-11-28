@@ -153,7 +153,7 @@ final class RootController {
         installer.ensureControlScript();
         RuntimeState before = status();
         boolean active = before.cameraEnabled || before.photoEnabled || before.micEnabled;
-        if (active) run(Action.STOP_ALL);
+        if (active || !before.modeMarkersClear || !before.feedersIdle) run(Action.STOP_ALL);
         try {
             mutation.apply();
         } catch (InterruptedException cancelled) {
@@ -193,9 +193,11 @@ final class RootController {
     private void restore(RuntimeState state, RuntimeState source)
             throws IOException, InterruptedException {
         RootShell.checkCancellation();
-        if (state.cameraEnabled && source.visualSourceReady) run(Action.ARM_CAMERA);
-        if (state.photoEnabled && source.visualSourceReady) run(Action.ARM_PHOTO);
-        if (state.micEnabled && source.audioSourceReady) run(Action.ARM_MIC);
+        if (state.cameraHookReady && source.visualSourceReady) {
+            if (state.cameraEnabled) run(Action.ARM_CAMERA);
+            if (state.photoEnabled) run(Action.ARM_PHOTO);
+        }
+        if (state.micEnabled && state.audioHookReady && source.audioSourceReady) run(Action.ARM_MIC);
     }
 
     private void restoreBestEffort(RuntimeState state, Throwable failure) {

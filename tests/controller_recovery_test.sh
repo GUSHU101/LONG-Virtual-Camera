@@ -49,6 +49,35 @@ MIC_MODE=$fixture/mic_mode
   unload_audio_hook
 )
 
+(
+  SOURCE_CONFIG=$fixture/source.conf
+  camera_state=stock audio_state=stock
+  camera_runtime_state() { say "$camera_state"; }
+  audio_runtime_state() { say "$audio_state"; }
+  find_feed_pid() { return 1; }
+  feeder_runtime_state() { say idle; }
+  hook_pid() { return 1; }
+  touch "$CONTROL/camera.lease" "$DATA/video_mode" "$CONTROL/mic.lease" "$MIC_MODE"
+
+  status=$(print_status)
+  [[ "$status" == *$'\nmode_markers=present\n'* ]]
+  [[ "$status" == *$'\ncamera_enabled=0\n'* && "$status" == *$'\nmic_enabled=0\n'* ]]
+  [[ -e "$CONTROL/camera.lease" && -e "$DATA/video_mode" ]]
+  [[ -e "$CONTROL/mic.lease" && -e "$MIC_MODE" ]]
+
+  camera_state=unknown audio_state=unknown
+  reconcile_stale_leases
+  [[ -e "$CONTROL/camera.lease" && -e "$DATA/video_mode" ]]
+  [[ -e "$CONTROL/mic.lease" && -e "$MIC_MODE" ]]
+  audio_state=stock
+  reconcile_stale_leases
+  [[ -e "$CONTROL/camera.lease" && -e "$DATA/video_mode" ]]
+  [[ ! -e "$CONTROL/mic.lease" && ! -e "$MIC_MODE" ]]
+  camera_state=stock
+  reconcile_stale_leases
+  [[ $(print_status) == *$'\nmode_markers=clear\n'* ]]
+)
+
 verify_steps() {
   local fail_step=$1 expected_rc=$2 rc=0
   steps=""

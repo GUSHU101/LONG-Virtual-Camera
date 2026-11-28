@@ -495,6 +495,8 @@ public final class MainActivity extends Activity
                     ? "\n原生相机服务恢复尚未确认。" : "")
                 + (!state.cameraEnabled && !state.photoEnabled && !state.micEnabled && !state.feedersIdle
                     ? "\n馈送进程退出尚未确认。" : "")
+                + (!state.cameraEnabled && !state.photoEnabled && !state.micEnabled && !state.modeMarkersClear
+                    ? "\n检测到残留开关记录，等待清理。" : "")
                 + cameraOutputSummary(state);
     }
 
