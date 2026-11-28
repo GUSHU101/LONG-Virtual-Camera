@@ -109,7 +109,7 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertIn("result=degraded", controller)
         self.assertIn("Never execute an unknown/corrupt file as root", controller)
         self.assertIn("boolean commitStarted", installer)
-        self.assertIn("commit(stage, expected)", installer)
+        self.assertIn("commit(stage, expected, manifest)", installer)
         self.assertIn("recovery stage=", installer)
         self.assertIn("u:object_r:system_file:s0", installer)
 
@@ -270,13 +270,17 @@ class LsposedModuleContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         commit = installer.split("private void commit(", 1)[1]
-        self.assertLess(commit.index("appendInstalledChecks(command, expected)"),
+        self.assertLess(commit.index("appendInstalledChecks(command, expected, manifest)"),
                         commit.index("trap - EXIT HUP INT TERM; echo committed"))
         self.assertNotIn('rm -rf \\"$backup\\"', commit)
         cleanup = installer.split("private void discardStage(", 1)[1]
         self.assertIn("catch (IOException cleanupFailure)", cleanup)
         self.assertIn('DEPLOY_DIR = "/data/cr/payload"', installer)
         self.assertIn("appendTrustedDeploymentChecks(command)", installer)
+        staging = installer.split("private void verifyRemoteStage(", 1)[1].split("private void commit(", 1)[0]
+        self.assertIn('appendEntryCheck(command, stage + "/" + MANIFEST_ASSET, manifest)', staging)
+        self.assertIn('result.hasLine("verified")', staging)
+        self.assertIn("appendEntryCheck(command, REMOTE_MANIFEST, manifest)", installer)
 
     def test_injector_discovers_services_by_executable(self) -> None:
         source = (ROOT / "engines/camreplace/android/injector/src/ptrace_arm64.cpp"

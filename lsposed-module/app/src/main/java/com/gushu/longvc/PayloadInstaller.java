@@ -20,6 +20,7 @@ final class PayloadInstaller {
     private static final String DEPLOY_DIR = "/data/cr/payload";
     static final String REMOTE_SCRIPT = DEPLOY_DIR + "/longvc-control.sh";
     private static final String ASSET_ROOT = "payload/arm64-v8a/";
+    private static final String MANIFEST_ASSET = "payload.sha256";
     private static final String REMOTE_ROOT = DEPLOY_DIR + "/";
     private static final String REMOTE_MANIFEST = REMOTE_ROOT + "longvc-payload.sha256";
     private static final String[] FILES = {
@@ -37,19 +38,20 @@ final class PayloadInstaller {
     boolean isCurrent() throws IOException, InterruptedException {
         Map<String, Entry> expected = readManifest();
         StringBuilder command = new StringBuilder("set -e; ");
-        appendInstalledChecks(command, expected);
+        appendInstalledChecks(command, expected, inspectPackagedAsset(MANIFEST_ASSET));
         command.append("echo current");
         RootShell.Result result = shell.execute(command.toString(), 15L);
         return result.ok() && hasLine(result, "current");
     }
 
     private static void appendInstalledChecks(StringBuilder command,
-                                               Map<String, Entry> expected)
+                                               Map<String, Entry> expected, Entry manifest)
             throws IOException {
         appendTrustedDeploymentChecks(command);
         for (String name : FILES) {
             appendEntryCheck(command, REMOTE_ROOT + name, requireEntry(expected, name));
         }
+        appendEntryCheck(command, REMOTE_MANIFEST, manifest);
         command.append("[ -x '").append(REMOTE_ROOT).append("cr_injector' ]; ")
                 .append("[ -x '").append(REMOTE_ROOT).append("cr_feed_proc' ]; ")
                 .append("[ -r '").append(REMOTE_ROOT).append("libcr_hooks.so' ]; ")
@@ -135,6 +137,7 @@ final class PayloadInstaller {
         requireArm64();
         Map<String, Entry> expected = readManifest();
         verifyPackagedAssets(expected);
+        Entry manifest = inspectPackagedAsset(MANIFEST_ASSET);
         ensureDeploymentDirectory();
 
         String suffix = Long.toUnsignedString(System.nanoTime());
@@ -149,11 +152,11 @@ final class PayloadInstaller {
             for (String name : FILES) {
                 streamAsset(name, stage + "/" + name);
             }
-            streamAsset("payload.sha256", stage + "/payload.sha256");
-            verifyRemoteStage(stage, expected);
+            streamAsset(MANIFEST_ASSET, stage + "/" + MANIFEST_ASSET);
+            verifyRemoteStage(stage, expected, manifest);
             quiesceRuntime(stage);
             commitStarted = true;
-            commit(stage, expected);
+            commit(stage, expected, manifest);
             commitCompleted = true;
         } finally {
             // A failed commit may have left its only recoverable backup under
@@ -174,7 +177,7 @@ final class PayloadInstaller {
         }
     }
 
-    private void verifyRemoteStage(String stage, Map<String, Entry> expected)
+    private void verifyRemoteStage(String stage, Map<String, Entry> expected, Entry manifest)
             throws IOException, InterruptedException {
         StringBuilder command = new StringBuilder("set -e; ");
         appendTrustedDeploymentChecks(command);
@@ -182,13 +185,14 @@ final class PayloadInstaller {
         for (String name : FILES) {
             appendEntryCheck(command, stage + "/" + name, requireEntry(expected, name));
         }
+        appendEntryCheck(command, stage + "/" + MANIFEST_ASSET, manifest);
         command.append("echo verified");
         RootShell.Result result = shell.execute(command.toString(), 30L);
         requireOk("verify staged payload", result);
-        if (!result.output.contains("verified")) throw new IOException("payload verification did not finish");
+        if (!result.hasLine("verified")) throw new IOException("payload verification did not finish");
     }
 
-    private void commit(String stage, Map<String, Entry> expected)
+    private void commit(String stage, Map<String, Entry> expected, Entry manifest)
             throws IOException, InterruptedException {
         StringBuilder command = new StringBuilder("set -e; "
                 + "backup='" + stage + "/backup'; mkdir \"$backup\"; "
@@ -210,7 +214,7 @@ final class PayloadInstaller {
                 + "mv -f '" + stage + "/cr_feed_proc' '" + REMOTE_ROOT + "cr_feed_proc'; "
                 + "mv -f '" + stage + "/libcr_hooks.so' '" + REMOTE_ROOT + "libcr_hooks.so'; "
                 + "mv -f '" + stage + "/longvc-control.sh' '" + REMOTE_SCRIPT + "'; "
-                + "mv -f '" + stage + "/payload.sha256' '" + REMOTE_MANIFEST + "'; "
+                + "mv -f '" + stage + "/" + MANIFEST_ASSET + "' '" + REMOTE_MANIFEST + "'; "
                 + "chown 0:0 '" + REMOTE_ROOT + "cr_injector' '" + REMOTE_ROOT + "cr_feed_proc' "
                 + "  '" + REMOTE_ROOT + "libcr_hooks.so' '" + REMOTE_SCRIPT + "' '" + REMOTE_MANIFEST + "'; "
                 + "chmod 0755 '" + REMOTE_ROOT + "cr_injector' '" + REMOTE_ROOT + "cr_feed_proc' "
@@ -222,7 +226,7 @@ final class PayloadInstaller {
                 + "else [ \"$(getenforce 2>/dev/null)\" != Enforcing ]; fi; ");
         // Keep the rollback trap armed through the same checks used by isCurrent().
         // The caller removes the stage and backup only after the shell confirms.
-        appendInstalledChecks(command, expected);
+        appendInstalledChecks(command, expected, manifest);
         command.append("trap - EXIT HUP INT TERM; echo committed");
         RootShell.Result result = shell.execute(command.toString(), 30L);
         requireOk("commit payload; recovery stage=" + stage, result);
@@ -266,7 +270,7 @@ final class PayloadInstaller {
     private Map<String, Entry> readManifest() throws IOException {
         Map<String, Entry> result = new LinkedHashMap<>();
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                assets.open(ASSET_ROOT + "payload.sha256"), StandardCharsets.UTF_8))) {
+                assets.open(ASSET_ROOT + MANIFEST_ASSET), StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 String[] parts = line.trim().split("\\s+", 3);
@@ -300,6 +304,13 @@ final class PayloadInstaller {
     }
 
     private void verifyPackagedAsset(String name, Entry entry) throws IOException {
+        Entry packaged = inspectPackagedAsset(name);
+        if (packaged.size != entry.size || !packaged.hash.equals(entry.hash)) {
+            throw new IOException("packaged asset checksum mismatch: " + name);
+        }
+    }
+
+    private Entry inspectPackagedAsset(String name) throws IOException {
         MessageDigest digest;
         try {
             digest = MessageDigest.getInstance("SHA-256");
@@ -316,10 +327,7 @@ final class PayloadInstaller {
                 size += read;
             }
         }
-        String hash = hex(digest.digest());
-        if (size != entry.size || !hash.equals(entry.hash)) {
-            throw new IOException("packaged asset checksum mismatch: " + name);
-        }
+        return new Entry(hex(digest.digest()), size);
     }
 
     private boolean isRemoteEntryCurrent(String remote, Entry entry, boolean requireExecutable)
