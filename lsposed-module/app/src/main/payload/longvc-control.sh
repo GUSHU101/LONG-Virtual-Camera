@@ -131,26 +131,34 @@ prepare_data() {
     "$CAM_READY" "$AUD_READY" || return 1
 }
 
+# Return 1 for an exited process and 2 when its identity cannot be verified.
 process_start_time() (
-  case "$1" in ''|*[!0-9]*) return 1 ;; esac
-  process_stat=$(cat "$PROC_ROOT/$1/stat" 2>/dev/null) || return 1
+  case "$1" in ''|*[!0-9]*) return 2 ;; esac
+  process_stat=$(cat "$PROC_ROOT/$1/stat" 2>/dev/null) || {
+    [ ! -d "$PROC_ROOT/$1" ] && return 1
+    return 2
+  }
   # Strip pid and comm, which is parenthesized and may contain spaces.
   process_fields=${process_stat##*) }
   set -f
   set -- $process_fields
-  [ "$#" -ge 20 ] || return 1
+  [ "$#" -ge 20 ] || return 2
   case "$1" in Z|X|x) return 1 ;; esac
-  case "${20}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${20}" in ''|*[!0-9]*) return 2 ;; esac
   say "${20}"
 )
+
+owned_feeder_executable() {
+  case "$1" in
+    "$FEEDER"|"$FEEDER (deleted)"|"$LEGACY_FEEDER"|"$LEGACY_FEEDER (deleted)") return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 feeder_start_time() (
   feeder_started=$(process_start_time "$1") || return 1
   feeder_exe=$(readlink "$PROC_ROOT/$1/exe" 2>/dev/null) || return 1
-  case "$feeder_exe" in
-    "$FEEDER"|"$FEEDER (deleted)"|"$LEGACY_FEEDER"|"$LEGACY_FEEDER (deleted)") ;;
-    *) return 1 ;;
-  esac
+  owned_feeder_executable "$feeder_exe" || return 1
   feeder_cmd=$(tr '\000' ' ' 2>/dev/null < "$PROC_ROOT/$1/cmdline") || return 1
   case "$feeder_cmd" in *"$2"*) ;; *) return 1 ;; esac
   [ "$(process_start_time "$1")" = "$feeder_started" ] || return 1
@@ -167,16 +175,57 @@ find_feed_pid() (
   return 1
 )
 
+feeder_runtime_state() (
+  if [ ! -r "$PROC_ROOT" ]; then
+    say unknown
+    return
+  fi
+  candidates=$(pidof cr_feed_proc 2>/dev/null) || {
+    scan_rc=$?
+    if [ "$scan_rc" -eq 1 ] && [ -z "$candidates" ]; then
+      say idle
+    else
+      say unknown
+    fi
+    return
+  }
+  if [ -z "$candidates" ]; then
+    say unknown
+    return
+  fi
+
+  state=idle
+  for candidate in $candidates; do
+    started=$(process_start_time "$candidate") || {
+      [ "$?" -eq 1 ] || state=unknown
+      continue
+    }
+    if executable=$(readlink "$PROC_ROOT/$candidate/exe" 2>/dev/null) &&
+       [ "$(process_start_time "$candidate")" = "$started" ]; then
+      if owned_feeder_executable "$executable"; then
+        say active
+        return
+      fi
+    else
+      state=unknown
+    fi
+  done
+  say "$state"
+)
+
 wait_feeders_exit() (
   stop_i=0
   while [ "$stop_i" -lt 20 ]; do
     stop_alive=0
     for stop_identity in "$@"; do
       stop_pid=${stop_identity%%:*}
-      if [ "$(process_start_time "$stop_pid")" = "${stop_identity#*:}" ]; then
-        stop_alive=1
-        break
+      if observed_start=$(process_start_time "$stop_pid"); then
+        [ "$observed_start" = "${stop_identity#*:}" ] || continue
+      elif [ "$?" -eq 1 ]; then
+        continue
       fi
+      stop_alive=1
+      break
     done
     [ "$stop_alive" = 0 ] && return 0
     stop_i=$((stop_i + 1))
@@ -318,16 +367,16 @@ mapped_hook_pid() {
   return 1
 }
 
-camera_runtime_state() {
-  local pids camera_pid scan_rc state
-  pids=$(pidof cameraserver 2>/dev/null) || pids=
+system_service_runtime() {
+  local pids candidate scan_rc state
+  pids=$(pidof "$1" 2>/dev/null) || pids=
   state=stock
   if [ -z "$pids" ]; then
     say unknown
     return
   fi
-  for camera_pid in $pids; do
-    if grep -q '/libcr_hooks\.so' "/proc/$camera_pid/maps" 2>/dev/null; then
+  for candidate in $pids; do
+    if grep -q '/libcr_hooks\.so' "$PROC_ROOT/$candidate/maps" 2>/dev/null; then
       say hook_mapped
       return
     else
@@ -335,12 +384,15 @@ camera_runtime_state() {
       [ "$scan_rc" -eq 1 ] || state=unknown
     fi
   done
-  if ! service check media.camera 2>/dev/null | grep -q ': found$' ||
-     [ "$(pidof cameraserver 2>/dev/null)" != "$pids" ]; then
+  if ! service check "$2" 2>/dev/null | grep -q ': found$' ||
+     [ "$(pidof "$1" 2>/dev/null)" != "$pids" ]; then
     state=unknown
   fi
   say "$state"
 }
+
+camera_runtime_state() { system_service_runtime cameraserver media.camera; }
+audio_runtime_state() { system_service_runtime audioserver media.audio_flinger; }
 
 wait_service() {
   wait_proc=$1
@@ -755,17 +807,19 @@ unload_camera_hook() {
 }
 
 unload_audio_hook() {
+  local marker_rc=0
   if ! old_audio_pid=$(mapped_hook_pid audioserver); then
-    rm -f "$AUD_READY" && wait_service audioserver
+    rm -f "$AUD_READY" && wait_service audioserver &&
+      [ "$(audio_runtime_state)" = stock ]
     return $?
   fi
-  rm -f "$AUD_READY"
+  rm -f "$AUD_READY" || marker_rc=1
   if ! killall -q audioserver >/dev/null 2>&1 &&
      ! killall audioserver >/dev/null 2>&1; then
     return 1
   fi
   wait_service audioserver "$old_audio_pid" || return 1
-  ! mapped_hook_pid audioserver >/dev/null 2>&1
+  [ "$(audio_runtime_state)" = stock ] && [ "$marker_rc" -eq 0 ]
 }
 
 install_camera_flag() {
@@ -870,6 +924,7 @@ stop_all() {
   revoke_u32 "$DATA/audio" 0 || stop_all_rc=1
   unload_camera_hook || stop_all_rc=1
   unload_audio_hook || stop_all_rc=1
+  [ "$(feeder_runtime_state)" = idle ] || stop_all_rc=1
   return "$stop_all_rc"
 }
 
@@ -984,6 +1039,7 @@ print_status() {
   say "audio_source_ready=$audio_source_ready"
   say "obs_configured=$obs_configured"
   say "obs_pull_running=$obs_pull"
+  say "feeder_runtime=$(feeder_runtime_state)"
   say "camera_enabled=$camera_enabled"
   say "photo_enabled=$photo_enabled"
   say "mic_enabled=$audio_enabled"
@@ -994,6 +1050,7 @@ print_status() {
   say "camera_hook_ready=$camera_hook_ready"
   say "camera_runtime=$(camera_runtime_state)"
   say "audio_hook_ready=$audio_hook_ready"
+  say "audio_runtime=$(audio_runtime_state)"
   say "camera_hook_pid=$camera_hook"
   say "audio_hook_pid=$audio_hook"
   camera_output_stats "$camera_hook"

@@ -248,25 +248,18 @@ final class PayloadInstaller {
     }
 
     private void quiesceRuntime(String stage) throws IOException, InterruptedException {
-        RootShell.Result stop = shell.execute(
-                "/system/bin/sh '" + stage + "/longvc-control.sh' stop-all", 45L);
+        String control = "/system/bin/sh '" + stage + "/longvc-control.sh' ";
+        RootShell.Result stop = shell.execute(control + "stop-all", 45L);
         requireOk("stop active runtime before payload update", stop);
-        if (!stop.output.contains("result=ok")) {
+        if (!stop.hasLine("result=ok") || !stop.hasLine("action=stop-all")) {
             throw new IOException("runtime stop did not report success before payload update");
         }
 
-        String verify = "set -e; "
-                + "for p in $(pidof cr_feed_proc 2>/dev/null); do "
-                + "  exe=$(readlink /proc/$p/exe 2>/dev/null); "
-                + "  case \"$exe\" in */cr_feed_proc*) exit 1 ;; esac; "
-                + "done; "
-                + "for proc in cameraserver audioserver; do for p in $(pidof $proc 2>/dev/null); do "
-                + "  if grep -q '/libcr_hooks\\.so' /proc/$p/maps 2>/dev/null; then exit 1; fi; "
-                + "done; done; echo quiescent";
-        RootShell.Result state = shell.execute(verify, 15L);
-        requireOk("verify quiescent runtime before payload update", state);
-        if (!state.output.contains("quiescent")) {
-            throw new IOException("runtime remained active before payload update");
+        RootShell.Result result = shell.execute(control + "status", 15L);
+        requireOk("verify quiescent runtime before payload update", result);
+        RuntimeState state = RuntimeState.parseController(result.output, true, false);
+        if (!state.isStopped()) {
+            throw new IOException("could not verify runtime recovery before payload update");
         }
     }
 

@@ -70,6 +70,7 @@ public final class RootLifecycleTest {
         return "schema=1\nroot=1\nresult=" + result + "\n"
                 + "camera_enabled=0\nphoto_enabled=0\nmic_enabled=0\n"
                 + "camera_hook_ready=0\ncamera_runtime=stock\naudio_hook_ready=0\nvideo_feeder_ready=0\n"
+                + "audio_runtime=stock\nfeeder_runtime=idle\n"
                 + "audio_feeder_ready=0\nvideo_channel_ready=0\naudio_channel_ready=0\n"
                 + "visual_source_ready=1\naudio_source_ready=0\nobs_pull_running=0\n";
     }
@@ -83,9 +84,14 @@ public final class RootLifecycleTest {
                 "camera_hook_ready=1"), true, true).isStopped(), "live hook cannot be ignored");
         for (String ambiguous : new String[]{stopped.replace("camera_runtime=stock\n", ""),
                 stopped.replace("camera_runtime=stock", "camera_runtime=hook_mapped"),
-                stopped.replace("camera_runtime=stock", "camera_runtime=unknown")}) {
+                stopped.replace("camera_runtime=stock", "camera_runtime=unknown"),
+                stopped.replace("audio_runtime=stock", "audio_runtime=hook_mapped"),
+                stopped.replace("audio_runtime=stock\n", ""),
+                stopped.replace("feeder_runtime=idle", "feeder_runtime=active"),
+                stopped.replace("feeder_runtime=idle", "feeder_runtime=unknown"),
+                stopped.replace("feeder_runtime=idle\n", "")}) {
             check(!RuntimeState.parseController(ambiguous, true, true).isStopped(),
-                    "an absent readiness marker does not establish camera recovery");
+                    "missing or ambiguous runtime state must prevent recovery confirmation");
         }
         for (String damaged : new String[]{stopped.replace("camera_enabled=0\n", ""),
                 stopped + "camera_enabled=1\n", stopped.replace("result=ok", "result=error")}) {

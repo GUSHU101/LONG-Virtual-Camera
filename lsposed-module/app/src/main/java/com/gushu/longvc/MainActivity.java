@@ -491,9 +491,10 @@ public final class MainActivity extends Activity
                 + "\n全局相机：" + cameraState(state, state.cameraEnabled)
                 + "\n照片替换：" + photoState(state)
                 + "\n虚拟麦克风：" + microphoneState(state)
-                + (state.micEnabled ? "" : "（手机原生麦克风）")
                 + (!state.cameraEnabled && !state.photoEnabled && !state.cameraRuntimeStock
                     ? "\n原生相机服务恢复尚未确认。" : "")
+                + (!state.cameraEnabled && !state.photoEnabled && !state.micEnabled && !state.feedersIdle
+                    ? "\n馈送进程退出尚未确认。" : "")
                 + cameraOutputSummary(state);
     }
 
@@ -562,7 +563,8 @@ public final class MainActivity extends Activity
     }
 
     private static String microphoneState(RuntimeState state) {
-        if (!state.micEnabled) return "关闭";
+        if (!state.micEnabled) return state.audioRuntimeStock ? "关闭（手机原生麦克风）"
+                : "关闭（原生音频服务恢复尚未确认）";
         if (!state.audioHookReady) return "等待 audioserver hook";
         if (!state.audioFeederReady) return state.audioUsesObs()
                 ? "等待启动电脑拉流，输出静音" : "等待本地音频解码器，输出静音";

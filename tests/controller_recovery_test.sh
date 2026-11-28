@@ -11,9 +11,10 @@ MIC_MODE=$fixture/mic_mode
 
 (
   CAM_READY=$fixture/camhook.ready
+  AUD_READY=$fixture/audhook.ready
   reported_pid=42 map_result=1 service_result=0
   pidof() {
-    [[ $1 == cameraserver && -n "$reported_pid" ]] || return 1
+    [[ ( $1 == cameraserver || $1 == audioserver ) && -n "$reported_pid" ]] || return 1
     printf '%s\n' "$reported_pid"
   }
   grep() {
@@ -21,8 +22,9 @@ MIC_MODE=$fixture/mic_mode
     command grep "$@"
   }
   service() {
-    [[ $1 == check && $2 == media.camera && $service_result == 0 ]] || return 1
-    printf '%s\n' 'Service media.camera: found'
+    [[ $1 == check && ( $2 == media.camera || $2 == media.audio_flinger ) &&
+       $service_result == 0 ]] || return 1
+    printf 'Service %s: found\n' "$2"
   }
   [[ $(camera_runtime_state) == stock ]]
   map_result=0
@@ -39,8 +41,12 @@ MIC_MODE=$fixture/mic_mode
   touch "$CAM_READY"
   if unload_camera_hook; then exit 1; fi
   [[ ! -e "$CAM_READY" ]]
+  touch "$AUD_READY"
+  if unload_audio_hook; then exit 1; fi
+  [[ ! -e "$AUD_READY" && $(audio_runtime_state) == unknown ]]
   map_result=1
   unload_camera_hook
+  unload_audio_hook
 )
 
 verify_steps() {
@@ -51,6 +57,13 @@ verify_steps() {
   stop_feeder() { steps+=" feeder"; [[ $fail_step != feeder ]]; }
   unload_camera_hook() { steps+=" camera"; [[ $fail_step != camera ]]; }
   unload_audio_hook() { steps+=" audio"; [[ $fail_step != audio ]]; }
+  feeder_runtime_state() {
+    case "$fail_step" in
+      residual) printf 'active\n' ;;
+      scan) printf 'unknown\n' ;;
+      *) printf 'idle\n' ;;
+    esac
+  }
   stop_all || rc=$?
   [[ $steps == " feeder revoke revoke revoke revoke camera audio" ]]
   [[ $rc == "$expected_rc" ]]
@@ -62,6 +75,8 @@ verify_steps revoke 1
 verify_steps feeder 1
 verify_steps camera 1
 verify_steps audio 1
+verify_steps residual 1
+verify_steps scan 1
 printf '%s\n' 'Recovery propagated every simulated failure and ran all cleanup steps'
 
 logcat() {

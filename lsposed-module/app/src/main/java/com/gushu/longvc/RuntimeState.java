@@ -16,6 +16,7 @@ final class RuntimeState {
     final boolean audioSourceReady;
     final boolean obsConfigured;
     final boolean obsPullRunning;
+    final boolean feedersIdle;
     final boolean cameraEnabled;
     final boolean photoEnabled;
     final boolean micEnabled;
@@ -24,6 +25,7 @@ final class RuntimeState {
     final boolean cameraHookReady;
     final boolean cameraRuntimeStock;
     final boolean audioHookReady;
+    final boolean audioRuntimeStock;
     final boolean videoChannelReady;
     final boolean audioChannelReady;
     final long cameraWrittenYuv;
@@ -56,6 +58,7 @@ final class RuntimeState {
         this.audioSourceReady = flag(values, "audio_source_ready");
         this.obsConfigured = flag(values, "obs_configured");
         this.obsPullRunning = flag(values, "obs_pull_running");
+        this.feedersIdle = "idle".equals(values.get("feeder_runtime"));
         this.cameraEnabled = flag(values, "camera_enabled");
         this.photoEnabled = flag(values, "photo_enabled");
         this.micEnabled = flag(values, "mic_enabled");
@@ -64,6 +67,7 @@ final class RuntimeState {
         this.cameraHookReady = flag(values, "camera_hook_ready");
         this.cameraRuntimeStock = "stock".equals(values.get("camera_runtime"));
         this.audioHookReady = flag(values, "audio_hook_ready");
+        this.audioRuntimeStock = "stock".equals(values.get("audio_runtime"));
         this.videoChannelReady = flag(values, "video_channel_ready");
         this.audioChannelReady = flag(values, "audio_channel_ready");
         this.cameraWrittenYuv = counter(values, "camera_written_yuv");
@@ -151,7 +155,8 @@ final class RuntimeState {
 
     boolean isStopped() {
         return root && controllerVerified && !cameraEnabled && !photoEnabled
-                && !micEnabled && cameraRuntimeStock && !cameraHookReady && !audioHookReady
+                && !micEnabled && cameraRuntimeStock && audioRuntimeStock && feedersIdle
+                && !cameraHookReady && !audioHookReady
                 && !videoFeederReady && !audioFeederReady && !obsPullRunning
                 && !videoChannelReady && !audioChannelReady;
     }

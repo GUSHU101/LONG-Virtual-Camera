@@ -26,7 +26,7 @@ write_stat 43 Z 143
 printf '/unrelated/cr_feed_proc\n' > "$PROC_ROOT/44/exe"
 
 fixture_pids='41 42 43 44'
-pidof() { [[ $1 == cr_feed_proc ]] && printf '%s\n' "$fixture_pids"; }
+pidof() { [[ $1 == cr_feed_proc && -n "$fixture_pids" ]] && printf '%s\n' "$fixture_pids"; }
 readlink() { cat "$1"; }
 sleep() { :; }
 kill() {
@@ -43,9 +43,22 @@ kill() {
 [[ $(process_start_time 42) == 142 ]]
 [[ -z $(process_start_time 43 || true) ]]
 [[ -z $(feeder_start_time 44 '' || true) ]]
+[[ $(feeder_runtime_state) == active ]]
+fixture_pids='43 44'
+[[ $(feeder_runtime_state) == idle ]]
 printf '%s\n' "$LEGACY_FEEDER (deleted)" > "$PROC_ROOT/44/exe"
 [[ $(feeder_start_time 44 '--role obs-video') == 144 ]]
+[[ $(feeder_runtime_state) == active ]]
 printf '/unrelated/cr_feed_proc\n' > "$PROC_ROOT/44/exe"
+fixture_pids=42
+mv "$PROC_ROOT/42/exe" "$PROC_ROOT/42/exe-backup"
+[[ $(feeder_runtime_state) == unknown ]]
+mv "$PROC_ROOT/42/exe-backup" "$PROC_ROOT/42/exe"
+mv "$PROC_ROOT/42/stat" "$PROC_ROOT/42/stat-backup"
+[[ $(feeder_runtime_state) == unknown ]]
+! wait_feeders_exit 42:142
+mv "$PROC_ROOT/42/stat-backup" "$PROC_ROOT/42/stat"
+fixture_pids='41 42 43 44'
 printf 'schema=2\nvisual_mode=obs\nobs_url=rtmp://relay.local/live/path-key?user=test&pass=placeholder\n' > "$SOURCE_CONFIG"
 [[ $(current_obs_url) == 'rtmp://relay.local/live/path-key?user=test&pass=placeholder' ]]
 status=$(print_status)
@@ -55,11 +68,13 @@ status=$(print_status)
 [[ "$status" != *path-key* ]]
 [[ "$status" != *placeholder* ]]
 [[ "$status" == *$'\nobs_pull_running=1\n'* ]]
+[[ "$status" == *$'\nfeeder_runtime=active\n'* ]]
 
 stop_feeder '--role obs'
 [[ $(cat "$fixture/signals") == $'-TERM 41\n-TERM 42\n-KILL 42' ]]
 
 fixture_pids=''
+[[ $(feeder_runtime_state) == idle ]]
 dd if=/dev/zero of="$DATA/feed" bs=64 count=1 2>/dev/null
 printf 'CRFD' | dd of="$DATA/feed" bs=1 conv=notrunc 2>/dev/null
 printf '\001\000\000\000' | dd of="$DATA/feed" bs=1 seek=48 conv=notrunc 2>/dev/null
