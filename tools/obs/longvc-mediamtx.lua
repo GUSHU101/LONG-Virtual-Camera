@@ -76,6 +76,7 @@ local CREATE_HIDDEN_WITH_ATTRIBUTES = 0x08080400 -- NO_WINDOW | STARTUPINFOEX | 
 
 local settings_now
 local applied_settings
+local pending_follow_settings
 local desired
 local child
 local retry_at = 0
@@ -210,20 +211,12 @@ local function obs_endpoint()
 end
 
 local function prepare(spec, endpoint)
-    if not endpoint then
-        if spec.follow_obs then
-            local reason
-            endpoint, reason = obs_endpoint()
-            if not endpoint then return nil, reason end
-        else
-            endpoint = {
-                port = spec.port,
-                path = spec.path == "" and DEFAULT_PATH or spec.path,
-                host = LOOPBACK_IP,
-                address = LOOPBACK_ADDRESS,
-            }
-        end
-    end
+    endpoint = endpoint or {
+        port = spec.port,
+        path = spec.path == "" and DEFAULT_PATH or spec.path,
+        host = LOOPBACK_IP,
+        address = LOOPBACK_ADDRESS,
+    }
     if not valid_port(endpoint.port) then return nil, "RTMP 端口应为 1024 至 65535。" end
     if not valid_path(endpoint.path) then
         return nil, "流路径只接受字母、数字、下划线、连字符及分隔斜杠。"
@@ -255,6 +248,10 @@ local function prepare(spec, endpoint)
         bind_address = bind_address,
         lan_readers = spec.lan_readers,
     }
+end
+
+local function publish_url(spec)
+    return "rtmp://" .. spec.publisher_ip .. ":" .. spec.port .. "/" .. spec.path
 end
 
 local function environment(spec)
@@ -370,6 +367,7 @@ end
 
 local function replace_relay(next_relay)
     desired, retry_at, retries = next_relay, 0, 0
+    pending_follow_settings = nil
     waiting_for_port = false
     follow_warning = nil
     stop()
@@ -393,7 +391,8 @@ local function report_follow_warning(message)
 end
 
 local function sync_endpoint(now)
-    if not desired or not applied_settings or not settings_now.follow_obs or now < next_endpoint_check then
+    local spec = pending_follow_settings or (desired and applied_settings)
+    if not spec or not settings_now.follow_obs or now < next_endpoint_check then
         return
     end
     next_endpoint_check = now + ENDPOINT_RECHECK_MS
@@ -401,20 +400,29 @@ local function sync_endpoint(now)
 
     local endpoint, reason = obs_endpoint()
     if not endpoint then report_follow_warning(reason); return end
-    if matches_endpoint(desired, endpoint) then
+    if desired and matches_endpoint(desired, endpoint) then
         follow_warning = nil
         return
     end
-    if not replacement_port_available(endpoint.port) then
+    if desired and not replacement_port_available(endpoint.port) then
         report_follow_warning("OBS 推流端口暂不可用，当前中继继续运行。")
         return
     end
     -- Follow the OBS service independently of unapplied executable or LAN
     -- settings. A stopped relay stays stopped and a live stream is left alone.
     local next_relay
-    next_relay, reason = prepare(applied_settings, endpoint)
-    if not next_relay then report_follow_warning(reason); return end
-    info("检测到 OBS 本机推流地址变更，正在同步中继设置。")
+    next_relay, reason = prepare(spec, endpoint)
+    if not next_relay then
+        pending_follow_settings = nil
+        report_follow_warning(reason)
+        return
+    end
+    if pending_follow_settings then
+        applied_settings = spec
+        info("OBS 推流配置已可用，正在启动中继。")
+    else
+        info("检测到 OBS 本机推流地址变更，正在同步中继设置。")
+    end
     replace_relay(next_relay)
 end
 
@@ -448,7 +456,8 @@ local function tick()
         elseif child.job and not child.ready_at then
             if listening(child.spec.port, child.pid, child.spec.bind_address) then
                 child.ready_at = now
-                info("中继已就绪，正在监听 TCP " .. child.spec.port .. "。")
+                info("中继已就绪，正在监听 TCP " .. child.spec.port .. "。OBS 推流地址 "
+                    .. publish_url(child.spec) .. "。")
             elseif now - child.launched >= STARTUP_MS then
                 stop()
                 if retries == 0 or not schedule_restart(now) then
@@ -477,7 +486,19 @@ local function tick()
 end
 
 local function apply_settings()
-    local next_relay, reason = prepare(settings_now)
+    pending_follow_settings = nil
+    local endpoint, reason
+    if settings_now.follow_obs then
+        endpoint, reason = obs_endpoint()
+        if not endpoint then
+            if not desired then pending_follow_settings = settings_now end
+            warn(reason)
+            follow_warning = reason
+            return false
+        end
+    end
+    local next_relay
+    next_relay, reason = prepare(settings_now, endpoint)
     if not next_relay then warn(reason); return false end
     if child and child.job then
         local active = child.spec
@@ -504,6 +525,7 @@ end
 
 local function stop_relay()
     desired = nil
+    pending_follow_settings = nil
     stop()
     info("已停止 OBS 脚本管理的中继。")
     return false
@@ -515,6 +537,7 @@ local function report_status()
         local endpoint, reason = obs_endpoint()
         local access = active.lan_readers and "局域网可拉流" or "仅本机可拉流"
         info("中继正在监听 TCP " .. active.port .. "（" .. access .. "）。")
+        info("中继接受的 OBS 推流地址 " .. publish_url(active) .. "。")
         if not endpoint then
             warn(reason)
         elseif not matches_endpoint(active, endpoint) then
@@ -524,6 +547,9 @@ local function report_status()
         info("等待 TCP " .. desired.port .. " 释放。")
     elseif desired then
         info("中继正在启动或等待重试。")
+    elseif pending_follow_settings and settings_now.follow_obs then
+        info("中继正在等待有效的 OBS 本机推流设置。")
+        if follow_warning then warn(follow_warning) end
     else
         info("中继已停止。")
     end
@@ -610,6 +636,7 @@ function script_unload()
     if not supported then return end
     obs.timer_remove(tick)
     desired = nil
+    pending_follow_settings = nil
     applied_settings = nil
     stop()
     if child then
