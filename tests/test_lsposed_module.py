@@ -271,7 +271,7 @@ class LsposedModuleContractTests(unittest.TestCase):
         activity = (MODULE / "java/com/gushu/longvc/MainActivity.java").read_text(
             encoding="utf-8"
         )
-        self.assertIn("if (!documentPickerOpen && !busy && !emergencyBusy && !hasUnseenOperation)", activity)
+        self.assertIn("if (!documentPickerOpen && !busy && !emergencyBusy && !hasUnseenOperation", activity)
         self.assertLess(activity.index("documentPickerOpen = true;"),
                         activity.index("startActivityForResult(intent, requestCode)"))
         self.assertIn("outState.putBoolean(PICKER_OPEN, documentPickerOpen)", activity)

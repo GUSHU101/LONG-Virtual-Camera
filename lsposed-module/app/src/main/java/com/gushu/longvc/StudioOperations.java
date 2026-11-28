@@ -57,6 +57,10 @@ final class StudioOperations {
         return true;
     }
 
+    boolean hasUnclaimedCompletion() {
+        return current != null && !current.pending() && current.id() > handled;
+    }
+
     boolean start(Request request, boolean recovery, Task task, Task readStatus) {
         long id = current == null ? 1 : current.id() + 1;
         AtomicReference<Outcome> result = new AtomicReference<>();

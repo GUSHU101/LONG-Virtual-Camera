@@ -40,6 +40,7 @@ public final class MainActivity extends Activity
     private static final String OBS_AUDIO_ONLY = "obs_audio_only";
     private static final String APPEARANCE = "studio_appearance";
     private static final String LIGHT = "light";
+    private static final long STATUS_MAX_AGE_MS = 15_000L;
 
     private enum VisualChoice {
         VIDEO(R.id.choose_video), IMAGE(R.id.choose_image), OBS(R.id.choose_obs);
@@ -101,7 +102,6 @@ public final class MainActivity extends Activity
     private boolean obsAudioOnly;
     private boolean canRequestSystemScope;
     private boolean destroyed;
-    private long lastCompletionShown;
     private RuntimeState lastState;
 
     @Override
@@ -271,11 +271,19 @@ public final class MainActivity extends Activity
         super.onStart();
         LongVcApplication.addServiceStateListener(this, true);
         StudioOperations.Snapshot latest = operations.latest();
-        boolean hasUnseenOperation = latest != null && latest.id() != lastCompletionShown;
+        boolean hasUnseenOperation = operations.hasUnclaimedCompletion();
         operations.attach(operationListener);
         // The picker result may arrive after onStart. A background refresh
         // cannot take the operation slot from the pending user import.
-        if (!documentPickerOpen && !busy && !emergencyBusy && !hasUnseenOperation) refreshOnEntry();
+        if (!documentPickerOpen && !busy && !emergencyBusy && !hasUnseenOperation
+                && needsForegroundRefresh(latest)) refreshOnEntry();
+    }
+
+    private static boolean needsForegroundRefresh(StudioOperations.Snapshot latest) {
+        if (latest == null) return true;
+        if (latest.pending()) return false;
+        long age = System.currentTimeMillis() - latest.outcome().readAt();
+        return age < 0 || age >= STATUS_MAX_AGE_MS;
     }
 
     private void refreshOnEntry() {
@@ -488,10 +496,9 @@ public final class MainActivity extends Activity
             return;
         }
 
-        lastCompletionShown = snapshot.id();
         StudioOperations.Outcome outcome = snapshot.outcome();
         boolean once = operations.claimCompletion(snapshot);
-        if (outcome.failure() == null && once) applyOperationSuccess(snapshot.request());
+        if (outcome.failure() == null && once) applyOperationSuccess(snapshot.request(), outcome.state());
         publishState(outcome.state(), outcome.readAt());
         if (outcome.failure() != null) {
             renderOperationFailure(snapshot.recovery(), outcome, once);
@@ -505,11 +512,10 @@ public final class MainActivity extends Activity
         }
     }
 
-    private void applyOperationSuccess(StudioOperations.Request request) {
+    private void applyOperationSuccess(StudioOperations.Request request, RuntimeState state) {
         switch (request.effect()) {
             case VIDEO_IMPORTED, IMAGE_IMPORTED -> {
-                studioPreview.remember(Uri.parse(request.document()),
-                        request.effect() == StudioOperations.Effect.VIDEO_IMPORTED ? "video" : "image");
+                studioPreview.remember(Uri.parse(request.document()), state);
                 announceMediaSaved();
             }
             case AUDIO_IMPORTED -> announceMediaSaved();

@@ -21,7 +21,7 @@ touch "$old_file" "$next_file"
 
 stage_name=.source-config-79
 stage=$CONTROL/$stage_name
-prepare() { printf 'schema=2\nvisual_path=%s\naudio_path=\n' "$1" > "$stage"; }
+prepare() { printf 'schema=2\nvisual_kind=video\nvisual_path=%s\naudio_path=\n' "$1" > "$stage"; }
 commit() { (commit_source "$stage_name" "$1" "$(file_sha256 "$stage")"); }
 
 initial=$(printf 'schema=2\n' | file_sha256)
@@ -55,3 +55,20 @@ prepare "$next_file"
 commit "$revision"
 [[ $(config_value visual_path) == "$next_file" && -f "$next_file" && ! -e "$old_file" ]]
 printf '%s\n' 'Source commit rejected conflicts, active leases, missing media and a bad checksum'
+
+find_feed_pid() { return 1; }
+hook_pid() { return 1; }
+camera_runtime_state() { printf '%s\n' stock; }
+audio_runtime_state() { printf '%s\n' stock; }
+camera_output_stats() { :; }
+getprop() { printf '%s\n' arm64-v8a; }
+getenforce() { printf '%s\n' Enforcing; }
+obs_url=rtmp://relay.invalid/live/test-fixture-key
+printf 'obs_url=%s\n' "$obs_url" >> "$SOURCE_CONFIG"
+status=$(print_status)
+[[ $status == *$'\nvisual_source_id='$(printf '%064d' 2)$'\n'* ]]
+[[ $status != *"$next_file"* && $status != *"$obs_url"* ]]
+printf 'visual_mode=obs\n' >> "$SOURCE_CONFIG"
+status=$(print_status)
+[[ $status == *$'\nvisual_source_id=\n'* && $status != *"$obs_url"* ]]
+printf '%s\n' 'Status identifies the selected local visual source without exposing file paths or OBS addresses'

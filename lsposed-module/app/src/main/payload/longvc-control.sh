@@ -984,6 +984,7 @@ print_status() {
 
   visual_kind=$(config_value visual_kind 2>/dev/null)
   case "$visual_kind" in video|image) ;; *) visual_kind=none ;; esac
+  visual_source_id=
   if [ "$visual_mode" = obs ]; then
     visual_source_ready=$obs_configured
     if [ "$obs_pull" = "1" ] &&
@@ -994,7 +995,14 @@ print_status() {
       video_feed=0
     fi
   else
-    local_visual_url >/dev/null 2>&1 && visual_source_ready=1 || visual_source_ready=0
+    if local_input=$(local_visual_url 2>/dev/null); then
+      visual_source_ready=1
+      visual_file=${local_input##*/}
+      visual_source_id=${visual_file#visual-}
+      visual_source_id=${visual_source_id%.media}
+    else
+      visual_source_ready=0
+    fi
     find_feed_pid "--role video" >/dev/null 2>&1 && video_feed=1 || video_feed=0
   fi
 
@@ -1035,6 +1043,7 @@ print_status() {
   say "visual_mode=$visual_mode"
   say "audio_mode=$audio_mode"
   say "visual_kind=${visual_kind:-none}"
+  say "visual_source_id=$visual_source_id"
   say "visual_source_ready=$visual_source_ready"
   say "audio_source_ready=$audio_source_ready"
   say "obs_configured=$obs_configured"

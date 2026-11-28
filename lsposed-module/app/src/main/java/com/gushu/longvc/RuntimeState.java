@@ -3,8 +3,10 @@ package com.gushu.longvc;
 import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 final class RuntimeState {
+    private static final Pattern SOURCE_ID = Pattern.compile("[a-f0-9]{64}");
     final boolean root;
     final boolean installed;
     final boolean controllerVerified;
@@ -12,6 +14,7 @@ final class RuntimeState {
     final String visualMode;
     final String audioMode;
     final String visualKind;
+    final String visualSourceId;
     final boolean visualSourceReady;
     final boolean audioSourceReady;
     final boolean obsConfigured;
@@ -56,6 +59,10 @@ final class RuntimeState {
         this.audioMode = values.getOrDefault("audio_mode", "local");
         this.visualKind = values.getOrDefault("visual_kind", "none");
         this.visualSourceReady = flag(values, "visual_source_ready");
+        String identity = values.getOrDefault("visual_source_id", "");
+        this.visualSourceId = this.controllerVerified && this.visualSourceReady
+                && "local".equals(this.visualMode) && SOURCE_ID.matcher(identity).matches()
+                ? identity : "";
         this.audioSourceReady = flag(values, "audio_source_ready");
         this.obsConfigured = flag(values, "obs_configured");
         this.obsPullRunning = flag(values, "obs_pull_running");
@@ -89,6 +96,11 @@ final class RuntimeState {
         this.abi = values.getOrDefault("abi", "unknown");
         this.selinux = values.getOrDefault("selinux", "unknown");
         this.raw = raw;
+    }
+
+    boolean matchesLocalVisual(String kind, String identity) {
+        return !visualSourceId.isEmpty() && visualSourceId.equals(identity)
+                && visualKind.equals(kind);
     }
 
     static RuntimeState parseController(String raw, boolean controllerVerified,

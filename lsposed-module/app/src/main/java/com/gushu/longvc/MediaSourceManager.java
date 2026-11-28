@@ -614,6 +614,10 @@ final class MediaSourceManager {
             this.fingerprint = fingerprint;
         }
 
+        boolean confirmsVisualImport(RuntimeState state) {
+            return !"visual".equals(type) || state.matchesLocalVisual(kind, fingerprint.sha256);
+        }
+
         @Override
         public void close() {
             cleanup(staged);

@@ -28,6 +28,7 @@ final class StudioPreview {
     private static final int PREVIEW_LIMIT = 960;
     private static final String URI = "visual_uri";
     private static final String KIND = "visual_kind";
+    private static final String SOURCE_ID = "visual_source_id";
     private final Activity activity;
     private final Runnable refresh;
     private final SharedPreferences preferences;
@@ -36,6 +37,7 @@ final class StudioPreview {
     private RuntimeState state;
     private Uri recentUri;
     private String recentKind;
+    private String recentSourceId;
     private View playingPanel;
     private View player;
     private Future<?> imageTask;
@@ -49,6 +51,7 @@ final class StudioPreview {
         String saved = preferences.getString(URI, null);
         recentUri = saved == null ? null : Uri.parse(saved);
         recentKind = preferences.getString(KIND, "");
+        recentSourceId = preferences.getString(SOURCE_ID, "");
         panels = new View[]{activity.findViewById(R.id.workbench_preview),
                 activity.findViewById(R.id.source_preview)};
         for (View panel : panels) {
@@ -56,16 +59,19 @@ final class StudioPreview {
         }
     }
 
-    void remember(Uri uri, String kind) {
+    void remember(Uri uri, RuntimeState imported) {
+        if (imported.visualSourceId.isEmpty()) return;
         stop();
         Uri previous = recentUri;
         recentUri = uri;
-        recentKind = kind;
+        recentKind = imported.visualKind;
+        recentSourceId = imported.visualSourceId;
         try {
             activity.getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            preferences.edit().putString(URI, uri.toString()).putString(KIND, kind).apply();
+            preferences.edit().putString(URI, uri.toString()).putString(KIND, recentKind)
+                    .putString(SOURCE_ID, recentSourceId).apply();
         } catch (SecurityException unavailable) {
-            preferences.edit().remove(URI).remove(KIND).apply();
+            preferences.edit().remove(URI).remove(KIND).remove(SOURCE_ID).apply();
         }
         if (previous != null && !previous.equals(uri)) {
             try {
@@ -88,8 +94,7 @@ final class StudioPreview {
     }
 
     private boolean localAvailable() {
-        return state != null && state.controllerVerified && state.visualSourceReady
-                && !state.visualUsesObs() && recentUri != null && recentKind.equals(state.visualKind);
+        return recentUri != null && state != null && state.matchesLocalVisual(recentKind, recentSourceId);
     }
 
     private boolean usesObs() {

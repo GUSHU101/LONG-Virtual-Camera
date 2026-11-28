@@ -122,7 +122,11 @@ final class RootController {
     private RuntimeState replaceMedia(MediaSourceManager.PreparedMedia media)
             throws IOException, InterruptedException {
         try (media) {
-            return replaceSource(() -> mediaSources.commitMedia(media));
+            RuntimeState state = replaceSource(() -> mediaSources.commitMedia(media));
+            if (!media.confirmsVisualImport(state)) {
+                throw new IOException("已无法确认导入的画面来源。请刷新状态，核对其他操作是否更换了来源。");
+            }
+            return state;
         }
     }
 

@@ -104,9 +104,31 @@ public final class RootLifecycleTest {
         check(!completion.pending() && completion.outcome().state() == imported,
                 "new screen sees completed import without a new command");
         check(completion.request().document().equals(request.document()), "preview can remember the imported document");
+        check(operations.hasUnclaimedCompletion(), "returning screen receives an unclaimed result");
         check(operations.claimCompletion(completion), "first screen can apply the completed import");
+        check(!operations.hasUnclaimedCompletion(), "reading an old status can now be scheduled");
         check(!operations.claimCompletion(completion), "replay cannot repeat the toast or URI changes");
         check(original.size() == 1, "destroyed screen was detached");
+    }
+
+    private static void verifiesLocalPreviewIdentity() throws Exception {
+        String importedId = "a".repeat(64);
+        String otherId = "b".repeat(64);
+        String current = snapshot("ok") + "visual_kind=video\nvisual_mode=local\n";
+        RuntimeState imported = RuntimeState.parseController(
+                current + "visual_source_id=" + importedId + "\n", true, true);
+        check(imported.matchesLocalVisual("video", importedId), "match imported media");
+        check(!imported.matchesLocalVisual("video", otherId), "different video must invalidate preview");
+        check(!imported.matchesLocalVisual("image", importedId), "different kind must invalidate preview");
+        RuntimeState obs = RuntimeState.parseController(
+                current.replace("visual_mode=local", "visual_mode=obs")
+                        + "visual_source_id=" + importedId + "\n", true, true);
+        check(!obs.matchesLocalVisual("video", importedId), "OBS must not show an old document");
+        RuntimeState oldStatus = RuntimeState.parseController(current, true, true);
+        check(!oldStatus.matchesLocalVisual("video", ""), "a missing identity cannot confirm a match");
+        RuntimeState malformed = RuntimeState.parseController(
+                current + "visual_source_id=bad\n", true, true);
+        check(!malformed.matchesLocalVisual("video", "bad"), "invalid identities cannot confirm a match");
     }
 
     private static void recoveryRejectsObsoleteCompletion() throws Exception {
@@ -230,6 +252,7 @@ public final class RootLifecycleTest {
         interruptsRunningWork();
         replaysImportAcrossActivities();
         recoveryRejectsObsoleteCompletion();
+        verifiesLocalPreviewIdentity();
         verifiesRecoveryResult();
         checksCameraOutputStats();
         System.out.println("Root lifecycle checks passed");
