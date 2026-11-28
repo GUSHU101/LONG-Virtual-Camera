@@ -2,7 +2,8 @@
 
 // NV21 → JPEG encoder for photo-mode BLOB substitution. Backed by
 // stb_image_write (single-header public-domain). Encodes RGB-encoded
-// JPEG at the requested quality.
+// JPEG at the requested quality. At quality 85 or above, a capacity
+// overflow permits one retry five points lower at the same dimensions.
 // Returns 0 on success, negative error code on failure:
 //   -1: invalid arguments or insufficient source data
 //   -2: allocation failed
@@ -17,7 +18,11 @@ extern "C"
 {
 #endif
 
-  enum { CR_CAMERA_JPEG_TRAILER_BYTES = 8 };
+  enum
+  {
+    CR_CAMERA_JPEG_TRAILER_BYTES = 8,
+    CR_CAMERA_JPEG_ORIENTATION_BYTES = 36
+  };
 
   int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int src_w, int src_h,
                       size_t dst_cap, int quality, uint8_t** out, size_t* out_written);

@@ -880,6 +880,7 @@ struct EncodedJpeg
 {
   std::shared_ptr<const uint8_t> data;
   size_t size = 0;
+  size_t capacity = 0;
   uint32_t generation = 0;
   uint64_t frame = 0;
   uint32_t width = 0;
@@ -993,10 +994,10 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   if (H != 1)
     return false;
   const size_t buf_capacity = (size_t) W;
-  const size_t trailer_size = CR_CAMERA_JPEG_TRAILER_BYTES;
-  if (buf_capacity < trailer_size + 1024)
+  constexpr size_t overhead = CR_CAMERA_JPEG_TRAILER_BYTES + CR_CAMERA_JPEG_ORIENTATION_BYTES;
+  if (buf_capacity < overhead + 1024)
     return false;
-  const size_t encode_cap = buf_capacity - trailer_size;
+  const size_t encode_cap = buf_capacity - overhead;
 
   const void* handle = anb->handle;
   if (!handle)
@@ -1048,7 +1049,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
   {
     std::lock_guard<std::mutex> guard(g_jpeg_cache_mutex);
     if (g_jpeg_cache.data && g_jpeg_cache.generation == source.generation &&
-        g_jpeg_cache.frame == cur_frame &&
+        g_jpeg_cache.frame == cur_frame && g_jpeg_cache.capacity == encode_cap &&
         g_jpeg_cache.width == static_cast<uint32_t>(target_w) &&
         g_jpeg_cache.height == static_cast<uint32_t>(target_h) && g_jpeg_cache.zoom == zoom)
       jpeg = g_jpeg_cache;
@@ -1082,6 +1083,7 @@ static bool overwrite_blob_jpeg(ANWB* anb, int fence)
       return false;
     }
     jpeg.data = std::shared_ptr<const uint8_t>(encoded, std::free);
+    jpeg.capacity = encode_cap;
     jpeg.generation = source.generation;
     jpeg.frame = cur_frame;
     jpeg.width = target_w;

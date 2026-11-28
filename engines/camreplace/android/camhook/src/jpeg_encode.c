@@ -24,6 +24,9 @@
 
 #include "jpeg_encode.h"
 #include "YuvColor.h"
+
+enum { JPEG_CAPACITY_EXCEEDED = -4 };
+
 struct EncodeCtx
 {
   uint8_t* dst;
@@ -40,7 +43,7 @@ static void write_cb(void* user, void* data, int size)
     return;
   if ((size_t) size > ctx->limit - ctx->off)
   {
-    ctx->error = -3;
+    ctx->error = JPEG_CAPACITY_EXCEEDED;
     return;
   }
   const size_t needed = ctx->off + (size_t) size;
@@ -106,6 +109,28 @@ static void nv21_to_rgb24(const uint8_t* nv21, int sw, int sh, uint8_t* rgb,
   }
 }
 
+static int has_jpeg_markers(const uint8_t* data, size_t size)
+{
+  return size >= 4 && data[0] == 0xff && data[1] == 0xd8 &&
+         data[size - 2] == 0xff && data[size - 1] == 0xd9;
+}
+
+static int encode_rgb_jpeg(const uint8_t* rgb, int width, int height, size_t limit, int quality,
+                           uint8_t** out, size_t* out_written)
+{
+  struct EncodeCtx ctx = {0};
+  ctx.limit = limit;
+  const int ok = stbi_write_jpg_to_func(write_cb, &ctx, width, height, 3, rgb, quality);
+  if (!ok || ctx.error || !has_jpeg_markers(ctx.dst, ctx.off))
+  {
+    free(ctx.dst);
+    return ctx.error ? ctx.error : -3;
+  }
+  *out = ctx.dst;
+  *out_written = ctx.off;
+  return 0;
+}
+
 int cr_nv21_to_jpeg_color(const uint8_t* nv21, size_t src_size, int sw, int sh,
                           size_t dst_cap, int quality, uint8_t** out, size_t* out_written,
                           int bt709, int full_range)
@@ -128,20 +153,13 @@ int cr_nv21_to_jpeg_color(const uint8_t* nv21, size_t src_size, int sw, int sh,
     return -2;
   nv21_to_rgb24(nv21, sw, sh, rgb, bt709, full_range);
 
-  struct EncodeCtx ctx = {0};
-  ctx.limit = dst_cap;
-
-  int ok = stbi_write_jpg_to_func(write_cb, &ctx, sw, sh, 3, rgb, quality);
+  int result = encode_rgb_jpeg(rgb, sw, sh, dst_cap, quality, out, out_written);
+  // A single bounded retry keeps the dimensions and reuses the RGB conversion.
+  // Limit the retry to small quality reductions and leave other failures alone.
+  if (result == JPEG_CAPACITY_EXCEEDED && quality >= 85)
+    result = encode_rgb_jpeg(rgb, sw, sh, dst_cap, quality - 5, out, out_written);
   free(rgb);
-
-  if (!ok || ctx.error || ctx.off == 0)
-  {
-    free(ctx.dst);
-    return ctx.error ? ctx.error : -3;
-  }
-  *out = ctx.dst;
-  *out_written = ctx.off;
-  return 0;
+  return result == JPEG_CAPACITY_EXCEEDED ? -3 : result;
 }
 
 int cr_nv21_to_jpeg(const uint8_t* nv21, size_t src_size, int sw, int sh,
@@ -161,12 +179,6 @@ _Static_assert(sizeof(struct CameraJpegTrailer) == CR_CAMERA_JPEG_TRAILER_BYTES,
                "Camera3 JPEG trailer size");
 _Static_assert(offsetof(struct CameraJpegTrailer, size) == 4,
                "Camera3 JPEG trailer size offset");
-
-static int has_jpeg_markers(const uint8_t* data, size_t size)
-{
-  return size >= 4 && data[0] == 0xff && data[1] == 0xd8 &&
-         data[size - 2] == 0xff && data[size - 1] == 0xd9;
-}
 
 static uint16_t exif_u16(const uint8_t* data, int little_endian)
 {
@@ -280,6 +292,11 @@ int cr_replace_camera_jpeg(uint8_t* dst, size_t dst_size,
       !has_jpeg_markers(jpeg, jpeg_size))
     return -1;
 
+  int width = 0, height = 0;
+  read_jpeg_metadata(jpeg, jpeg_size, &width, &height, NULL);
+  if (width <= 0 || height <= 0)
+    return -1;
+
   const size_t previous_size = camera_jpeg_size(dst, dst_size);
   if (previous_size == 0)
     return -1;
@@ -292,6 +309,7 @@ int cr_replace_camera_jpeg(uint8_t* dst, size_t dst_size,
       'I', 'I', 42, 0, 8, 0, 0, 0,
       1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, orientation, 0, 0, 0,
       0, 0, 0, 0};
+  _Static_assert(sizeof(exif) == CR_CAMERA_JPEG_ORIENTATION_BYTES, "JPEG orientation segment size");
   const size_t new_size = jpeg_size + (orientation == 1 ? 0 : sizeof(exif));
   if (new_size > capacity || new_size > UINT32_MAX || new_size < jpeg_size)
     return -1;

@@ -68,6 +68,34 @@ static void verify_encoded_colors(int bt709, int full_range)
   free(jpeg);
 }
 
+static void verify_jpeg_capacity(const uint8_t* nv21, size_t src_size, int width, int height,
+                                 size_t budget, const uint8_t* nominal, size_t nominal_size)
+{
+  uint8_t* reference = NULL;
+  size_t reference_size = 0;
+  assert(cr_nv21_to_jpeg(nv21, src_size, width, height, budget, 80,
+                        &reference, &reference_size) == 0);
+  assert(reference_size > 1024 && reference_size < nominal_size);
+
+  uint8_t* encoded = NULL;
+  size_t size = 0;
+  assert(cr_nv21_to_jpeg(nv21, src_size, width, height, nominal_size, 85, &encoded, &size) == 0);
+  assert(size == nominal_size && memcmp(encoded, nominal, size) == 0);
+  free(encoded);
+
+  assert(cr_nv21_to_jpeg(nv21, src_size, width, height, reference_size, 85, &encoded, &size) == 0);
+  assert(size == reference_size && memcmp(encoded, reference, size) == 0);
+  int decoded_width = 0, decoded_height = 0, components = 0;
+  uint8_t* rgb = stbi_load_from_memory(encoded, (int) size, &decoded_width, &decoded_height, &components, 3);
+  assert(rgb && decoded_width == width && decoded_height == height);
+  stbi_image_free(rgb);
+  free(encoded);
+  free(reference);
+
+  assert(cr_nv21_to_jpeg(nv21, src_size, width, height, reference_size - 1, 85, &encoded, &size) == -3);
+  assert(encoded == NULL && size == 0);
+}
+
 int main(void)
 {
   verify_encoded_colors(0, 0);
@@ -107,6 +135,7 @@ int main(void)
   assert(cr_nv21_to_jpeg(nv21, sizeof(nv21), WIDTH, HEIGHT, tail, 85,
                         &jpeg, &length) == 0);
   assert(jpeg && length > 1024 && length <= tail);
+  verify_jpeg_capacity(nv21, sizeof(nv21), WIDTH, HEIGHT, tail, jpeg, length);
 
   blob[tail] = 0x00;
   blob[tail + 1] = 0x01; // Android JPEG APP segments use the same BLOB format.
@@ -120,6 +149,7 @@ int main(void)
   assert(cr_camera_jpeg_dimensions(blob, sizeof(blob), &capture_width, &capture_height) != 0);
   memcpy(original, blob, sizeof(blob));
   assert(cr_replace_camera_jpeg(blob, sizeof(blob), jpeg, length - 1) != 0);
+  assert(cr_replace_camera_jpeg(blob, sizeof(blob), original_jpeg, sizeof(original_jpeg)) != 0);
   assert(memcmp(blob, original, sizeof(blob)) == 0);
   assert(cr_replace_camera_jpeg(blob, sizeof(blob), jpeg, length) == 0);
   assert(memcmp(blob, jpeg, length) == 0);
@@ -149,10 +179,36 @@ int main(void)
   memcpy(&written, blob + tail + 4, sizeof(written));
   assert(written == length + 36);
 
+  const size_t exact_tail = length + CR_CAMERA_JPEG_ORIENTATION_BYTES;
+  const size_t exact_size = exact_tail + CR_CAMERA_JPEG_TRAILER_BYTES;
+  assert(exact_size <= sizeof(blob));
+  memcpy(blob, rotated_jpeg, sizeof(rotated_jpeg));
+  memcpy(blob + exact_tail, trailer, sizeof(trailer));
+  memcpy(blob + exact_tail + 4, &original_size, sizeof(original_size));
+  assert(cr_replace_camera_jpeg(blob, exact_size, jpeg, length) == 0);
+  memcpy(&written, blob + exact_tail + 4, sizeof(written));
+  assert(written == exact_tail);
+  memcpy(blob, rotated_jpeg, sizeof(rotated_jpeg));
+  memcpy(blob + exact_tail - 1, trailer, sizeof(trailer));
+  memcpy(blob + exact_tail - 1 + 4, &original_size, sizeof(original_size));
+  memcpy(original, blob, exact_size - 1);
+  assert(cr_replace_camera_jpeg(blob, exact_size - 1, jpeg, length) != 0);
+  assert(memcmp(blob, original, exact_size - 1) == 0);
+
   memcpy(blob, rotated_jpeg, sizeof(rotated_jpeg));
   blob[8] = 'X'; // A different APP1 type contributes no orientation.
+  memcpy(blob + tail, trailer, sizeof(trailer));
   memcpy(blob + tail + 4, &original_size, sizeof(original_size));
   assert(cr_replace_camera_jpeg(blob, sizeof(blob), jpeg, length) == 0);
   assert(memcmp(blob, jpeg, length) == 0);
+  free(jpeg);
+
+  memset(nv21, 128, sizeof(nv21));
+  assert(cr_nv21_to_jpeg(nv21, sizeof(nv21), WIDTH, HEIGHT, 1024, 85, &jpeg, &length) == 0);
+  assert(length < 1024);
+  int components = 0;
+  uint8_t* pixels = stbi_load_from_memory(jpeg, (int) length, &capture_width, &capture_height, &components, 3);
+  assert(pixels && capture_width == WIDTH && capture_height == HEIGHT);
+  stbi_image_free(pixels);
   free(jpeg);
 }
