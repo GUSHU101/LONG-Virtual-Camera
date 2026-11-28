@@ -51,6 +51,11 @@ final class RootShell {
             return false;
         }
 
+        boolean reportsFailure(String message, String detail) {
+            return exitCode != 0 && !timedOut && !outputTruncated && streamError == null
+                    && hasLine("result=error") && hasLine("message=" + message) && hasLine(detail);
+        }
+
         String describe() {
             if (timedOut) return "root command timed out";
             if (streamError != null) return "root stream failed: " + redactDiagnostic(streamError.getMessage());

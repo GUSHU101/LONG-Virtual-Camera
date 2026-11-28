@@ -103,6 +103,16 @@ public final class RootLifecycleTest {
         check(!diagnostic.contains("relay.local") && !diagnostic.contains("path-key")
                         && !diagnostic.contains("query-secret") && !diagnostic.contains("my-private-video"),
                 "diagnostics must omit stream and content addresses");
+        String cameraFailure = "NormalPerm(policy log)\ncr_injector: FAIL rc=17\n"
+                + "result=error\nmessage=camera_arm_failed\n";
+        RootShell.Result failedCamera = new RootShell.Result(1, cameraFailure, false, false, null);
+        check(failedCamera.reportsFailure("camera_arm_failed", "cr_injector: FAIL rc=17"),
+                "recognize the exact camera initialization failure despite policy log noise");
+        check(!failedCamera.reportsFailure("photo_arm_failed", "cr_injector: FAIL rc=17"),
+                "do not attribute camera failures to the photo operation");
+        check(!new RootShell.Result(1, cameraFailure, false, true, null)
+                        .reportsFailure("camera_arm_failed", "cr_injector: FAIL rc=17"),
+                "truncated command output cannot diagnose a structured failure");
         Thread.currentThread().interrupt();
         try {
             RootShell.checkCancellation();

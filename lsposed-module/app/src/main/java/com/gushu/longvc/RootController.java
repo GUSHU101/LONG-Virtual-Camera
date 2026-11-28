@@ -24,6 +24,12 @@ final class RootController {
         }
     }
 
+    static final class CameraInitializationException extends IOException {
+        CameraInitializationException() {
+            super("Camera module initialization failed (rc=17)");
+        }
+    }
+
     private final RootShell shell = new RootShell();
     private final PayloadInstaller installer;
     private final MediaSourceManager mediaSources;
@@ -58,6 +64,14 @@ final class RootController {
                 PayloadInstaller.REMOTE_SCRIPT + " " + action.command, 45L);
         if (!result.ok() || !result.hasLine("result=ok")
                 || !result.hasLine("action=" + action.command)) {
+            String cameraError = switch (action) {
+                case ARM_CAMERA -> "camera_arm_failed";
+                case ARM_PHOTO -> "photo_arm_failed";
+                default -> null;
+            };
+            if (cameraError != null && result.reportsFailure(cameraError, "cr_injector: FAIL rc=17")) {
+                throw new CameraInitializationException();
+            }
             throw new IOException(action.command + " failed: " + result.describe());
         }
         RuntimeState state = status();

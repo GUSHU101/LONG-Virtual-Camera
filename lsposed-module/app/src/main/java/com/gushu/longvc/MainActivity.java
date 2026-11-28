@@ -600,7 +600,10 @@ public final class MainActivity extends Activity
         };
     }
 
-    private static String safeMessage(Throwable error) {
+    private String safeMessage(Throwable error) {
+        if (error instanceof RootController.CameraInitializationException) {
+            return getString(R.string.camera_initialization_failed);
+        }
         String message = error.getMessage();
         if (message == null || message.isBlank()) message = error.getClass().getSimpleName();
         message = RootShell.redactDiagnostic(message);
