@@ -183,13 +183,14 @@ private:
 
 public:
   // Feed one AAC raw access unit (FLV AAC packet type 1).
-  void push(const uint8_t* aac, size_t len, int64_t pts_us)
+  bool push(const uint8_t* aac, size_t len, int64_t pts_us)
   {
     if (!aac || !len || config_size_ == 0)
-      return;
+      return false;
     if (!ready_ && (std::chrono::steady_clock::now() < retry_at_ || !start_decoder()))
-      return;
+      return false;
 
+    bool accepted = false;
     ssize_t in_idx = AMediaCodec_dequeueInputBuffer(dec_, 5'000);
     if (in_idx >= 0)
     {
@@ -206,8 +207,9 @@ public:
           CR_AUDIO_LOGW(OBF("aac: queueInput failed status=%d").c_str(),
                         (int) queued);
           reset_decoder();
-          return;
+          return false;
         }
+        accepted = true;
       }
       else
       {
@@ -219,16 +221,17 @@ public:
                                         pts_us < 0 ? 0u : (uint64_t) pts_us, 0) != AMEDIA_OK)
         {
           reset_decoder();
-          return;
+          return false;
         }
       }
     }
     else if (in_idx != AMEDIACODEC_INFO_TRY_AGAIN_LATER)
     {
       reset_decoder();
-      return;
+      return false;
     }
     drain();
+    return accepted;
   }
 
   // Drop old buffered samples if the AAC track stalls while video continues.
@@ -236,7 +239,7 @@ public:
   void revoke_pcm() { publish_audio_header(); }
   uint64_t pcm_blocks_published() const noexcept { return pcm_blocks_published_; }
 
-private:
+  // Collect output that becomes available after push() returns.
   void drain()
   {
     if (!dec_)
@@ -307,7 +310,6 @@ private:
     }
   }
 
-public:
   void stop()
   {
     reset_decoder();

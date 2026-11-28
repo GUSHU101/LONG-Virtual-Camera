@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -76,8 +77,8 @@ public:
   struct ReceiveIdle
   {
     Clock::time_point until{};
-    // Return the next independent service deadline, or time_point::max().
-    Clock::time_point (*service)(void*) noexcept = nullptr;
+    // Return the next service deadline, or nullopt to cancel this receive.
+    std::optional<Clock::time_point> (*service)(void*) noexcept = nullptr;
     void* context = nullptr;
     Clock::time_point wake_at = Clock::time_point::max();
   };
@@ -130,6 +131,17 @@ private:
   {
     const auto until = std::min(transfer_deadline(), limit);
     auto wake_at = idle ? idle->wake_at : Clock::time_point::max();
+    auto service_receive = [&]() noexcept
+    {
+      const auto next = idle->service(idle->context);
+      if (!next)
+      {
+        errno = ECANCELED;
+        return false;
+      }
+      wake_at = *next;
+      return true;
+    };
     while (length != 0)
     {
       if (stop_.load(std::memory_order_relaxed))
@@ -146,7 +158,8 @@ private:
       }
       if (idle && idle->service && now >= wake_at)
       {
-        wake_at = idle->service(idle->context);
+        if (!service_receive())
+          return false;
         continue;
       }
       const bool service_idle = idle && idle->service && now < idle->until;
@@ -160,8 +173,8 @@ private:
       if (ready == 0)
       {
         if (service_idle && Clock::now() < wake_at && Clock::now() < until &&
-            !stop_.load(std::memory_order_relaxed))
-          wake_at = idle->service(idle->context);
+            !stop_.load(std::memory_order_relaxed) && !service_receive())
+          return false;
         continue;
       }
       if (ready < 0 && errno == EINTR)

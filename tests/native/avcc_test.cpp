@@ -68,6 +68,23 @@ int main()
   truncated.pop_back();
   assert(!cr::media::parse_avc_decoder_config(truncated, unchanged));
 
+  using cr::media::AvcConfigUpdate;
+  using cr::media::update_avc_decoder_config;
+  AvcDecoderConfig active;
+  assert(update_avc_decoder_config(tagged_avcc, active) == AvcConfigUpdate::Changed);
+  assert(update_avc_decoder_config(tagged_avcc, active) == AvcConfigUpdate::Unchanged);
+  const auto active_sets = active.parameter_sets_annexb;
+  assert(update_avc_decoder_config(truncated, active) == AvcConfigUpdate::Invalid);
+  assert(active.parameter_sets_annexb == active_sets && active.nalu_length_size == 4);
+  auto changed_length = tagged_avcc;
+  changed_length[4] = config(1)[4];
+  assert(update_avc_decoder_config(changed_length, active) == AvcConfigUpdate::Changed);
+  assert(active.parameter_sets_annexb == active_sets && active.nalu_length_size == 2);
+  auto changed_pps = changed_length;
+  changed_pps.back() ^= 1;
+  assert(update_avc_decoder_config(changed_pps, active) == AvcConfigUpdate::Changed);
+  assert(active.parameter_sets_annexb != active_sets && active.nalu_length_size == 2);
+
   std::vector<std::uint8_t> out;
   const std::vector<std::uint8_t> one{2, 0x65, 0xaa};
   const std::vector<std::uint8_t> two{0, 2, 0x41, 0xbb};

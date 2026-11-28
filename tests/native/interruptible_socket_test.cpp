@@ -55,7 +55,7 @@ static void verify_idle_receive()
     int peer;
     int calls;
   } progress{pair[1], 0};
-  auto service = [](void* context) noexcept {
+  auto service = [](void* context) noexcept -> std::optional<Socket::Clock::time_point> {
     auto& state = *static_cast<Idle*>(context);
     ++state.calls;
     assert(::send(state.peer, "b", 1, 0) == 1);
@@ -68,7 +68,7 @@ static void verify_idle_receive()
   assert(bytes[0] == 'a' && bytes[1] == 'b' && progress.calls == 1);
   assert(input.received() == 2);
 
-  auto leave_waiting = [](void* context) noexcept {
+  auto leave_waiting = [](void* context) noexcept -> std::optional<Socket::Clock::time_point> {
     ++*static_cast<int*>(context);
     return Socket::Clock::time_point::max();
   };
@@ -83,7 +83,7 @@ static void verify_idle_receive()
   assert(errno == ETIMEDOUT && progress.calls == 1);
 
   int deadlines = 0;
-  auto scheduled = [](void* context) noexcept {
+  auto scheduled = [](void* context) noexcept -> std::optional<Socket::Clock::time_point> {
     const int count = ++*static_cast<int*>(context);
     return count == 1 ? Socket::Clock::now() + 20ms : Socket::Clock::time_point::max();
   };
@@ -91,6 +91,18 @@ static void verify_idle_receive()
   assert(!input.receive(bytes, 1, quiet + 100ms,
                         {quiet, scheduled, &deadlines, quiet + 20ms}));
   assert(errno == ETIMEDOUT && deadlines == 2);
+
+  auto cancel = [](void*) noexcept -> std::optional<Socket::Clock::time_point> {
+    return std::nullopt;
+  };
+  assert(::send(pair[1], "c", 1, 0) == 1);
+  const auto partial = Socket::Clock::now();
+  assert(!input.receive(bytes, sizeof(bytes), partial + 500ms,
+                        {partial, cancel, nullptr, partial + 30ms}));
+  assert(errno == ECANCELED && bytes[0] == 'c');
+  assert(!stop.load(std::memory_order_relaxed));
+  assert(::send(pair[1], "d", 1, 0) == 1);
+  assert(input.receive(bytes, 1) && bytes[0] == 'd');
   ::close(pair[0]);
   ::close(pair[1]);
 }

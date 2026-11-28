@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cmath>
 #include <new>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
@@ -50,8 +51,6 @@ constexpr unsigned kMaxAmfDepth = 16u;
 constexpr size_t kMaxStartupBytes = 1024u * 1024u;
 constexpr auto kStartupTimeout = std::chrono::seconds(12);
 constexpr auto kLiveIoTimeout = std::chrono::seconds(3);
-constexpr auto kTrackPublicationTimeout = std::chrono::seconds(2);
-constexpr auto kSessionPublicationTimeout = std::chrono::seconds(6);
 constexpr auto kDecoderIdleWindow = std::chrono::milliseconds(48);
 
 inline uint32_t be32(const uint8_t* p)
@@ -354,9 +353,8 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
     return true;
   };
 
-  std::vector<uint8_t> sps_pps_annexb;
+  cr::media::AvcDecoderConfig avc_config;
   std::vector<uint8_t> annexb;
-  uint8_t avcc_nalu_length_size = 0;
   int stream_w = 0, stream_h = 0;
   int metadata_w = 0, metadata_h = 0;
   bool geometry_from_sps = false;
@@ -367,7 +365,8 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   bool seen_video_keyframe = false;
   uint64_t waiting_for_keyframe = 0;
   cr_feed::H264DecodePipe pipe;
-  auto decoder_idle_until = cr::feed::DeadlineSocket::Clock::time_point{};
+  using Clock = cr::feed::DeadlineSocket::Clock;
+  Clock::time_point video_idle_until{}, audio_idle_until{};
 
   // Audio decoding begins after an AAC AudioSpecificConfig.
   cr_feed::AacDecodePipe audio_pipe;
@@ -377,14 +376,14 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   bool receiving_media = false;
   bool received_codec_config = false;
   bool publication_stalled = false;
-  cr::feed::TrackFreshness video_freshness, audio_freshness, session_freshness;
+  cr::feed::RtmpPlaybackFreshness freshness(enable_video);
 
   auto begin_media = [&]()
   {
     receiving_media = true;
     connection.finish_startup();
     connection.set_io_timeout(kLiveIoTimeout);
-    LOGI("rtmp: desktop stream is delivering supported media");
+    LOGI("rtmp: desktop stream is delivering %s", enable_video ? "video" : "audio");
   };
 
   auto try_start_pipe = [&]()
@@ -402,7 +401,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
            pipe_w, pipe_h, pipe_color.standard, pipe_color.range,
            stream_w, stream_h, stream_color.standard, stream_color.range);
       pipe.stop();
-      decoder_idle_until = {};
+      video_idle_until = {};
       pipe_started = false;
       seen_video_keyframe = false;
     }
@@ -422,38 +421,35 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
 
   auto update_track_readiness = [&]() noexcept
   {
-    const auto now = std::chrono::steady_clock::now();
-    const auto frames = pipe.frames_published();
-    const auto blocks = audio_pipe.pcm_blocks_published();
-    if (!receiving_media && (frames != 0 || blocks != 0))
+    const auto progress = freshness.observe(pipe.frames_published(),
+                                            audio_pipe.pcm_blocks_published(),
+                                            Clock::now());
+    if (!receiving_media && progress.primary_started)
       begin_media();
-    if (video_freshness.expired(frames, now, kTrackPublicationTimeout))
+    if (progress.video_stalled)
     {
       pipe.revoke_frame();
       LOGW("rtmp: no new video published in two seconds, waiting for a fresh frame");
     }
-    if (audio_freshness.expired(blocks, now, kTrackPublicationTimeout))
+    if (progress.audio_stalled)
     {
       audio_pipe.revoke_pcm();
       LOGW("rtmp: no new PCM published in two seconds, waiting for fresh audio");
     }
-    if (session_freshness.expired(frames + blocks, now, kSessionPublicationTimeout))
-      publication_stalled = true;
+    publication_stalled |= progress.reconnect;
   };
 
-  auto next_track_deadline = [&]() noexcept
+  auto service_media = [&]() noexcept -> std::optional<Clock::time_point>
   {
-    return std::min({video_freshness.deadline(kTrackPublicationTimeout),
-                     audio_freshness.deadline(kTrackPublicationTimeout),
-                     session_freshness.deadline(kSessionPublicationTimeout)});
-  };
-
-  auto service_media = [&]() noexcept
-  {
-    if (cr::feed::DeadlineSocket::Clock::now() < decoder_idle_until)
+    const auto now = Clock::now();
+    if (now < video_idle_until)
       pipe.drain();
+    if (now < audio_idle_until)
+      audio_pipe.drain();
     update_track_readiness();
-    return next_track_deadline();
+    if (publication_stalled)
+      return std::nullopt;
+    return freshness.deadline();
   };
 
   while (!g_stop.load(std::memory_order_relaxed))
@@ -479,9 +475,9 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
         // Publish ready output while waiting for RTMP bytes, bounded by the
         // recent-input window and the original socket deadline.
         const cr::feed::DeadlineSocket::ReceiveIdle idle{
-            decoder_idle_until, [](void* context) noexcept {
+            std::max(video_idle_until, audio_idle_until), [](void* context) noexcept {
               return (*static_cast<decltype(service_media)*>(context))();
-            }, &service_media, next_track_deadline()};
+            }, &service_media, freshness.deadline()};
         if (!connection.receive(data, take, deadline, idle))
           return false;
         data += take;
@@ -506,7 +502,8 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
     if (!receiving_media && ((!received_codec_config && connection.received() > kMaxStartupBytes) ||
                             std::chrono::steady_clock::now() > startup_deadline))
     {
-      LOGW("rtmp: play startup deadline exceeded");
+      LOGW("rtmp: playback startup limit reached before the first %s output",
+           enable_video ? "video" : "audio");
       return false;
     }
     if (result == cr::feed::RtmpChunkResult::Incomplete)
@@ -687,7 +684,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
             }
             break;
           }
-          if (enable_video && !geometry_from_sps && avcc_nalu_length_size != 0 &&
+          if (enable_video && !geometry_from_sps && avc_config.nalu_length_size != 0 &&
               metadata_w > 0 && metadata_h > 0)
           {
             stream_w = metadata_w;
@@ -723,7 +720,8 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
         else if (aac_pkt_type == 1 && audio_pipe_started)
         {
           int64_t pts_us = (int64_t) message.timestamp * 1000;
-          audio_pipe.push(payload, pay_len, pts_us);
+          if (audio_pipe.push(payload, pay_len, pts_us))
+            audio_idle_until = Clock::now() + kDecoderIdleWindow;
         }
         break;
       }
@@ -751,27 +749,29 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
 
         if (avc_packet_type == 0)
         {
-          cr::media::AvcDecoderConfig config{};
-          if (!cr::media::parse_avc_decoder_config({payload, pay_len}, config))
+          const auto update = cr::media::update_avc_decoder_config(
+              {payload, pay_len}, avc_config);
+          if (update == cr::media::AvcConfigUpdate::Invalid)
           {
             LOGW(OBF("rtmp: invalid AVCDecoderConfigurationRecord").c_str());
             break;
           }
           received_codec_config = true;
-          sps_pps_annexb = std::move(config.parameter_sets_annexb);
-          avcc_nalu_length_size = config.nalu_length_size;
+          if (update == cr::media::AvcConfigUpdate::Unchanged)
+            break;
           seen_video_keyframe = false;
           // ReCam's SPS-derived geometry removes the fragile dependency on
           // onMetaData ordering. SPS is authoritative when it is parseable;
           // metadata remains a compatibility fallback for unusual profiles.
-          geometry_from_sps = static_cast<bool>(config.sps.dimensions);
-          stream_w = geometry_from_sps ? static_cast<int>(config.sps.dimensions.width) : metadata_w;
-          stream_h = geometry_from_sps ? static_cast<int>(config.sps.dimensions.height) : metadata_h;
-          stream_color = cr_feed::SdrColorAspects::from_h264_vui(config.sps);
+          const auto& sps = avc_config.sps;
+          geometry_from_sps = static_cast<bool>(sps.dimensions);
+          stream_w = geometry_from_sps ? static_cast<int>(sps.dimensions.width) : metadata_w;
+          stream_h = geometry_from_sps ? static_cast<int>(sps.dimensions.height) : metadata_h;
+          stream_color = cr_feed::SdrColorAspects::from_h264_vui(sps);
           if (stream_w > 0 && stream_h > 0)
             try_start_pipe();
         }
-        else if (avc_packet_type == 1 && avcc_nalu_length_size != 0)
+        else if (avc_packet_type == 1 && avc_config.nalu_length_size != 0)
         {
           if (!pipe_started)
           {
@@ -790,10 +790,10 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
             ++waiting_for_keyframe;
             break;
           }
-          const auto prefix = is_key ? std::span<const uint8_t>(sps_pps_annexb)
+          const auto prefix = is_key ? std::span<const uint8_t>(avc_config.parameter_sets_annexb)
                                      : std::span<const uint8_t>();
           if (!cr::media::avcc_access_unit_to_annexb(
-                  {payload, pay_len}, avcc_nalu_length_size, annexb, prefix))
+                  {payload, pay_len}, avc_config.nalu_length_size, annexb, prefix))
           {
             LOGW(OBF("rtmp: malformed AVCC access unit").c_str());
             break;
@@ -803,7 +803,7 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
             const bool accepted = pipe.push(annexb.data(), annexb.size(), pts_us);
             // The decoder can still have output from earlier accepted AUs
             // if this one missed its input deadline.
-            decoder_idle_until = cr::feed::DeadlineSocket::Clock::now() + kDecoderIdleWindow;
+            video_idle_until = Clock::now() + kDecoderIdleWindow;
             if (!accepted)
               seen_video_keyframe = false;
             else if (is_key)
@@ -820,13 +820,13 @@ bool play_session(int socket, const cr::media::RtmpAddress& address,
   }
 done:
   if (publication_stalled)
-    LOGW("rtmp: no enabled track is publishing; reconnecting");
+    LOGW("rtmp: %s output stalled; reconnecting", enable_video ? "video" : "audio");
   LOGI(OBF("rtmp: reader disconnected (input=%llu published=%llu waiting_idr=%llu audio=%s)").c_str(),
        (unsigned long long) pipe.input_count(), (unsigned long long) pipe.frames_published(),
        static_cast<unsigned long long>(waiting_for_keyframe),
        audio_pipe_started ? "on" : OBF("off").c_str());
-  const bool delivered_media =
-      pipe.frames_published() != 0 || audio_pipe.pcm_blocks_published() != 0;
+  const bool delivered_media = enable_video ? pipe.frames_published() != 0
+                                            : audio_pipe.pcm_blocks_published() != 0;
   pipe.stop();
   audio_pipe.stop();
   return delivered_media;

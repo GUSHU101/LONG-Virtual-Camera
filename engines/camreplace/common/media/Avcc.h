@@ -316,6 +316,21 @@ inline bool parse_avc_decoder_config(std::span<const std::uint8_t> data,
   return true;
 }
 
+enum class AvcConfigUpdate { Invalid, Unchanged, Changed };
+
+inline AvcConfigUpdate update_avc_decoder_config(
+    std::span<const std::uint8_t> data, AvcDecoderConfig& current)
+{
+  AvcDecoderConfig parsed{};
+  if (!parse_avc_decoder_config(data, parsed))
+    return AvcConfigUpdate::Invalid;
+  if (parsed.nalu_length_size == current.nalu_length_size &&
+      parsed.parameter_sets_annexb == current.parameter_sets_annexb)
+    return AvcConfigUpdate::Unchanged;
+  current = std::move(parsed);
+  return AvcConfigUpdate::Changed;
+}
+
 inline bool avcc_access_unit_to_annexb(std::span<const std::uint8_t> data,
                                        std::uint8_t length_size,
                                        std::vector<std::uint8_t>& out,
