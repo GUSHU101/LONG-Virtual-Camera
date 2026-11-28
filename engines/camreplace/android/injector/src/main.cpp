@@ -35,6 +35,7 @@
 
 #include "ptrace_arm64.h"
 #include "cr_feed.h"
+#include "media/CameraInitStatus.h"
 #include "sepolicy.hpp"
 
 #include <android/log.h>
@@ -467,6 +468,11 @@ int main(int argc, char** argv)
   if (!init_return_ok(init_ret))
   {
     LOGE(OBF("%s returned non-zero: %lld").c_str(), a.init, (long long) (int64_t) init_ret);
+    if (strcmp(a.init, "cr_camhook_init") == 0 &&
+        static_cast<uint32_t>(init_ret) == static_cast<uint32_t>(cr::media::kCameraOutputUnavailable))
+    {
+      fprintf(stderr, "camera_init=output_unavailable\n");
+    }
     rc = 17;
   }
 

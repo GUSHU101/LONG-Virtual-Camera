@@ -33,6 +33,8 @@ final class RootController {
         }
     }
 
+    private static volatile boolean cameraStartPaused;
+
     private final RootShell shell = new RootShell();
     private final PayloadInstaller installer;
     private final MediaSourceManager mediaSources;
@@ -55,7 +57,19 @@ final class RootController {
         return status();
     }
 
+    static boolean isCameraStartPaused() {
+        return cameraStartPaused;
+    }
+
     RuntimeState run(Action action) throws IOException, InterruptedException {
+        String cameraError = switch (action) {
+            case ARM_CAMERA -> "camera_arm_failed";
+            case ARM_PHOTO -> "photo_arm_failed";
+            default -> null;
+        };
+        if (cameraError != null && isCameraStartPaused()) {
+            throw new CameraActionException("Camera output interface unavailable", R.string.camera_output_unavailable);
+        }
         if (action.requiresNativePayload) {
             if (!installer.isCurrent()) installer.install();
         } else {
@@ -67,17 +81,19 @@ final class RootController {
                 PayloadInstaller.REMOTE_SCRIPT + " " + action.command, 45L);
         if (!result.ok() || !result.hasLine("result=ok")
                 || !result.hasLine("action=" + action.command)) {
-            String cameraError = switch (action) {
-                case ARM_CAMERA -> "camera_arm_failed";
-                case ARM_PHOTO -> "photo_arm_failed";
-                default -> null;
-            };
             if (cameraError != null) {
+                boolean initFailed = result.reportsFailure(cameraError, "cr_injector: FAIL rc=17");
+                boolean outputUnavailable = initFailed && result.hasLine("camera_init=output_unavailable");
+                if (outputUnavailable) cameraStartPaused = true;
                 if (result.reportsFailure(cameraError, "camera_recovery=unverified")) {
                     throw new CameraActionException("Camera recovery could not be verified",
                             R.string.camera_recovery_failed);
                 }
-                if (result.reportsFailure(cameraError, "cr_injector: FAIL rc=17")) {
+                if (outputUnavailable) {
+                    throw new CameraActionException("Camera output interface unavailable",
+                            R.string.camera_output_unavailable);
+                }
+                if (initFailed) {
                     throw new CameraActionException("Camera module initialization failed (rc=17)",
                             R.string.camera_initialization_failed);
                 }
@@ -193,7 +209,7 @@ final class RootController {
     private void restore(RuntimeState state, RuntimeState source)
             throws IOException, InterruptedException {
         RootShell.checkCancellation();
-        if (state.cameraHookReady && source.visualSourceReady) {
+        if (!isCameraStartPaused() && state.cameraHookReady && source.visualSourceReady) {
             if (state.cameraEnabled) run(Action.ARM_CAMERA);
             if (state.photoEnabled) run(Action.ARM_PHOTO);
         }

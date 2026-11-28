@@ -377,10 +377,11 @@ public final class MainActivity extends Activity
         boolean visualReady = lastState != null && lastState.visualSourceReady;
         boolean audioReady = lastState != null && lastState.audioSourceReady;
         boolean blocked = busy || emergencyBusy;
+        boolean canStartCamera = visualReady && !RootController.isCameraStartPaused();
         cameraSwitch.setEnabled(!blocked && rootReady &&
-                (visualReady || lastState.cameraEnabled));
+                (canStartCamera || lastState.cameraEnabled));
         photoSwitch.setEnabled(!blocked && rootReady &&
-                (visualReady || lastState.photoEnabled));
+                (canStartCamera || lastState.photoEnabled));
         micSwitch.setEnabled(!blocked && rootReady &&
                 (audioReady || lastState.micEnabled));
         rootButton.setEnabled(!blocked);
@@ -497,6 +498,8 @@ public final class MainActivity extends Activity
                     ? "\n馈送进程退出尚未确认。" : "")
                 + (!state.cameraEnabled && !state.photoEnabled && !state.micEnabled && !state.modeMarkersClear
                     ? "\n检测到残留开关记录，等待清理。" : "")
+                + (RootController.isCameraStartPaused()
+                    ? "\n本次 App 运行的相机和照片替换已暂停。" : "")
                 + cameraOutputSummary(state);
     }
 

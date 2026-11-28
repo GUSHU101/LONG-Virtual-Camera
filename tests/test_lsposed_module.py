@@ -113,6 +113,24 @@ class LsposedModuleContractTests(unittest.TestCase):
         self.assertIn("recovery stage=", installer)
         self.assertIn("u:object_r:system_file:s0", installer)
 
+    def test_unavailable_camera_output_pauses_both_start_paths(self) -> None:
+        controller = (MODULE / "java/com/gushu/longvc/RootController.java").read_text(encoding="utf-8")
+        action = controller.split("RuntimeState run(Action action)", 1)[1].split("RuntimeState stageVideo", 1)[0]
+        self.assertIn('case ARM_CAMERA -> "camera_arm_failed"', action)
+        self.assertIn('case ARM_PHOTO -> "photo_arm_failed"', action)
+        self.assertLess(action.index("cameraError != null && isCameraStartPaused()"),
+                        action.index("installer.install()"))
+        self.assertIn('initFailed && result.hasLine("camera_init=output_unavailable")', action)
+        self.assertLess(action.index("cameraStartPaused = true"), action.index("camera_recovery=unverified"))
+        self.assertIn("private static volatile boolean cameraStartPaused", controller)
+        self.assertIn("!isCameraStartPaused() && state.cameraHookReady", controller)
+
+        native = ROOT / "engines/camreplace/android"
+        camera = (native / "camhook/src/hook_main.cpp").read_text(encoding="utf-8")
+        injector = (native / "injector/src/main.cpp").read_text(encoding="utf-8")
+        self.assertEqual(camera.count("return cr::media::kCameraOutputUnavailable;"), 1)
+        self.assertIn("camera_init=output_unavailable", injector)
+
     def test_manifest_limits_permissions_and_disables_backup(self) -> None:
         manifest_path = MODULE / "AndroidManifest.xml"
         tree = ET.parse(manifest_path)

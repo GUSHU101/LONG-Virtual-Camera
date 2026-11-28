@@ -8,6 +8,7 @@
 #include "Raw10Bayer.h"
 #include "CaptureZoom.h"
 #include "CameraYuvColor.h"
+#include "media/CameraInitStatus.h"
 #include "shadowhook.h"
 
 #include <android/hardware_buffer.h>
@@ -2574,7 +2575,7 @@ extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_in
 
   LOGE(OBF("no supported camera symbol found — hook not installed").c_str());
   g_installed = false;
-  return -1;
+  return cr::media::kCameraOutputUnavailable;
 }
 
 extern "C" __attribute__((visibility("default" /*OBF_SKIP*/))) int cr_camhook_shutdown()
