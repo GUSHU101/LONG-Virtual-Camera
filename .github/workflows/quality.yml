@@ -1,4 +1,5 @@
-name: Quality
+name: 03 自动质量检查
+run-name: 自动质量检查 · ${{ github.head_ref || github.ref_name }}
 
 on:
   push:
@@ -14,6 +15,7 @@ concurrency:
 
 jobs:
   contracts:
+    name: 控制器与媒体回归测试
     runs-on: ubuntu-22.04
     timeout-minutes: 12
     steps:
@@ -129,6 +131,7 @@ jobs:
           /tmp/secure_channel_test
 
   mobile-apk:
+    name: Android 编译与 Lint
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     steps:
@@ -151,3 +154,7 @@ jobs:
           apk=lsposed-module/app/build/outputs/apk/debug/app-debug.apk
           bash .github/scripts/verify-android-apk.sh "$BUILD_TOOLS" "$apk" \
             quality "$LONGVC_VERSION_NAME" "$LONGVC_VERSION_CODE"
+      - name: 标明质量检查结果
+        run: |
+          printf '## 自动质量检查\n\nAndroid APK 编译、Lint 和封装校验已通过。此运行用于 CI 检查。\n\n要下载手机测试包，请运行 [01 开发调试版 APK](%s/%s/actions/workflows/development-build.yml)。\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"

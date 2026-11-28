@@ -117,5 +117,5 @@ jq -e --arg apk "$apk" --arg apk_digest "sha256:$APK_SHA256" \
 check_tag
 
 url=$(gh api --method PATCH "$repo/releases/$release_id" -F draft=false --jq '.html_url')
-printf '## Published signed APK\n\n[%s](%s)\n\nCommit: \x60%s\x60\n' \
-  "$RELEASE_VERSION" "$url" "$BUILD_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+printf '## 正式发布版已公开 · %s\n\n[打开 GitHub Release 下载](%s)\n\nAPK 文件 `%s`\n\n构建提交 `%s`\n\nAPK SHA-256 `%s`\n' \
+  "$RELEASE_VERSION" "$url" "$apk" "$BUILD_COMMIT" "$APK_SHA256" >> "$GITHUB_STEP_SUMMARY"

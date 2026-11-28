@@ -1,13 +1,12 @@
-name: Build development APK
-run-name: Build development APK ${{ inputs.version }}
+name: 01 开发调试版 APK
+run-name: 开发调试版 APK · ${{ inputs.version }} · ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Development build version (vMAJOR.MINOR.PATCH)
+        description: 开发调试版版本号（例如 v2.0.43），产物在运行摘要的 Artifacts
         required: true
-        default: v2.0.39
         type: string
 
 permissions:
@@ -19,9 +18,16 @@ concurrency:
 
 jobs:
   build:
-    uses: ./.github/workflows/build-android-apk.yml
-    with:
-      version: ${{ inputs.version }}
-    secrets:
-      LONGVC_DEVELOPMENT_KEYSTORE_BASE64: ${{ secrets.LONGVC_DEVELOPMENT_KEYSTORE_BASE64 }}
-      LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD: ${{ secrets.LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD }}
+    name: 构建开发调试版 · Actions Artifacts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/android-apk
+        with:
+          channel: development
+          version: ${{ inputs.version }}
+          development-store-base64: ${{ secrets.LONGVC_DEVELOPMENT_KEYSTORE_BASE64 }}
+          development-store-password: ${{ secrets.LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD }}

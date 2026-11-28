@@ -39,19 +39,30 @@ cmake --build build/camreplace-android --parallel
 python tests/verify_apk.py lsposed-module/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Windows 开发机可用 `lsposed-module\gradlew.bat` 执行相同 Gradle 任务，输出仍然是 Android APK。正式发布要求配置项目的 Android 签名密钥。CI 的开发包使用独立的应用 ID。载荷清单会核验 APK 内的文件大小、SHA-256 与 ARM64 ELF 架构。
+Windows 开发机可用 `lsposed-module\gradlew.bat` 执行相同的 Gradle 任务。载荷清单会核验 APK 内的文件大小、SHA-256 与 ARM64 ELF 架构。
 
-在 GitHub Actions 运行 **Build development APK**，填写版本号即可生成开发版 APK 和 SHA-256 校验文件，从该次运行的 Artifacts 下载。该工作流使用固定的开发签名，并在上传前校验证书指纹。从 v2.0.7 起，同一开发渠道可直接覆盖升级。打包时使用等于或高于手机上已安装版本的版本号。
+## 从 GitHub 获取 APK
+
+| Actions 入口 | 何时使用 | APK 和下载位置 |
+| --- | --- | --- |
+| [01 开发调试版 APK](https://github.com/GUSHU101/LONG-Virtual-Camera/actions/workflows/development-build.yml) | 给手机装测试版。点 **Run workflow**，选择分支，填写版本号 | 从该次运行的 **Summary → Artifacts** 下载压缩包，解压安装 `*-development.apk`。应用 ID 为 `com.gushu.longvc.debug` |
+| [02 正式发布版 APK](https://github.com/GUSHU101/LONG-Virtual-Camera/actions/workflows/release-build.yml) | 出正式签名包并公开发布。手动填写新版本号，或推送对应版本标签 | 从 [Releases](https://github.com/GUSHU101/LONG-Virtual-Camera/releases) 下载 `*-release.apk`。应用 ID 为 `com.gushu.longvc` |
+| [03 自动质量检查](https://github.com/GUSHU101/LONG-Virtual-Camera/actions/workflows/quality.yml) | 推送 `main` 和提交 PR 时自动测试、编译和运行 Lint | 运行摘要显示检查结果 |
+
+版本号格式为 `vMAJOR.MINOR.PATCH`，例如 `v2.0.43`。两个渠道使用各自的应用 ID 和签名，可分别安装。同一渠道覆盖升级时使用等于或高于已安装版本的版本号，并沿用相同签名。
 
 旧 CI 开发包使用过一次性签名，需要先卸载旧 APK，再安装固定签名版。通过控制面板导入的媒体和来源配置保存在独立的 `/data/cr` 下。首次重装后，在 Root 管理器为新安装的 App 恢复授权，并在 LSPosed 恢复 `system` 作用域。打开控制面板，用“校验并安装载荷”加载新 APK 的系统组件。
 
-仓库维护者通过 Actions Secrets 提供 `LONGVC_DEVELOPMENT_KEYSTORE_BASE64` 和 `LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD`。开发密钥别名为 `longvc-development`，证书 SHA-256 必须与 `.github/development-cert.sha256` 一致。Quality 只校验构建，手机安装包从 **Build development APK** 下载。
+### 构建签名设置
 
-运行 **Publish signed APK** 或推送版本标签会走正式发布。提前在仓库的 **Settings → Secrets and variables → Actions** 配置 `LONGVC_ANDROID_KEYSTORE_BASE64`、`LONGVC_ANDROID_KEYSTORE_PASSWORD`、`LONGVC_ANDROID_KEY_ALIAS`、`LONGVC_ANDROID_KEY_PASSWORD`。正式版更新必须继续使用同一签名密钥。
+仓库维护者在 **Settings → Secrets and variables → Actions** 配置对应渠道的密钥。
+
+- 开发调试版读取 `LONGVC_DEVELOPMENT_KEYSTORE_BASE64` 和 `LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD`。开发密钥别名为 `longvc-development`，证书 SHA-256 必须与 `.github/development-cert.sha256` 一致。
+- 正式发布版读取 `LONGVC_ANDROID_KEYSTORE_BASE64`、`LONGVC_ANDROID_KEYSTORE_PASSWORD`、`LONGVC_ANDROID_KEY_ALIAS` 和 `LONGVC_ANDROID_KEY_PASSWORD`。可用 Actions Variable `LONGVC_ANDROID_CERT_SHA256` 锁定正式签名证书。
 
 同一正式版本的发布任务串行执行。构建前会检查版本标签和已有发布，发布前会按构建返回的制品 ID 下载，并再次校验 APK 的 SHA-256。GitHub 草稿里的 APK 与校验文件均匹配后才公开发布。同一次运行上传中断时，可以用 **Re-run failed jobs** 从该运行的草稿继续。已有正式版本请继续使用新版本号。
 
-正式发布可以在 Actions Variables 设置 `LONGVC_ANDROID_CERT_SHA256`，锁定现有正式签名证书的 SHA-256。开发构建摘要内提供 APK 下载入口、构建提交和 SHA-256。
+开发构建和正式发布的运行摘要均提供对应的下载位置、构建提交和 APK SHA-256。自动质量检查会链接到开发版构建入口。
 
 当前测试覆盖桌面端移除、APK 契约、恢复故障注入和原生像素布局。设备上的相机、麦克风以及 OBS 全链路仍需在对应固件实测。
 

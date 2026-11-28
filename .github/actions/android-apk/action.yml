@@ -1,0 +1,209 @@
+name: Assemble and verify Android APK
+description: Build a fixed signing channel and stage the verified APK
+inputs:
+  channel:
+    description: Fixed caller channel (development or production)
+    required: true
+  version:
+    description: APK version from the manual input or release tag
+    required: true
+  repository-token:
+    description: Read-only GitHub token used for production release preflight
+    required: false
+  development-store-base64:
+    description: Development signing store
+    required: false
+  development-store-password:
+    description: Development signing store password
+    required: false
+  release-store-base64:
+    description: Production signing store
+    required: false
+  release-store-password:
+    description: Production signing store password
+    required: false
+  release-key-alias:
+    description: Production key alias
+    required: false
+  release-key-password:
+    description: Production key password
+    required: false
+  release-certificate:
+    description: Optional pinned SHA-256 of the production signing certificate
+    required: false
+outputs:
+  version:
+    description: Validated version
+    value: ${{ steps.metadata.outputs.version }}
+  artifact:
+    description: Base name of the APK and its checksum
+    value: ${{ steps.metadata.outputs.artifact }}
+  artifact-id:
+    description: ID of the uploaded verified artifact
+    value: ${{ steps.upload.outputs.artifact-id }}
+  apk-sha256:
+    description: SHA-256 of the verified APK
+    value: ${{ steps.verify.outputs.apk_sha256 }}
+  commit:
+    description: Commit used for the Android build
+    value: ${{ steps.metadata.outputs.commit }}
+runs:
+  using: composite
+  steps:
+    - name: 核对版本、渠道和提交
+      id: metadata
+      shell: bash
+      env:
+        APK_CHANNEL: ${{ inputs.channel }}
+        REQUESTED_VERSION: ${{ inputs.version }}
+      run: bash .github/scripts/android-apk-metadata.sh "$REQUESTED_VERSION" "$APK_CHANNEL"
+    - name: 检查开发签名配置
+      if: inputs.channel == 'development'
+      shell: bash
+      env:
+        LONGVC_DEVELOPMENT_KEYSTORE_BASE64: ${{ inputs.development-store-base64 }}
+        LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD: ${{ inputs.development-store-password }}
+      run: |
+        set -euo pipefail
+        missing=0
+        for key in LONGVC_DEVELOPMENT_KEYSTORE_BASE64 LONGVC_DEVELOPMENT_KEYSTORE_PASSWORD; do
+          if [[ -z "${!key}" ]]; then
+            echo "::error::开发调试版缺少 Actions Secret $key" >&2
+            missing=1
+          fi
+        done
+        (( missing == 0 ))
+    - name: 检查正式签名配置
+      if: inputs.channel == 'production'
+      shell: bash
+      env:
+        LONGVC_ANDROID_KEYSTORE_BASE64: ${{ inputs.release-store-base64 }}
+        LONGVC_ANDROID_KEYSTORE_PASSWORD: ${{ inputs.release-store-password }}
+        LONGVC_ANDROID_KEY_ALIAS: ${{ inputs.release-key-alias }}
+        LONGVC_ANDROID_KEY_PASSWORD: ${{ inputs.release-key-password }}
+      run: |
+        set -euo pipefail
+        missing=0
+        for key in LONGVC_ANDROID_KEYSTORE_BASE64 LONGVC_ANDROID_KEYSTORE_PASSWORD \
+                   LONGVC_ANDROID_KEY_ALIAS LONGVC_ANDROID_KEY_PASSWORD; do
+          if [[ -z "${!key}" ]]; then
+            echo "::error::正式发布版缺少 Actions Secret $key" >&2
+            missing=1
+          fi
+        done
+        (( missing == 0 ))
+    - name: 检查正式版标签和发布状态
+      if: inputs.channel == 'production'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.repository-token }}
+        RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+        BUILD_COMMIT: ${{ steps.metadata.outputs.commit }}
+      run: bash .github/scripts/publish-android-release.sh preflight
+    - name: 构建 Android ARM64 载荷
+      id: android
+      uses: ./.github/actions/android-payload
+      with:
+        gradle-cache: ${{ inputs.channel == 'development' }}
+    - name: 构建并签名开发调试版 APK
+      if: inputs.channel == 'development'
+      shell: bash
+      env:
+        ANDROID_OUT_DIR: ${{ steps.android.outputs.payload }}
+        LONGVC_VERSION_NAME: ${{ steps.metadata.outputs.version }}
+        LONGVC_VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+        DEVELOPMENT_STORE_BASE64: ${{ inputs.development-store-base64 }}
+        LONGVC_DEVELOPMENT_STORE_PASSWORD: ${{ inputs.development-store-password }}
+      run: |
+        set -euo pipefail
+        export LONGVC_VERSION_NAME="${LONGVC_VERSION_NAME#v}"
+        export LONGVC_DEVELOPMENT_STORE_FILE
+        LONGVC_DEVELOPMENT_STORE_FILE=$(mktemp "$RUNNER_TEMP/longvc-development.XXXXXX.p12")
+        trap 'rm -f -- "$LONGVC_DEVELOPMENT_STORE_FILE"' EXIT
+        if ! printf '%s' "$DEVELOPMENT_STORE_BASE64" | base64 --decode > "$LONGVC_DEVELOPMENT_STORE_FILE"; then
+          echo '::error::LONGVC_DEVELOPMENT_KEYSTORE_BASE64 需要有效的 Base64 内容'
+          exit 1
+        fi
+        unset DEVELOPMENT_STORE_BASE64
+        test -s "$LONGVC_DEVELOPMENT_STORE_FILE"
+        chmod +x lsposed-module/gradlew
+        lsposed-module/gradlew --no-daemon -p lsposed-module :app:assembleDebug :app:lintDebug
+    - name: 构建并签名正式发布版 APK
+      if: inputs.channel == 'production'
+      shell: bash
+      env:
+        ANDROID_OUT_DIR: ${{ steps.android.outputs.payload }}
+        LONGVC_VERSION_NAME: ${{ steps.metadata.outputs.version }}
+        LONGVC_VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+        SIGNING_STORE_BASE64: ${{ inputs.release-store-base64 }}
+        LONGVC_SIGNING_STORE_PASSWORD: ${{ inputs.release-store-password }}
+        LONGVC_SIGNING_KEY_ALIAS: ${{ inputs.release-key-alias }}
+        LONGVC_SIGNING_KEY_PASSWORD: ${{ inputs.release-key-password }}
+      run: |
+        set -euo pipefail
+        export LONGVC_VERSION_NAME="${LONGVC_VERSION_NAME#v}"
+        export LONGVC_SIGNING_STORE_FILE
+        LONGVC_SIGNING_STORE_FILE=$(mktemp "$RUNNER_TEMP/longvc-release.XXXXXX")
+        trap 'rm -f -- "$LONGVC_SIGNING_STORE_FILE"' EXIT
+        if ! printf '%s' "$SIGNING_STORE_BASE64" | base64 --decode > "$LONGVC_SIGNING_STORE_FILE"; then
+          echo '::error::LONGVC_ANDROID_KEYSTORE_BASE64 需要有效的 Base64 内容'
+          exit 1
+        fi
+        unset SIGNING_STORE_BASE64
+        test -s "$LONGVC_SIGNING_STORE_FILE"
+        chmod +x lsposed-module/gradlew
+        lsposed-module/gradlew --no-daemon -p lsposed-module :app:assembleRelease :app:lintRelease
+    - name: 核验应用 ID、签名和载荷
+      id: verify
+      shell: bash
+      env:
+        APK_CHANNEL: ${{ inputs.channel }}
+        ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact }}
+        APK_VARIANT: ${{ steps.metadata.outputs.variant }}
+        APK_VERSION: ${{ steps.metadata.outputs.version }}
+        APK_VERSION_CODE: ${{ steps.metadata.outputs.version_code }}
+        BUILD_TOOLS: ${{ steps.android.outputs.build-tools }}
+        PRODUCTION_CERT_SHA256: ${{ inputs.release-certificate }}
+      run: |
+        set -euo pipefail
+        source_apk="lsposed-module/app/build/outputs/apk/$APK_VARIANT/app-$APK_VARIANT.apk"
+        bash .github/scripts/verify-android-apk.sh "$BUILD_TOOLS" "$source_apk" \
+          "$APK_CHANNEL" "${APK_VERSION#v}" "$APK_VERSION_CODE"
+        mkdir -p dist
+        apk="$ARTIFACT_NAME.apk"
+        cp "$source_apk" "dist/$apk"
+        (cd dist && sha256sum --binary "$apk" > "$apk.sha256")
+        read -r digest _ < "dist/$apk.sha256"
+        printf 'apk_sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+    - name: 上传已核验的 APK
+      id: upload
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ format('{0}{1}{2}', steps.metadata.outputs.artifact, inputs.channel == 'production' && '-staging' || '', github.run_attempt > 1 && format('-attempt-{0}', github.run_attempt) || '') }}
+        path: |
+          dist/${{ steps.metadata.outputs.artifact }}.apk
+          dist/${{ steps.metadata.outputs.artifact }}.apk.sha256
+        if-no-files-found: error
+        retention-days: 30
+        compression-level: 0
+    - name: 记录版本和下载位置
+      shell: bash
+      env:
+        APK_CHANNEL: ${{ inputs.channel }}
+        ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact }}
+        APK_VERSION: ${{ steps.metadata.outputs.version }}
+        APK_URL: ${{ steps.upload.outputs.artifact-url }}
+        APK_SHA: ${{ steps.verify.outputs.apk_sha256 }}
+        BUILD_COMMIT: ${{ steps.metadata.outputs.commit }}
+        RELEASE_PAGES: ${{ github.server_url }}/${{ github.repository }}/releases
+      run: |
+        {
+          if [[ "$APK_CHANNEL" == development ]]; then
+            printf '## 开发调试版 APK · %s\n\n[下载开发调试包及 SHA-256](%s)\n\n' "$APK_VERSION" "$APK_URL"
+            printf '解压后安装 `%s.apk`。应用 ID 为 `com.gushu.longvc.debug`，使用固定开发签名。\n' "$ARTIFACT_NAME"
+          else
+            printf '## 正式发布版 APK · %s\n\n已完成正式签名和校验。发布成功后从 [GitHub Releases](%s) 下载。\n\n' "$APK_VERSION" "$RELEASE_PAGES"
+            printf '正式 APK 为 `%s.apk`，应用 ID 为 `com.gushu.longvc`。\n' "$ARTIFACT_NAME"
+          fi
+          printf '\n构建提交 `%s`\n\nAPK SHA-256 `%s`\n' "$BUILD_COMMIT" "$APK_SHA"
+        } >> "$GITHUB_STEP_SUMMARY"

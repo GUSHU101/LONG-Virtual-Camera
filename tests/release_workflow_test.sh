@@ -2,15 +2,36 @@
 set -euo pipefail
 
 script="$PWD/.github/scripts/publish-android-release.sh"
+metadata="$PWD/.github/scripts/android-apk-metadata.sh"
+commit=$(git rev-parse HEAD)
 temp=$(mktemp -d)
 trap 'rm -rf -- "$temp"' EXIT
+for channel in development production; do
+  case "$channel" in
+    development) variant=debug; suffix=development ;;
+    production) variant=release; suffix=release ;;
+  esac
+  GITHUB_OUTPUT="$temp/metadata" bash "$metadata" v2.3.4-rc.1 "$channel"
+  grep -Fxq 'version=v2.3.4-rc.1' "$temp/metadata"
+  grep -Fxq 'version_code=2003004' "$temp/metadata"
+  grep -Fxq "variant=$variant" "$temp/metadata"
+  grep -Fxq "artifact=LONG-Virtual-Camera-v2.3.4-rc.1-LSPosed-arm64-$suffix" "$temp/metadata"
+  grep -Fxq "commit=$commit" "$temp/metadata"
+  : > "$temp/metadata"
+done
+for invalid in '' v2.01.4 v0.0.0 v2100.0.1 'v2.0.1 bad'; do
+  ! GITHUB_OUTPUT="$temp/metadata" bash "$metadata" "$invalid" development
+done
+! GITHUB_OUTPUT="$temp/metadata" bash "$metadata" v2.0.1 quality
+[[ ! -s "$temp/metadata" ]]
+
 cd "$temp"
 mkdir bin dist
 export PATH="$PWD/bin:$PATH"
 export GITHUB_REPOSITORY=example/longvc GITHUB_RUN_ID=123 GITHUB_REF_TYPE=branch
 export GITHUB_REF_NAME=main GH_TOKEN=fixture GITHUB_STEP_SUMMARY="$PWD/summary"
 export RELEASE_VERSION=v2.0.22 BUILD_COMMIT=1111111111111111111111111111111111111111
-export ARTIFACT_NAME="LONG-Virtual-Camera-$RELEASE_VERSION-LSPosed-arm64"
+export ARTIFACT_NAME="LONG-Virtual-Camera-$RELEASE_VERSION-LSPosed-arm64-release"
 export TEST_DIR="$PWD"
 
 apk="$ARTIFACT_NAME.apk"

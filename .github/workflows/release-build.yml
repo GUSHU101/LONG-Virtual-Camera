@@ -1,11 +1,11 @@
-name: Publish signed APK
-run-name: Publish signed APK ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+name: 02 正式发布版 APK
+run-name: 正式发布版 APK · ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version (vMAJOR.MINOR.PATCH). Requires production signing secrets.
+        description: 正式发布版本号（例如 v2.0.43）。成功后公开到 GitHub Releases
         required: true
         type: string
   push:
@@ -21,17 +21,33 @@ concurrency:
 
 jobs:
   build:
-    uses: ./.github/workflows/build-android-apk.yml
-    with:
-      version: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
-      production: true
-    secrets:
-      LONGVC_ANDROID_KEYSTORE_BASE64: ${{ secrets.LONGVC_ANDROID_KEYSTORE_BASE64 }}
-      LONGVC_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEYSTORE_PASSWORD }}
-      LONGVC_ANDROID_KEY_ALIAS: ${{ secrets.LONGVC_ANDROID_KEY_ALIAS }}
-      LONGVC_ANDROID_KEY_PASSWORD: ${{ secrets.LONGVC_ANDROID_KEY_PASSWORD }}
+    name: 构建并核验正式发布版
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    outputs:
+      version: ${{ steps.apk.outputs.version }}
+      artifact: ${{ steps.apk.outputs.artifact }}
+      artifact_id: ${{ steps.apk.outputs.artifact-id }}
+      apk_sha256: ${{ steps.apk.outputs.apk-sha256 }}
+      commit: ${{ steps.apk.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: apk
+        uses: ./.github/actions/android-apk
+        with:
+          channel: production
+          version: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+          repository-token: ${{ github.token }}
+          release-store-base64: ${{ secrets.LONGVC_ANDROID_KEYSTORE_BASE64 }}
+          release-store-password: ${{ secrets.LONGVC_ANDROID_KEYSTORE_PASSWORD }}
+          release-key-alias: ${{ secrets.LONGVC_ANDROID_KEY_ALIAS }}
+          release-key-password: ${{ secrets.LONGVC_ANDROID_KEY_PASSWORD }}
+          release-certificate: ${{ vars.LONGVC_ANDROID_CERT_SHA256 }}
 
   publish:
+    name: 公开正式发布版 · GitHub Releases
     needs: build
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -42,7 +58,7 @@ jobs:
         with:
           ref: ${{ needs.build.outputs.commit }}
           persist-credentials: false
-      - name: Check artifact identity
+      - name: 核对正式制品 ID
         env:
           ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
         run: |
@@ -55,7 +71,7 @@ jobs:
           artifact-ids: ${{ needs.build.outputs.artifact_id }}
           path: dist
           merge-multiple: true
-      - name: Verify release assets and publish
+      - name: 校验发布文件并公开 Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.build.outputs.version }}
